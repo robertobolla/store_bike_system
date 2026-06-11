@@ -6463,7 +6463,7 @@ USING (true);`;
                               const totalCount = isConsolidated
                                 ? Object.values(prod.custom_field_values.location_distribution as Record<string, number>).reduce((a, b) => a + b, 0)
                                 : group.length;
-                              const isLastFew = groupedList.length > 1 && index >= groupedList.length - 2;
+                              const isLastFew = index > 0 && index >= groupedList.length - 2;
                               const serialDisplay = (prod.serial_number || '').replace(/^([A-Za-z]+)(\d+)$/, '$1-$2');
                               const catMatch = (categories || []).find(c => c && c.id === prod.category_id);
                               const categoryName = catMatch ? (language === 'es' ? catMatch.name_es : catMatch.name_en) : '';
@@ -7119,7 +7119,7 @@ USING (true);`;
                             return groupedList.map((group, index) => {
                               const prod = group[0];
                               const isConsolidated = !!prod.custom_field_values?.location_distribution;
-                              const isLastFew = groupedList.length > 1 && index >= groupedList.length - 2;
+                              const isLastFew = index > 0 && index >= groupedList.length - 2;
                               const totalCount = isConsolidated
                                 ? Object.values(prod.custom_field_values.location_distribution as Record<string, number>).reduce((a, b) => a + b, 0)
                                 : group.length;
