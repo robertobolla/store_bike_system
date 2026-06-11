@@ -2066,7 +2066,7 @@ export async function getAllowedEmails(): Promise<AllowedEmail[]> {
 export async function addAllowedEmail(email: string, role: string = 'admin'): Promise<void> {
   const { error } = await supabase
     .from('allowed_emails')
-    .insert({ email: email.toLowerCase().trim(), role });
+    .upsert({ email: email.toLowerCase().trim(), role }, { onConflict: 'email' });
   if (error) throw error;
 }
 

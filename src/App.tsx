@@ -13655,20 +13655,66 @@ USING (true);`;
                       const saleItemsToInsert = [];
                       for (const p of soldProducts) {
                         const actualUnitPrice = soldProductPrices[p.id] ?? p.price_sold ?? (p.price_paid ? Math.round(p.price_paid * 1.5) : 500);
+                        const dist = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
+                        const totalQty = dist ? Object.values(dist).reduce((a, b) => a + b, 0) : 0;
+                        const statusToSet = soldPaymentType === 'financiado' ? 'Financiada' : 'Vendida';
 
-                        saleItemsToInsert.push({
-                          sale_id: newSaleId,
-                          product_id: p.id,
-                          unit_price: actualUnitPrice
-                        });
-                        
-                        // Update product status
-                        await upsertProduct({
-                          ...p,
-                          status: soldPaymentType === 'financiado' ? 'Financiada' : 'Vendida',
-                          price_sold: actualUnitPrice,
-                          sold_date: soldFormDate
-                        });
+                        if (dist && totalQty > 1) {
+                          const splitId = crypto.randomUUID();
+                          const mainLoc = Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central';
+                          
+                          // Insert the split-off sold unit
+                          await upsertProduct({
+                            ...p,
+                            id: splitId,
+                            status: statusToSet,
+                            price_sold: actualUnitPrice,
+                            sold_date: soldFormDate,
+                            custom_field_values: { ...p.custom_field_values, location: mainLoc, location_distribution: undefined },
+                          });
+
+                          saleItemsToInsert.push({
+                            sale_id: newSaleId,
+                            product_id: splitId,
+                            unit_price: actualUnitPrice
+                          });
+
+                          // Decrement quantity from the main product
+                          const updatedDist = { ...dist };
+                          const locToDecrement = Object.keys(updatedDist).find(k => updatedDist[k] > 0) || mainLoc;
+                          updatedDist[locToDecrement] = (updatedDist[locToDecrement] || 1) - 1;
+                          Object.keys(updatedDist).forEach(k => { if (updatedDist[k] <= 0) delete updatedDist[k]; });
+                          const newTotal = Object.values(updatedDist).reduce((a, b) => a + b, 0);
+
+                          if (newTotal <= 0) {
+                            await upsertProduct({
+                              ...p,
+                              status: statusToSet,
+                              price_sold: actualUnitPrice,
+                              sold_date: soldFormDate,
+                              custom_field_values: { ...p.custom_field_values, location_distribution: undefined }
+                            });
+                          } else {
+                            await upsertProduct({
+                              ...p,
+                              custom_field_values: { ...p.custom_field_values, location_distribution: updatedDist }
+                            });
+                          }
+                        } else {
+                          // Standard or last unit
+                          await upsertProduct({
+                            ...p,
+                            status: statusToSet,
+                            price_sold: actualUnitPrice,
+                            sold_date: soldFormDate
+                          });
+
+                          saleItemsToInsert.push({
+                            sale_id: newSaleId,
+                            product_id: p.id,
+                            unit_price: actualUnitPrice
+                          });
+                        }
                       }
                       await insertSaleItems(saleItemsToInsert);
 
