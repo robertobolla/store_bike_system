@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS categories (
 CREATE TABLE IF NOT EXISTS serial_prefixes (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   prefix TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT ''
+  description TEXT NOT NULL DEFAULT '',
+  category_id UUID REFERENCES categories(id) ON DELETE SET NULL
 );
 
 -- ============================================================
@@ -619,3 +620,66 @@ Saludos,
 El equipo de The Fast Sheep')
 ON CONFLICT (template_key, language) DO UPDATE 
 SET subject = EXCLUDED.subject, body_text = EXCLUDED.body_text;
+
+-- ============================================================
+-- TASK CARDS (To-Do List columns/categories)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS task_cards (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  title TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================
+-- TASK ITEMS (Checklist items within a card)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS task_items (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  card_id UUID REFERENCES task_cards(id) ON DELETE CASCADE,
+  text TEXT NOT NULL,
+  completed BOOLEAN NOT NULL DEFAULT false,
+  color TEXT NOT NULL DEFAULT '#3b82f6',
+  position INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================
+-- TASK COLOR TAGS (Hex color label mappings)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS task_color_tags (
+  color TEXT PRIMARY KEY,
+  label TEXT NOT NULL
+);
+
+ALTER TABLE task_cards ENABLE ROW LEVEL SECURITY;
+ALTER TABLE task_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE task_color_tags ENABLE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+  EXECUTE 'DROP POLICY IF EXISTS "dev_all_task_cards" ON task_cards';
+  EXECUTE 'CREATE POLICY "dev_all_task_cards" ON task_cards FOR ALL TO anon, authenticated USING (true) WITH CHECK (true)';
+  
+  EXECUTE 'DROP POLICY IF EXISTS "dev_all_task_items" ON task_items';
+  EXECUTE 'CREATE POLICY "dev_all_task_items" ON task_items FOR ALL TO anon, authenticated USING (true) WITH CHECK (true)';
+
+  EXECUTE 'DROP POLICY IF EXISTS "dev_all_task_color_tags" ON task_color_tags';
+  EXECUTE 'CREATE POLICY "dev_all_task_color_tags" ON task_color_tags FOR ALL TO anon, authenticated USING (true) WITH CHECK (true)';
+END;
+$$;
+
+-- ============================================================
+-- UPGRADE: Add category_id to serial_prefixes if it doesn't exist
+-- ============================================================
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'serial_prefixes' AND column_name = 'category_id'
+  ) THEN
+    ALTER TABLE serial_prefixes ADD COLUMN category_id UUID REFERENCES categories(id) ON DELETE SET NULL;
+  END IF;
+END;
+$$;
+
+

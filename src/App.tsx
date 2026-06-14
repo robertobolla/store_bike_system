@@ -8,6 +8,7 @@ import type {
   AppAccountNote, AppAccountEarning, AppPlatform, AppVehicleType,
   ProductModel, QuickReply,
   Sale, SaleItem, FinancingPlan, FinancingPayment, EmailTemplate,
+  TaskCard, TaskItem,
 } from './db';
 import {
   calculateProductROI,
@@ -29,13 +30,16 @@ import {
   getRecords, deleteRecord, upsertRecord,
   getQuickReplies, upsertQuickReply, deleteQuickReply,
   getSales, insertSale, updateSaleStatus, deleteSale,
-  getSaleItems, insertSaleItems, deleteSaleItems,
+  getSaleItems, insertSaleItems, deleteSaleItems, deleteSaleItem, updateSaleTotal,
   getFinancingPlans, insertFinancingPlan, updateFinancingPlanStatus, deleteFinancingPlan, deleteFinancingPayments,
   getFinancingPayments, insertFinancingPayments, markFinancingPaymentPaid, unmarkFinancingPaymentPaid,
   getEmailTemplates, upsertEmailTemplate,
   getAllowedEmails, addAllowedEmail, deleteAllowedEmail,
   getBikeModifications, addBikeModification, deleteBikeModification,
   deleteExpense,
+  getTaskCards, upsertTaskCard, deleteTaskCard,
+  getTaskItems, upsertTaskItem, deleteTaskItem,
+  getColorTags, upsertColorTag, deleteColorTag,
 } from './db';
 import type { AllowedEmail, BikeModification } from './db';
 
@@ -1101,7 +1105,7 @@ const translations = {
     dashboard: "Panel de Analíticas", analytics: "Panel de Analíticas", stock: "Inventario y Stock", customers: "Expediente de Clientes",
     crm: "CRM y Leads", suppliers: "Proveedores y Comparador", accounts: "Cuentas de Reparto", users: "Usuarios",
     calendar: "Calendario de Eventos", maintenance: "Taller y Mantenimiento", wizard: "Terminal de Alquiler", rental_wizard: "Terminal de Alquiler",
-    quick_replies: "Respuestas Rápidas",
+    quick_replies: "Respuestas Rápidas", tasks: "Tareas",
     welcome: "Bienvenido a The Fast Sheep", activeRentals: "Alquileres Activos",
     monthlyEarnings: "Ingresos Mensuales", availableBikes: "Bicicletas Disponibles", announcedReturns: "Devoluciones Anunciadas",
     mechanicalHealth: "Salud de Flota", nationalities: "Distribución por Nacionalidades",
@@ -1152,7 +1156,7 @@ const translations = {
     dashboard: "Analytics Dashboard", analytics: "Analytics Dashboard", stock: "Inventory & Stock", customers: "Customer Ledger",
     crm: "CRM & Leads", suppliers: "Suppliers & Compare", accounts: "Gig App Accounts", users: "Users",
     calendar: "Events & Calendar", maintenance: "Garage & Maintenance", wizard: "Rental Terminal", rental_wizard: "Rental Terminal",
-    quick_replies: "Quick Replies",
+    quick_replies: "Quick Replies", tasks: "Tasks",
     welcome: "Welcome to The Fast Sheep", activeRentals: "Active Rentals",
     monthlyEarnings: "Monthly Payouts", availableBikes: "Available Bikes", announcedReturns: "Announced Returns",
     mechanicalHealth: "Fleet Health", nationalities: "Nationalities Distribution",
@@ -1341,7 +1345,7 @@ export default function App() {
           ? `¿Seguro que quieres revocar el acceso a ${email}?`
           : `Are you sure you want to revoke access for ${email}?`);
 
-    if (!confirm(confirmMsg)) return;
+    if (!await asyncConfirm(confirmMsg)) return;
 
     try {
       await deleteAllowedEmail(id);
@@ -1447,7 +1451,13 @@ USING (true);`;
 
   const [language, setLanguage] = useState<'es' | 'en'>('es');
   const [darkMode, setDarkMode] = useState(true);
-  const [currentTab, setCurrentTab] = useState('analytics');
+  const [currentTab, setCurrentTab] = useState(() => {
+    return localStorage.getItem('fast_sheep_current_tab') || 'analytics';
+  });
+
+  useEffect(() => {
+    localStorage.setItem('fast_sheep_current_tab', currentTab);
+  }, [currentTab]);
   const [maintLogYear, setMaintLogYear] = useState(new Date().getFullYear());
   const [maintLogMonth, setMaintLogMonth] = useState(new Date().getMonth()); // 0-indexed
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
@@ -1462,7 +1472,7 @@ USING (true);`;
     });
   }, [language]);
 
-  const [stockSubTab, setStockSubTab] = useState<'all_items' | 'items' | 'sold' | 'lost' | 'templates'>('all_items');
+  const [stockSubTab, setStockSubTab] = useState<'all_items' | 'items' | 'sold' | 'lost' | 'templates'>('items');
   const [soldFilterType, setSoldFilterType] = useState<'all' | 'month' | 'year' | 'custom'>('all');
   const [soldFilterStart, setSoldFilterStart] = useState<string>(() => {
     const d = new Date();
@@ -1474,6 +1484,38 @@ USING (true);`;
   const [prodFormSubmitting, setProdFormSubmitting] = useState(false);
   const [dbVer, setDbVer] = useState(0);
   const triggerReload = useCallback(() => setDbVer(v => v + 1), []);
+
+  // Task Board States
+  const [taskCards, setTaskCards] = useState<TaskCard[]>([]);
+  const [taskItems, setTaskItems] = useState<TaskItem[]>([]);
+  const [colorTags, setColorTags] = useState<Record<string, string>>({
+    '#ef4444': 'Prioritario',
+    '#3b82f6': 'En progreso',
+    '#10b981': 'Completado',
+    '#f59e0b': 'Idea',
+    '#8b5cf6': 'Opcional'
+  });
+  const [newCardTitle, setNewCardTitle] = useState('');
+  const [editingCardId, setEditingCardId] = useState<string | null>(null);
+  const [editingCardTitle, setEditingCardTitle] = useState('');
+  const [newTaskTexts, setNewTaskTexts] = useState<Record<string, string>>({});
+  const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
+  const [editingTaskText, setEditingTaskText] = useState('');
+  const [showColorConfig, setShowColorConfig] = useState(false);
+  const [newTagColor, setNewTagColor] = useState('#3b82f6');
+  const [newTagLabel, setNewTagLabel] = useState('');
+
+  const [confirmPromise, setConfirmPromise] = useState<{
+    resolve: (value: boolean) => void;
+    message: string;
+    title?: string;
+  } | null>(null);
+
+  const asyncConfirm = (message: string, title?: string): Promise<boolean> => {
+    return new Promise((resolve) => {
+      setConfirmPromise({ resolve, message, title });
+    });
+  };
 
   // ----------------------------------------------------------
   // DATA STATES (loaded async from Supabase)
@@ -1575,6 +1617,57 @@ USING (true);`;
       setEvents(evs); setRecords(recs); setProductModels(pms); setQuickReplies(qrs);
       setSales(sls); setSaleItems(sis); setFinancingPlans(fps); setFinancingPaymentsData(fpays);
       setEmailTemplates(emts);
+
+      // Check if category_id exists in serial_prefixes
+      try {
+        const { error } = await supabase
+          .from('serial_prefixes')
+          .select('id, category_id')
+          .limit(1);
+        if (error && error.message.includes('category_id')) {
+          setIsPrefixCategorySupported(false);
+        } else {
+          setIsPrefixCategorySupported(true);
+        }
+      } catch (err) {
+        setIsPrefixCategorySupported(false);
+      }
+
+      // Fetch Tareas with Local Fallback
+      let cards: TaskCard[] = [];
+      let items: TaskItem[] = [];
+      let tagMap: Record<string, string> = {
+        '#ef4444': 'Prioritario',
+        '#3b82f6': 'En progreso',
+        '#10b981': 'Completado',
+        '#f59e0b': 'Idea',
+        '#8b5cf6': 'Opcional'
+      };
+      try {
+        cards = await getTaskCards();
+        items = await getTaskItems();
+        const tags = await getColorTags();
+        if (tags && tags.length > 0) {
+          tags.forEach(t => {
+            tagMap[t.color] = t.label;
+          });
+        }
+      } catch (err) {
+        console.warn('[FastSheep] Tasks tables not found in Supabase. Falling back to localStorage.', err);
+        try {
+          cards = JSON.parse(localStorage.getItem('fast_sheep_task_cards') || '[]');
+          items = JSON.parse(localStorage.getItem('fast_sheep_task_items') || '[]');
+          const storedTags = JSON.parse(localStorage.getItem('fast_sheep_task_color_tags') || '{}');
+          if (Object.keys(storedTags).length > 0) {
+            tagMap = { ...tagMap, ...storedTags };
+          }
+        } catch (e) {
+          console.error('Error loading tasks from localStorage', e);
+        }
+      }
+      setTaskCards(cards);
+      setTaskItems(items);
+      setColorTags(tagMap);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Unknown error';
       setConnectionError(msg);
@@ -1680,6 +1773,16 @@ USING (true);`;
   const catBikeId = useMemo(() => categories.find(c => c.name_es === 'Bicicleta')?.id ?? '', [categories]);
   const catBattId = useMemo(() => categories.find(c => c.name_es === 'Batería')?.id    ?? '', [categories]);
   const catLockId = useMemo(() => categories.find(c => c.name_es === 'Candado')?.id    ?? '', [categories]);
+
+  // Single source of truth for "is this a generic/consolidated article?".
+  // Uses the explicit is_generic flag; for legacy rows saved before the flag existed,
+  // falls back to the old rule (no prefix + not a unique category).
+  const isProductGeneric = useCallback((p: Product): boolean => {
+    const g = p.custom_field_values?.is_generic;
+    if (g === true) return true;
+    if (g === false) return false;
+    return p.prefix_id === null && p.category_id !== catBikeId && p.category_id !== catBattId && p.category_id !== catLockId;
+  }, [catBikeId, catBattId, catLockId]);
 
   const getDynamicEventStatus = useCallback((ev: CompanyEvent): 'Pendiente' | 'Realizado' => {
     if (ev.title.startsWith('[Service]')) {
@@ -2121,7 +2224,10 @@ USING (true);`;
             category_id: p.category_id
           };
         }
-        purchaseGroups[groupKey].quantity += 1;
+        const dist = (p.custom_field_values?.location_distribution as Record<string, number>) || {};
+        const isCons = !!p.custom_field_values?.location_distribution;
+        const rowQty = isCons ? Object.values(dist).reduce((a, b) => a + b, 0) : 1;
+        purchaseGroups[groupKey].quantity += rowQty;
         purchaseGroups[groupKey].ids.push(p.id);
         
         const groupCreatedAt = purchaseGroups[groupKey].created_at;
@@ -2140,7 +2246,7 @@ USING (true);`;
       const itemsInSale = saleItems.filter(si => si.sale_id === s.id);
       const bikeDescs = itemsInSale.map(si => {
         const prod = products.find(p => p.id === si.product_id);
-        return prod ? prod.serial_number : '';
+        return prod ? [prod.serial_number, prod.name].filter(Boolean).join(' ') : '';
       }).filter(Boolean).join(', ');
       
       const descDetails = bikeDescs ? ` (${bikeDescs})` : '';
@@ -2194,7 +2300,7 @@ USING (true);`;
         const itemsInSale = sale ? saleItems.filter(si => si.sale_id === sale.id) : [];
         const bikeDescs = itemsInSale.map(si => {
           const prod = products.find(prod => prod.id === si.product_id);
-          return prod ? prod.serial_number : '';
+          return prod ? [prod.serial_number, prod.name].filter(Boolean).join(' ') : '';
         }).filter(Boolean).join(', ');
         const descDetails = bikeDescs ? ` (${bikeDescs})` : '';
 
@@ -2429,6 +2535,20 @@ USING (true);`;
   const [selectedProductId, setSelectedProductId] = useState<string | null>(null);
   const [selectedCondition, setSelectedCondition] = useState<'nuevo' | 'bueno' | 'regular' | 'para venta'>('bueno');
   const [activeStockMenuId, setActiveStockMenuId] = useState<string | null>(null);
+
+  useEffect(() => {
+    const handleScroll = () => {
+      setActiveStockMenuId(null);
+      setMenuCoords(null);
+    };
+    if (activeStockMenuId) {
+      window.addEventListener('scroll', handleScroll, { capture: true, passive: true });
+    }
+    return () => {
+      window.removeEventListener('scroll', handleScroll, { capture: true });
+    };
+  }, [activeStockMenuId]);
+
   const [activeLeadMenuId, setActiveLeadMenuId] = useState<string | null>(null);
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
   const [selectedEventId,   setSelectedEventId]   = useState<string | null>(null);
@@ -2461,6 +2581,7 @@ USING (true);`;
 
   // Sold Tab filters & Column Visibility
   const [searchSold,           setSearchSold]           = useState('');
+  const [balanceSearch,        setBalanceSearch]        = useState('');
   const [filterSoldCategory,   setFilterSoldCategory]   = useState('all');
   const [showSoldColVisPicker, setShowSoldColVisPicker] = useState(false);
   const [soldVisibleCols,      setSoldVisibleCols]      = useState<Record<string, boolean>>({
@@ -2547,7 +2668,7 @@ USING (true);`;
   };
 
   const handleDeleteModification = async (id: string) => {
-    if (!confirm(language === 'es' ? '¿Seguro que quieres eliminar este registro?' : 'Are you sure you want to delete this record?')) return;
+    if (!await asyncConfirm(language === 'es' ? '¿Seguro que quieres eliminar este registro?' : 'Are you sure you want to delete this record?')) return;
     try {
       await deleteBikeModification(id);
       showToast(language === 'es' ? 'Registro eliminado correctamente.' : 'Record deleted successfully.', 'success');
@@ -2633,6 +2754,7 @@ USING (true);`;
   const [prodFormPrefixId,   setProdFormPrefixId]   = useState('');
 
   const [prodFormPricePaid,  setProdFormPricePaid]  = useState(1000);
+  const [prodFormAddBat,     setProdFormAddBat]     = useState(false);
   const [prodFormPriceSold,  setProdFormPriceSold]  = useState<number | null>(null);
   const [prodFormWeeklyRate, setProdFormWeeklyRate] = useState(50);
   const [prodFormDeposit,    setProdFormDeposit]    = useState(150);
@@ -2768,6 +2890,7 @@ USING (true);`;
   const [soldEmailLang, setSoldEmailLang] = useState<'es' | 'en' | 'pt'>('es');
   const [soldProducts, setSoldProducts] = useState<Product[]>([]);
   const [soldProductPrices, setSoldProductPrices] = useState<Record<string, number>>({});
+  const [soldProductLocations, setSoldProductLocations] = useState<Record<string, string>>({});
   const [soldProductSearch, setSoldProductSearch] = useState('');
   const [soldSubmitting, setSoldSubmitting] = useState(false);
   const [soldReceivedVia, setSoldReceivedVia] = useState<'efectivo' | 'transferencia'>('efectivo');
@@ -2814,8 +2937,18 @@ USING (true);`;
   const [accFormStartDate, setAccFormStartDate] = useState('');
 
   // Prefix / Category modal
+  const [openActionMenuBikeId, setOpenActionMenuBikeId] = useState<string | null>(null);
+  useEffect(() => {
+    const handleDocClick = () => setOpenActionMenuBikeId(null);
+    document.addEventListener('click', handleDocClick);
+    return () => document.removeEventListener('click', handleDocClick);
+  }, []);
+
   const [pfFormPrefix, setPfFormPrefix] = useState('');
   const [pfFormDesc,   setPfFormDesc]   = useState('');
+  const [pfFormCategoryId, setPfFormCategoryId] = useState('');
+  const [isPrefixCategorySupported, setIsPrefixCategorySupported] = useState(true);
+  const [editingPrefixId, setEditingPrefixId] = useState<string | null>(null);
   const [catFormNameEs,setCatFormNameEs]= useState('');
   const [catFormNameEn,setCatFormNameEn]= useState('');
 
@@ -3012,10 +3145,16 @@ USING (true);`;
   // ----------------------------------------------------------
   const openProductModal = useCallback((prod?: Product) => {
     const catId = prod?.category_id ?? catBikeId;
-    const prefId = prod?.prefix_id   ?? prefixes.find(p => p.prefix === (catId === catBikeId ? 'B-' : catId === catBattId ? 'BAT-' : catId === catLockId ? 'L-' : ''))?.id ?? prefixes.find(p => p.prefix === 'B-')?.id ?? '';
+    // When editing, respect the product's own prefix (or none). When creating, default by category.
+    const prefId = prod
+      ? (prod.prefix_id ?? '')
+      : (prefixes.find(p => p.prefix === (catId === catBikeId ? 'B-' : catId === catBattId ? 'BAT-' : catId === catLockId ? 'L-' : ''))?.id ?? prefixes.find(p => p.prefix === 'B-')?.id ?? '');
     setProdFormCategory(catId);
     setProdFormPrefixId(prefId);
-    setProdFormPricePaid(prod?.price_paid ?? 1000);
+    const batApplied = prod?.custom_field_values?.bat_applied === true;
+    setProdFormAddBat(batApplied);
+    // When BAT was applied, the input shows the base cost; price_paid already includes the tax.
+    setProdFormPricePaid(batApplied ? ((prod?.custom_field_values?.cost_base as number) ?? prod?.price_paid ?? 1000) : (prod?.price_paid ?? 1000));
     setProdFormPriceSold(prod?.price_sold ?? null);
     setProdFormWeeklyRate(prod?.suggested_weekly_rate ?? 50); setProdFormDeposit(prod?.suggested_deposit ?? 150);
     setProdFormNotes(prod?.notes ?? ''); setProdFormFrame(prod?.frame_serial ?? '');
@@ -3030,7 +3169,7 @@ USING (true);`;
     setProdFormCustomValues(prod?.custom_field_values ?? {});
     setSelectedLocation((prod?.custom_field_values?.location as string) || '');
     setSelectedLocationDate((prod?.custom_field_values?.location_date as string) || new Date().toISOString().split('T')[0]);
-    const isGen = !!prod?.custom_field_values?.location_distribution;
+    const isGen = prod?.custom_field_values?.is_generic === true || !!prod?.custom_field_values?.location_distribution;
     const dist = (prod?.custom_field_values?.location_distribution as Record<string, number>) || {};
     const totalQty = Object.values(dist).reduce((a, b) => a + b, 0);
 
@@ -3185,6 +3324,9 @@ USING (true);`;
     setSoldEmailLang('es');
     setSoldProducts([prod]);
     setSoldProductPrices({ [prod.id]: suggestedPrice });
+    const dist = prod.custom_field_values?.location_distribution as Record<string, number> | undefined;
+    const initialLoc = dist ? Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central' : (prod.custom_field_values?.location as string || 'Almacén Central');
+    setSoldProductLocations({ [prod.id]: initialLoc });
     setSoldProductSearch('');
     setSoldSubmitting(false);
     setSoldReceivedVia('efectivo');
@@ -3223,7 +3365,7 @@ USING (true);`;
 
       let finalReceivedVia = receivedVia;
       if (!finalReceivedVia) {
-        const isCash = window.confirm(language === 'es' ? '¿El pago de la cuota fue en EFECTIVO?\n\n(Aceptar = Efectivo / Cancelar = Transferencia)' : 'Was the installment paid in CASH?\n\n(OK = Cash / Cancel = Bank Transfer)');
+        const isCash = await asyncConfirm(language === 'es' ? '¿El pago de la cuota fue en EFECTIVO?\n\n(Aceptar = Efectivo / Cancelar = Transferencia)' : 'Was the installment paid in CASH?\n\n(OK = Cash / Cancel = Bank Transfer)');
         finalReceivedVia = isCash ? 'efectivo' : 'transferencia';
       }
 
@@ -3398,6 +3540,46 @@ USING (true);`;
   const [wizKitProductIds, setWizKitProductIds] = useState<string[]>([]);
   const [kitSearchModalOpen, setKitSearchModalOpen] = useState(false);
   const [kitSearchQuery, setKitSearchQuery] = useState('');
+  // Generic Stock addition/removal states
+  const [addGenStockModalOpen, setAddGenStockModalOpen] = useState(false);
+  const [removeGenStockModalOpen, setRemoveGenStockModalOpen] = useState(false);
+  const [genStockQty, setGenStockQty] = useState(1);
+  const [genStockLocation, setGenStockLocation] = useState('Almacén Central');
+  const [genStockCost, setGenStockCost] = useState(0);
+  const [menuCoords, setMenuCoords] = useState<{ top: number; left: number; width: number; height: number } | null>(null);
+  const activeStockMenuProduct = useMemo(() => {
+    if (!activeStockMenuId) return null;
+    return products.find(p => p.id === activeStockMenuId) || null;
+  }, [activeStockMenuId, products]);
+
+  const activeStockMenuData = useMemo(() => {
+    if (!activeStockMenuProduct) return null;
+    const prod = activeStockMenuProduct;
+    const group = products.filter(p => p.serial_number === prod.serial_number);
+    
+    const consolidatedLocDist: Record<string, number> = {};
+    group.forEach(p => {
+      const dist = (p.custom_field_values?.location_distribution as Record<string, number>) || {};
+      Object.entries(dist).forEach(([loc, qty]) => {
+        if (qty > 0) {
+          consolidatedLocDist[loc] = (consolidatedLocDist[loc] || 0) + qty;
+        }
+      });
+      if (Object.keys(dist).length === 0 && p.custom_field_values?.location) {
+        const singleLoc = p.custom_field_values.location as string;
+        consolidatedLocDist[singleLoc] = (consolidatedLocDist[singleLoc] || 0) + 1;
+      }
+    });
+
+    const isConsolidated = group.some(p => p.custom_field_values?.location_distribution);
+    const totalCount = isConsolidated
+      ? Object.values(consolidatedLocDist).reduce((a, b) => a + b, 0)
+      : group.length;
+    const hasRentals = group.some(p => rentals.some(r => r.bike_id === p.id && r.status === 'Activo'));
+    const isGeneric = isProductGeneric(prod);
+    const hasAvailableStock = group.some(p => p.status === 'Disponible');
+    return { prod, group, isConsolidated, totalCount, hasRentals, isGeneric, hasAvailableStock, consolidatedLocDist };
+  }, [activeStockMenuProduct, products, rentals, catBikeId, catBattId, catLockId]);
 
   // Conditional Referral UI States (Wizard)
   const [wizRefType, setWizRefType] = useState('Instagram');
@@ -3721,7 +3903,7 @@ USING (true);`;
       ? '¿Estás seguro de que deseas eliminar esta foto de estado?' 
       : 'Are you sure you want to delete this condition photo?';
     
-    if (!window.confirm(confirmMsg)) return;
+    if (!await asyncConfirm(confirmMsg)) return;
 
     try {
       setIsUploadingDoc('bike_photo');
@@ -3778,7 +3960,7 @@ USING (true);`;
       ? '¿Estás seguro de que deseas eliminar esta foto de Instagram?' 
       : 'Are you sure you want to delete this Instagram photo?';
     
-    if (!window.confirm(confirmMsg)) return;
+    if (!await asyncConfirm(confirmMsg)) return;
 
     try {
       setIsUploadingDoc('instagram_photo');
@@ -4491,6 +4673,168 @@ USING (true);`;
   );
 
   // ============================================================
+  // TASK BOARD ACTIONS (WITH LOCAL FALLBACK)
+  // ============================================================
+  const handleSaveCard = async (title: string, existingId?: string) => {
+    const cardId = existingId || crypto.randomUUID();
+    const newCard: TaskCard = {
+      id: cardId,
+      title,
+      created_at: new Date().toISOString()
+    };
+    
+    // Optimistic / Local update first
+    let updatedCards = [...taskCards];
+    if (existingId) {
+      updatedCards = updatedCards.map(c => c.id === existingId ? { ...c, title } : c);
+    } else {
+      updatedCards.push(newCard);
+    }
+    setTaskCards(updatedCards);
+
+    try {
+      await upsertTaskCard(newCard);
+    } catch (err) {
+      console.warn('[FastSheep] Error saving card to Supabase. Saving to localStorage.', err);
+      localStorage.setItem('fast_sheep_task_cards', JSON.stringify(updatedCards));
+    }
+  };
+
+  const handleDeleteCard = async (id: string) => {
+    const updatedCards = taskCards.filter(c => c.id !== id);
+    const updatedItems = taskItems.filter(item => item.card_id !== id);
+    setTaskCards(updatedCards);
+    setTaskItems(updatedItems);
+
+    try {
+      await deleteTaskCard(id);
+    } catch (err) {
+      console.warn('[FastSheep] Error deleting card from Supabase. Saving to localStorage.', err);
+      localStorage.setItem('fast_sheep_task_cards', JSON.stringify(updatedCards));
+      localStorage.setItem('fast_sheep_task_items', JSON.stringify(updatedItems));
+    }
+  };
+
+  const handleSaveTask = async (item: Partial<TaskItem>) => {
+    const itemId = item.id || crypto.randomUUID();
+    const existing = taskItems.find(t => t.id === itemId);
+    const text = item.text !== undefined ? item.text : (existing?.text || '');
+    const completed = item.completed !== undefined ? item.completed : (existing?.completed || false);
+    const color = item.color !== undefined ? item.color : (existing?.color || '#3b82f6');
+    const card_id = item.card_id !== undefined ? item.card_id : (existing?.card_id || '');
+    
+    // Find next position if it's a new task
+    let position = item.position !== undefined ? item.position : (existing?.position || 0);
+    if (!existing) {
+      const cardTasks = taskItems.filter(t => t.card_id === card_id);
+      position = cardTasks.length > 0 ? Math.max(...cardTasks.map(t => t.position)) + 1 : 0;
+    }
+
+    const newTask: TaskItem = {
+      id: itemId,
+      card_id,
+      text,
+      completed,
+      color,
+      position,
+      created_at: existing?.created_at || new Date().toISOString()
+    };
+
+    let updatedItems = [...taskItems];
+    if (existing) {
+      updatedItems = updatedItems.map(t => t.id === itemId ? newTask : t);
+    } else {
+      updatedItems.push(newTask);
+    }
+    // Keep it sorted
+    updatedItems.sort((a, b) => a.position - b.position);
+    setTaskItems(updatedItems);
+
+    try {
+      await upsertTaskItem(newTask);
+    } catch (err) {
+      console.warn('[FastSheep] Error saving task to Supabase. Saving to localStorage.', err);
+      localStorage.setItem('fast_sheep_task_items', JSON.stringify(updatedItems));
+    }
+  };
+
+  const handleDeleteTask = async (id: string) => {
+    const updatedItems = taskItems.filter(t => t.id !== id);
+    setTaskItems(updatedItems);
+
+    try {
+      await deleteTaskItem(id);
+    } catch (err) {
+      console.warn('[FastSheep] Error deleting task from Supabase. Saving to localStorage.', err);
+      localStorage.setItem('fast_sheep_task_items', JSON.stringify(updatedItems));
+    }
+  };
+
+  const handleSaveColorTag = async (color: string, label: string) => {
+    const updatedTags = { ...colorTags, [color]: label };
+    setColorTags(updatedTags);
+
+    try {
+      await upsertColorTag({ color, label });
+    } catch (err) {
+      console.warn('[FastSheep] Error saving color tag to Supabase. Saving to localStorage.', err);
+      localStorage.setItem('fast_sheep_task_color_tags', JSON.stringify(updatedTags));
+    }
+  };
+
+  const handleDeleteColorTag = async (color: string) => {
+    const updatedTags = { ...colorTags };
+    delete updatedTags[color];
+    setColorTags(updatedTags);
+
+    try {
+      await deleteColorTag(color);
+    } catch (err) {
+      console.warn('[FastSheep] Error deleting color tag from Supabase. Saving to localStorage.', err);
+      localStorage.setItem('fast_sheep_task_color_tags', JSON.stringify(updatedTags));
+    }
+  };
+
+  const handleMoveTask = async (item: TaskItem, direction: 'up' | 'down') => {
+    const cardTasks = taskItems.filter(t => t.card_id === item.card_id).sort((a, b) => a.position - b.position);
+    const index = cardTasks.findIndex(t => t.id === item.id);
+    if (index === -1) return;
+
+    if (direction === 'up' && index > 0) {
+      const prevItem = cardTasks[index - 1];
+      const tempPos = item.position;
+      item.position = prevItem.position;
+      prevItem.position = tempPos;
+    } else if (direction === 'down' && index < cardTasks.length - 1) {
+      const nextItem = cardTasks[index + 1];
+      const tempPos = item.position;
+      item.position = nextItem.position;
+      nextItem.position = tempPos;
+    } else {
+      return; // Can't move further
+    }
+
+    // Update state
+    const updatedItems = taskItems.map(t => {
+      const match = cardTasks.find(ct => ct.id === t.id);
+      return match ? { ...t, position: match.position } : t;
+    }).sort((a, b) => a.position - b.position);
+
+    setTaskItems(updatedItems);
+
+    try {
+      // Save both updated items to Supabase
+      const affected = cardTasks.slice(Math.max(0, index - 1), index + 2);
+      for (const t of affected) {
+        await upsertTaskItem(t);
+      }
+    } catch (err) {
+      console.warn('[FastSheep] Error moving tasks on Supabase. Saving to localStorage.', err);
+      localStorage.setItem('fast_sheep_task_items', JSON.stringify(updatedItems));
+    }
+  };
+
+  // ============================================================
   // MAIN APP
   // ============================================================
   return (
@@ -4530,6 +4874,7 @@ USING (true);`;
             { key: 'suppliers',     icon: '🏬', label: t.suppliers },
             { key: 'quick_replies', icon: '💬', label: t.quick_replies },
             { key: 'emails',        icon: '📧', label: language === 'es' ? 'Plantillas de Emails' : 'Email Templates' },
+            { key: 'tasks',         icon: '📋', label: t.tasks },
           ].filter(({ key }) => !(key === 'balance' && isManager)).map(({ key, icon, label }) => (
             <a key={key} className={`menu-item ${currentTab === key ? 'active' : ''}`}
               onClick={() => {
@@ -4836,17 +5181,23 @@ USING (true);`;
                 {/* Seasonality – dynamic from real data */}
                 <div className="glass-card">
                   <h3 style={{ marginBottom: '16px' }}>📈 {t.seasonality}</h3>
-                  <div className="chart-container">
-                    {bi.seasonalityData.map((item, idx) => {
-                      const maxCount = Math.max(...bi.seasonalityData.map(d => d.count), 1);
-                      const pct = Math.round((item.count / maxCount) * 100);
-                      return (
-                        <div key={idx} className="bar-wrapper">
-                          <div className="chart-bar" style={{ height: `${Math.max(pct, 4)}%` }} data-value={item.count} />
-                          <span className="bar-label">{item.month}</span>
-                        </div>
-                      );
-                    })}
+                  <div className="chart-container" style={bi.seasonalityData.every(d => d.count === 0) ? { display: 'flex', justifyContent: 'center', alignItems: 'center' } : undefined}>
+                    {bi.seasonalityData.every(d => d.count === 0) ? (
+                      <p style={{ color: 'var(--text-muted)', fontSize: '13px' }}>
+                        {language === 'es' ? 'No hay datos de alquiler registrados.' : 'No rental data recorded.'}
+                      </p>
+                    ) : (
+                      bi.seasonalityData.map((item, idx) => {
+                        const maxCount = Math.max(...bi.seasonalityData.map(d => d.count), 1);
+                        const pct = Math.round((item.count / maxCount) * 100);
+                        return (
+                          <div key={idx} className="bar-wrapper">
+                            <div className="chart-bar" style={{ height: `${Math.max(pct, 4)}%` }} data-value={item.count} />
+                            <span className="bar-label">{item.month}</span>
+                          </div>
+                        );
+                      })
+                    )}
                   </div>
                 </div>
 
@@ -4876,8 +5227,9 @@ USING (true);`;
               ================================================ */}
           {currentTab === 'balance' && !isManager && (
             <>
-              <div className="header-actions-balance">
-                <div className="finance-filters">
+              <div className="header-actions-balance" style={{ display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: '16px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '16px', width: '100%' }}>
+                  <div className="finance-filters">
                   <select 
                     value={balanceFilterType} 
                     onChange={e => setBalanceFilterType(e.target.value as any)}
@@ -4996,6 +5348,16 @@ USING (true);`;
                 >
                   💸 {language === 'es' ? 'Agregar Gasto' : 'Add Expense'}
                 </button>
+                </div>
+                <div style={{ width: '100%' }}>
+                  <input
+                    className="form-control"
+                    style={{ width: '100%', maxWidth: '100%', padding: '10px 16px', fontSize: '14px' }}
+                    placeholder={language === 'es' ? '🔍 Buscar por descripción, producto, categoría...' : '🔍 Search by description, product, category...'}
+                    value={balanceSearch}
+                    onChange={e => setBalanceSearch(e.target.value)}
+                  />
+                </div>
               </div>
               
               <div className="kpis-grid">
@@ -5081,10 +5443,15 @@ USING (true);`;
                       </tr>
                     </thead>
                     <tbody>
-                      {balanceData.txs.length === 0 ? (
-                        <tr><td colSpan={5} style={{ textAlign: 'center', padding: '20px', color: 'var(--text-muted)' }}>No hay transacciones registradas.</td></tr>
+                      {(() => {
+                        const term = balanceSearch.trim().toLowerCase();
+                        const filteredTxs = term
+                          ? balanceData.txs.filter(tx => (tx.description || '').toLowerCase().includes(term) || (tx.category || '').toLowerCase().includes(term))
+                          : balanceData.txs;
+                        return filteredTxs.length === 0 ? (
+                        <tr><td colSpan={5} style={{ textAlign: 'center', padding: '20px', color: 'var(--text-muted)' }}>{balanceSearch.trim() ? (language === 'es' ? 'No hay transacciones que coincidan.' : 'No matching transactions.') : 'No hay transacciones registradas.'}</td></tr>
                       ) : (
-                        balanceData.txs.map((tx) => {
+                        filteredTxs.map((tx) => {
                           const formatDateToDDMMYY = (dateStr: string) => {
                             if (!dateStr) return '';
                             const cleanStr = dateStr.split('T')[0];
@@ -5152,7 +5519,7 @@ USING (true);`;
                                 {tx.type === 'income' ? '+' : '-'}€{tx.amount}
                                 <button
                                   onClick={async () => {
-                                    if (confirm(language === 'es' ? '¿Seguro que deseas eliminar esta transacción? Esta acción revertirá los efectos originales de la misma en la base de datos.' : 'Are you sure you want to delete this transaction? This will revert its original effects in the database.')) {
+                                    if (await asyncConfirm(language === 'es' ? '¿Seguro que deseas eliminar esta transacción? Esta acción revertirá los efectos originales de la misma en la base de datos.' : 'Are you sure you want to delete this transaction? This will revert its original effects in the database.')) {
                                       try {
                                         const rawId = tx.id;
                                         if (rawId.startsWith('other-')) {
@@ -5228,7 +5595,8 @@ USING (true);`;
                             </tr>
                           );
                         })
-                      )}
+                        );
+                      })()}
                     </tbody>
                   </table>
                 </div>
@@ -6268,12 +6636,6 @@ USING (true);`;
               {/* Sub-tabs Switcher */}
               <div className="subtabs-container">
                 <button
-                  className={`subtab-button ${stockSubTab === 'all_items' ? 'active' : ''}`}
-                  onClick={() => setStockSubTab('all_items')}
-                >
-                  🌐 {language === 'es' ? 'Todos los Artículos' : 'All Items'}
-                </button>
-                <button
                   className={`subtab-button ${stockSubTab === 'items' ? 'active' : ''}`}
                   onClick={() => setStockSubTab('items')}
                 >
@@ -6284,6 +6646,12 @@ USING (true);`;
                   onClick={() => setStockSubTab('sold')}
                 >
                   💶 {language === 'es' ? 'Artículos Vendidos' : 'Sold Items'}
+                </button>
+                <button
+                  className={`subtab-button ${stockSubTab === 'all_items' ? 'active' : ''}`}
+                  onClick={() => setStockSubTab('all_items')}
+                >
+                  🌐 {language === 'es' ? 'Todos los Artículos' : 'All Items'}
                 </button>
                 <button
                   className={`subtab-button ${stockSubTab === 'lost' ? 'active' : ''}`}
@@ -6457,13 +6825,41 @@ USING (true);`;
                               );
                             }
 
-                            return groupedList.map((group, index) => {
+                            return groupedList.map((group) => {
                               const prod = group[0];
-                              const isConsolidated = !!prod.custom_field_values?.location_distribution;
+                              const activeProd = group.find(p => p.status !== 'Vendida' && p.status !== 'Financiada' && p.status !== 'Robada' && p.status !== 'Perdida' && p.status !== 'Perdida/Garda') || prod;
+                              const isConsolidated = group.some(p => p.custom_field_values?.location_distribution);
+                              
+                              const consolidatedLocDist: Record<string, number> = {};
+                              group.filter(p => p.status !== 'Vendida' && p.status !== 'Financiada' && p.status !== 'Robada' && p.status !== 'Perdida' && p.status !== 'Perdida/Garda').forEach(p => {
+                                const dist = (p.custom_field_values?.location_distribution as Record<string, number>) || {};
+                                Object.entries(dist).forEach(([loc, qty]) => {
+                                  if (qty > 0) {
+                                    consolidatedLocDist[loc] = (consolidatedLocDist[loc] || 0) + qty;
+                                  }
+                                });
+                                // Only count a row as 1 implicit unit when it has NO location_distribution field at all
+                                // (a genuine single-unit row). A row whose location_distribution is an empty object {}
+                                // represents an emptied/sold-out consolidated row and must count as 0, not 1.
+                                const hasDistField = p.custom_field_values?.location_distribution != null;
+                                if (!hasDistField && p.custom_field_values?.location) {
+                                  const singleLoc = p.custom_field_values.location as string;
+                                  consolidatedLocDist[singleLoc] = (consolidatedLocDist[singleLoc] || 0) + 1;
+                                }
+                              });
+
                               const totalCount = isConsolidated
-                                ? Object.values(prod.custom_field_values.location_distribution as Record<string, number>).reduce((a, b) => a + b, 0)
+                                ? Object.values(consolidatedLocDist).reduce((a, b) => a + b, 0)
                                 : group.length;
-                              const isLastFew = index > 0 && index >= groupedList.length - 2;
+                              // Grand total = every unit ever, including sold, financed, lost and stolen.
+                              // For consolidated rows: sum each row's distribution, or count 1 for single
+                              // rows (e.g. sold/lost split-offs that no longer carry a distribution).
+                              const grandTotal = isConsolidated
+                                ? group.reduce((sum, p) => {
+                                    const d = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
+                                    return sum + (d != null ? Object.values(d).reduce((a, b) => a + (Number(b) || 0), 0) : 1);
+                                  }, 0)
+                                : group.length;
                               const serialDisplay = (prod.serial_number || '').replace(/^([A-Za-z]+)(\d+)$/, '$1-$2');
                               const catMatch = (categories || []).find(c => c && c.id === prod.category_id);
                               const categoryName = catMatch ? (language === 'es' ? catMatch.name_es : catMatch.name_en) : '';
@@ -6476,8 +6872,6 @@ USING (true);`;
                               const countShop = group.filter(p => p.status === 'Mantenimiento').length;
                               const countLost = group.filter(p => p.status === 'Robada' || p.status === 'Perdida' || p.status === 'Perdida/Garda').length;
                               const countSold = group.filter(p => p.status === 'Vendida' || p.status === 'Financiada').length;
-
-                              const hasRentals = group.some(p => (rentals || []).some(r => r && r.bike_id === p.id && r.status === 'Activo'));
 
                               return (
                                 <tr key={prod.id}>
@@ -6497,11 +6891,11 @@ USING (true);`;
                                   </td>
 {stockVisibleCols.location !== false && (
                                   <td>
-                                    {(prod.status === 'Vendida' || prod.status === 'Financiada' || prod.status === 'Robada' || prod.status === 'Perdida' || prod.status === 'Perdida/Garda') ? (
+                                    {group.every(p => p.status === 'Vendida' || p.status === 'Financiada' || p.status === 'Robada' || p.status === 'Perdida' || p.status === 'Perdida/Garda') ? (
                                       <span style={{ color: 'var(--text-muted)' }}>—</span>
-                                    ) : prod.custom_field_values?.location_distribution ? (
+                                    ) : isConsolidated ? (
                                       <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                                        {Object.entries(prod.custom_field_values.location_distribution as Record<string, number>)
+                                        {Object.entries(consolidatedLocDist)
                                           .filter(([_, qty]) => qty > 0)
                                           .map(([locName, qty]) => (
                                             <div key={locName} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -6510,13 +6904,13 @@ USING (true);`;
                                             </div>
                                           ))}
                                       </div>
-                                    ) : prod.custom_field_values?.location ? (
+                                    ) : activeProd.custom_field_values?.location ? (
                                       <div>
-                                        <strong>📍 {prod.custom_field_values.location as string}</strong>
-                                        {!!prod.custom_field_values.location_date && (
+                                        <strong>📍 {activeProd.custom_field_values.location as string}</strong>
+                                        {!!activeProd.custom_field_values.location_date && (
                                           <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: '2px' }}>
                                             {(() => {
-                                              const dStr = prod.custom_field_values.location_date as string;
+                                              const dStr = activeProd.custom_field_values.location_date as string;
                                               const parts = dStr.split('-');
                                               return parts.length === 3 ? `${parts[2]}/${parts[1]}/${parts[0].slice(-2)}` : dStr;
                                             })()}
@@ -6532,7 +6926,7 @@ USING (true);`;
                                   <td>{prod.price_sold ? <strong>€{prod.price_sold}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
                                   {stockVisibleCols.cost && (
-                                  <td>{prod.price_paid ? <strong>€{prod.price_paid}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td>{prod.price_paid ? <strong>€{prod.price_paid}{isConsolidated ? <span style={{ fontWeight: 400, color: 'var(--text-muted)', fontSize: '11px' }}> /u</span> : null}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
 {stockVisibleCols.condition !== false && (
                                   <td>
@@ -6617,13 +7011,15 @@ USING (true);`;
                                       const displayShop = isConsolidated ? countShop : countShop;
                                       const displayLost = isConsolidated ? countLost : countLost;
                                       const displaySold = isConsolidated ? countSold : countSold;
+                                      // totalCount (Stock) already excludes sold/lost rows, so available =
+                                      // stock minus only the units that are rented or in the workshop.
                                       const displayDisp = isConsolidated
-                                        ? Math.max(0, totalCount - displayRent - displayShop - displayLost - displaySold)
+                                        ? Math.max(0, totalCount - displayRent - displayShop)
                                         : Math.max(0, countDisp - countReqService - countReviewed);
                                       return (
                                         <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', alignItems: 'flex-start' }}>
                                           <span className="badge" style={{ background: 'rgba(255,255,255,0.06)', color: 'var(--text-bright)', alignSelf: 'flex-start', fontSize: '10px' }}>
-                                            Stock: {totalCount}
+                                            Total: {grandTotal}
                                           </span>
                                           <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', fontSize: '10px' }}>
                                             {displayDisp > 0 && <span className="badge status-available" style={{ fontSize: '9px', padding: '2px 5px' }}>{displayDisp} {language === 'es' ? 'Disp' : 'Avail'}</span>}
@@ -6672,9 +7068,10 @@ USING (true);`;
                                   )}
                                   <td>
                                     <div style={{ display: 'flex', gap: '6px', flexWrap: 'nowrap', alignItems: 'center' }}>
-                                      {countDisp > 0 ? (
+                                      {(isConsolidated ? totalCount : countDisp) > 0 ? (
                                         <button className="btn-primary btn-xs" onClick={() => {
-                                          const availableUnit = group.find(p => p.status === 'Disponible');
+                                          // Prefer a Disponible row that still has real stock; fall back to any Disponible row
+                                          const availableUnit = group.find(p => p.status === 'Disponible' && (!isConsolidated || Object.values((p.custom_field_values?.location_distribution as Record<string, number>) || {}).reduce((a, b) => a + b, 0) > 0)) || group.find(p => p.status === 'Disponible');
                                           if (availableUnit) openSoldModal(availableUnit);
                                         }}>💶 {t.markSold}</button>
                                       ) : (
@@ -6700,312 +7097,25 @@ USING (true);`;
                                           style={{ display: 'flex', alignItems: 'center', gap: '4px' }}
                                           onClick={(e) => {
                                             e.stopPropagation();
-                                            setActiveStockMenuId(activeStockMenuId === prod.id ? null : prod.id);
+                                            const rect = e.currentTarget.getBoundingClientRect();
+                                            if (activeStockMenuId === prod.id) {
+                                              setActiveStockMenuId(null);
+                                              setMenuCoords(null);
+                                            } else {
+                                              setActiveStockMenuId(prod.id);
+                                              setMenuCoords({
+                                                top: rect.top,
+                                                left: rect.left,
+                                                width: rect.width,
+                                                height: rect.height
+                                              });
+                                            }
                                           }}
                                         >
                                           ➕ {language === 'es' ? 'Más' : 'More'}
                                         </button>
                                         
-                                        {activeStockMenuId === prod.id && (
-                                          <>
-                                            <div 
-                                              style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 90, cursor: 'default' }}
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                setActiveStockMenuId(null);
-                                              }}
-                                            />
-                                            
-                                            <div 
-                                              style={{ 
-                                                position: 'absolute', 
-                                                ...(isLastFew ? { bottom: 'calc(100% + 4px)' } : { top: 'calc(100% + 4px)' }),
-                                                right: 0, 
-                                                background: 'rgba(23, 23, 37, 0.98)', 
-                                                backdropFilter: 'blur(12px)',
-                                                WebkitBackdropFilter: 'blur(12px)',
-                                                border: '1px solid rgba(255, 255, 255, 0.08)', 
-                                                borderRadius: '8px', 
-                                                padding: '6px', 
-                                                minWidth: '150px', 
-                                                zIndex: 100, 
-                                                boxShadow: '0 10px 25px rgba(0, 0, 0, 0.6)',
-                                                display: 'flex',
-                                                flexDirection: 'column',
-                                                gap: '4px'
-                                              }}
-                                            >
-                                              <button
-                                                className="dropdown-item"
-                                                style={{
-                                                  width: '100%',
-                                                  textAlign: 'left',
-                                                  background: 'transparent',
-                                                  border: 'none',
-                                                  borderRadius: '6px',
-                                                  padding: '8px 12px',
-                                                  fontSize: '12px',
-                                                  color: 'var(--text-muted)',
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease'
-                                                }}
-                                                onClick={() => {
-                                                  setActiveStockMenuId(null);
-                                                  openProductModal(prod);
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                  e.currentTarget.style.color = 'var(--text-bright)';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'var(--text-muted)';
-                                                }}
-                                              >
-                                                ✏️ {t.edit}
-                                              </button>
-
-                                              {prod.status !== 'Vendida' && prod.status !== 'Financiada' && (
-                                                <>
-                                                  <button
-                                                    className="dropdown-item"
-                                                    style={{ 
-                                                      width: '100%', 
-                                                      textAlign: 'left', 
-                                                      background: 'transparent', 
-                                                      border: 'none', 
-                                                      borderRadius: '6px', 
-                                                      padding: '8px 12px', 
-                                                      fontSize: '12px', 
-                                                      color: 'var(--text-muted)', 
-                                                      cursor: 'pointer',
-                                                      display: 'flex',
-                                                      alignItems: 'center',
-                                                      gap: '8px',
-                                                      transition: 'all 0.2s ease'
-                                                    }}
-                                                    onClick={() => {
-                                                      setActiveStockMenuId(null);
-                                                      setSelectedProductId(prod.id);
-                                                      setSelectedLocation((prod.custom_field_values?.location as string) || '');
-                                                      setSelectedLocationDate((prod.custom_field_values?.location_date as string) || new Date().toISOString().split('T')[0]);
-                                                      setModalType('changeLocation');
-                                                    }}
-                                                    onMouseEnter={(e) => {
-                                                      e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                      e.currentTarget.style.color = 'var(--text-bright)';
-                                                    }}
-                                                    onMouseLeave={(e) => {
-                                                      e.currentTarget.style.background = 'transparent';
-                                                      e.currentTarget.style.color = 'var(--text-muted)';
-                                                    }}
-                                                  >
-                                                    📍 {language === 'es' ? 'Ubicación' : 'Location'}
-                                                  </button>
-
-                                                  {(prod.category_id === catBikeId || prod.category_id === catBattId) && (
-                                                    <button 
-                                                      className="dropdown-item"
-                                                      style={{ 
-                                                        width: '100%', 
-                                                        textAlign: 'left', 
-                                                        background: 'transparent', 
-                                                        border: 'none', 
-                                                        borderRadius: '6px', 
-                                                        padding: '8px 12px', 
-                                                        fontSize: '12px', 
-                                                        color: 'var(--text-muted)', 
-                                                        cursor: 'pointer',
-                                                        display: 'flex',
-                                                        alignItems: 'center',
-                                                        gap: '8px',
-                                                        transition: 'all 0.2s ease'
-                                                      }}
-                                                      onClick={() => {
-                                                        setActiveStockMenuId(null);
-                                                        setSelectedProductId(prod.id);
-                                                        setSelectedCondition(prod.condition || 'bueno');
-                                                        setModalType('changeCondition');
-                                                      }}
-                                                      onMouseEnter={(e) => {
-                                                        e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                        e.currentTarget.style.color = 'var(--text-bright)';
-                                                      }}
-                                                      onMouseLeave={(e) => {
-                                                        e.currentTarget.style.background = 'transparent';
-                                                        e.currentTarget.style.color = 'var(--text-muted)';
-                                                      }}
-                                                    >
-                                                      ✨ {language === 'es' ? 'Condición' : 'Condition'}
-                                                    </button>
-                                                  )}
-                                                </>
-                                              )}
-
-                                              {(prod.category_id === catBikeId || prod.category_id === catBattId) && (prod.status || '') !== 'Vendida' && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    setModalType('bikeHistory');
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  🔧 Service
-                                                </button>
-                                              )}
-
-                                              {prod.category_id === catBikeId && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    setModalType('bikeModifications');
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  🛠️ {language === 'es' ? 'Modificaciones' : 'Modifications'}
-                                                </button>
-                                              )}
-
-
-                                              <button 
-                                                className="dropdown-item"
-                                                style={{ 
-                                                  width: '100%', 
-                                                  textAlign: 'left', 
-                                                  background: 'transparent', 
-                                                  border: 'none', 
-                                                  borderRadius: '6px', 
-                                                  padding: '8px 12px', 
-                                                  fontSize: '12px', 
-                                                  color: 'var(--text-muted)', 
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease'
-                                                }}
-                                                onClick={() => {
-                                                  setActiveStockMenuId(null);
-                                                  setActiveNoteProduct(prod);
-                                                  setActiveNoteProductGroup(group);
-                                                  setProductNotesText(prod.notes || '');
-                                                  setModalType('productNotes');
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                  e.currentTarget.style.color = 'var(--text-bright)';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'var(--text-muted)';
-                                                }}
-                                              >
-                                                📝 {language === 'es' ? 'Notas' : 'Notes'}
-                                              </button>
-
-                                              <button 
-                                                className="dropdown-item-danger"
-                                                style={{ 
-                                                  width: '100%', 
-                                                  textAlign: 'left', 
-                                                  background: 'transparent', 
-                                                  border: 'none', 
-                                                  borderRadius: '6px', 
-                                                  padding: '8px 12px', 
-                                                  fontSize: '12px', 
-                                                  color: 'rgba(239, 68, 68, 0.85)', 
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease',
-                                                  borderTop: '1px solid rgba(255, 255, 255, 0.06)',
-                                                  marginTop: '4px',
-                                                  paddingTop: '8px'
-                                                }}
-                                                onClick={async () => {
-                                                  setActiveStockMenuId(null);
-                                                  const confirmMsg = totalCount > 1 
-                                                    ? (language === 'es' ? `⚠️ ¿Eliminar TODAS las ${totalCount} unidades de este lote?` : `⚠️ Delete ALL ${totalCount} units of this batch?`)
-                                                    : (language === 'es' ? '¿Eliminar este producto del inventario?' : 'Delete this product from inventory?');
-                                                  
-                                                  if (hasRentals) {
-                                                    if (!confirm(language === 'es' ? '⚠️ Este lote/producto tiene alquileres activos. ¿Eliminar de todos modos?' : '⚠️ This batch/product has active rentals. Delete anyway?')) return;
-                                                  } else {
-                                                    if (!confirm(confirmMsg)) return;
-                                                  }
-
-                                                  try {
-                                                    await Promise.all(group.map(p => deleteProduct(p.id)));
-                                                    showToast(language === 'es' ? 'Stock eliminado.' : 'Stock deleted.');
-                                                    triggerReload();
-                                                  } catch { showToast(language === 'es' ? 'Error al eliminar.' : 'Delete error.', 'error'); }
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(239, 68, 68, 0.12)';
-                                                  e.currentTarget.style.color = '#f87171';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'rgba(239, 68, 68, 0.85)';
-                                                }}
-                                              >
-                                                🗑️ {t.delete}
-                                              </button>
-                                            </div>
-                                          </>
-                                        )}
+                                        
                                       </div>
                                     </div>
                                   </td>
@@ -7116,12 +7226,31 @@ USING (true);`;
                               );
                             }
 
-                            return groupedList.map((group, index) => {
+                            return groupedList.map((group) => {
                               const prod = group[0];
-                              const isConsolidated = !!prod.custom_field_values?.location_distribution;
-                              const isLastFew = index > 0 && index >= groupedList.length - 2;
+                              const activeProd = group.find(p => p.status !== 'Vendida' && p.status !== 'Financiada' && p.status !== 'Robada' && p.status !== 'Perdida' && p.status !== 'Perdida/Garda') || prod;
+                              const isConsolidated = group.some(p => p.custom_field_values?.location_distribution);
+                              
+                              const consolidatedLocDist: Record<string, number> = {};
+                              group.filter(p => p.status !== 'Vendida' && p.status !== 'Financiada' && p.status !== 'Robada' && p.status !== 'Perdida' && p.status !== 'Perdida/Garda').forEach(p => {
+                                const dist = (p.custom_field_values?.location_distribution as Record<string, number>) || {};
+                                Object.entries(dist).forEach(([loc, qty]) => {
+                                  if (qty > 0) {
+                                    consolidatedLocDist[loc] = (consolidatedLocDist[loc] || 0) + qty;
+                                  }
+                                });
+                                // Only count a row as 1 implicit unit when it has NO location_distribution field at all
+                                // (a genuine single-unit row). A row whose location_distribution is an empty object {}
+                                // represents an emptied/sold-out consolidated row and must count as 0, not 1.
+                                const hasDistField = p.custom_field_values?.location_distribution != null;
+                                if (!hasDistField && p.custom_field_values?.location) {
+                                  const singleLoc = p.custom_field_values.location as string;
+                                  consolidatedLocDist[singleLoc] = (consolidatedLocDist[singleLoc] || 0) + 1;
+                                }
+                              });
+
                               const totalCount = isConsolidated
-                                ? Object.values(prod.custom_field_values.location_distribution as Record<string, number>).reduce((a, b) => a + b, 0)
+                                ? Object.values(consolidatedLocDist).reduce((a, b) => a + b, 0)
                                 : group.length;
                               const serialDisplay = (prod.serial_number || '').replace(/^([A-Za-z]+)(\d+)$/, '$1-$2');
                               const catMatch = (categories || []).find(c => c && c.id === prod.category_id);
@@ -7133,8 +7262,6 @@ USING (true);`;
                               const countReviewed = isConsolidated ? 0 : group.filter(p => p.status === 'Disponible' && p.maintenance_status === 'Al día' && isWithinLast30Days(p.last_service_date)).length;
                               const countRent = isConsolidated ? 0 : group.filter(p => p.status === 'Rentada').length;
                               const countShop = isConsolidated ? 0 : group.filter(p => p.status === 'Mantenimiento').length;
-
-                              const hasRentals = group.some(p => (rentals || []).some(r => r && r.bike_id === p.id && r.status === 'Activo'));
 
                               return (
                                 <tr key={prod.id}>
@@ -7154,11 +7281,11 @@ USING (true);`;
                                   </td>
 {stockVisibleCols.location !== false && (
                                   <td>
-                                    {(prod.status === 'Vendida' || prod.status === 'Financiada' || prod.status === 'Robada' || prod.status === 'Perdida' || prod.status === 'Perdida/Garda') ? (
+                                    {group.every(p => p.status === 'Vendida' || p.status === 'Financiada' || p.status === 'Robada' || p.status === 'Perdida' || p.status === 'Perdida/Garda') ? (
                                       <span style={{ color: 'var(--text-muted)' }}>—</span>
-                                    ) : prod.custom_field_values?.location_distribution ? (
+                                    ) : isConsolidated ? (
                                       <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                                        {Object.entries(prod.custom_field_values.location_distribution as Record<string, number>)
+                                        {Object.entries(consolidatedLocDist)
                                           .filter(([_, qty]) => qty > 0)
                                           .map(([locName, qty]) => (
                                             <div key={locName} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -7167,13 +7294,13 @@ USING (true);`;
                                             </div>
                                           ))}
                                       </div>
-                                    ) : prod.custom_field_values?.location ? (
+                                    ) : activeProd.custom_field_values?.location ? (
                                       <div>
-                                        <strong>📍 {prod.custom_field_values.location as string}</strong>
-                                        {!!prod.custom_field_values.location_date && (
+                                        <strong>📍 {activeProd.custom_field_values.location as string}</strong>
+                                        {!!activeProd.custom_field_values.location_date && (
                                           <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: '2px' }}>
                                             {(() => {
-                                              const dStr = prod.custom_field_values.location_date as string;
+                                              const dStr = activeProd.custom_field_values.location_date as string;
                                               const parts = dStr.split('-');
                                               return parts.length === 3 ? `${parts[2]}/${parts[1]}/${parts[0].slice(-2)}` : dStr;
                                             })()}
@@ -7189,7 +7316,7 @@ USING (true);`;
                                   <td>{prod.price_sold ? <strong>€{prod.price_sold}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
                                   {stockVisibleCols.cost && (
-                                  <td>{prod.price_paid ? <strong>€{prod.price_paid}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td>{prod.price_paid ? <strong>€{prod.price_paid}{isConsolidated ? <span style={{ fontWeight: 400, color: 'var(--text-muted)', fontSize: '11px' }}> /u</span> : null}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
 {stockVisibleCols.condition !== false && (
                                   <td>
@@ -7266,22 +7393,30 @@ USING (true);`;
                                           })()}
                                         </span>
                                       );
-                                    })() : (
-                                      <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', alignItems: 'flex-start' }}>
-                                        <span className="badge status-available" style={{ fontWeight: 'bold', fontSize: '11px' }}>
-                                          {language === 'es' ? `${countDisp} Disponibles` : `${countDisp} Available`}
-                                        </span>
-                                        {(countReqService > 0 || countReviewed > 0 || countRent > 0 || countShop > 0) && (
+                                    })() : (() => {
+                                      // "Stock" here = active stock only (sold/lost/stolen are already excluded from this tab).
+                                      const displayRent = isConsolidated
+                                        ? (rentals || []).filter(r => group.some(p => p.id === r.bike_id) && r.status === 'Activo').length
+                                        : countRent;
+                                      const displayShop = isConsolidated ? group.filter(p => p.status === 'Mantenimiento').length : countShop;
+                                      const displayDisp = isConsolidated
+                                        ? Math.max(0, totalCount - displayRent - displayShop)
+                                        : Math.max(0, countDisp - countReqService - countReviewed);
+                                      return (
+                                        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', alignItems: 'flex-start' }}>
+                                          <span className="badge" style={{ background: 'rgba(255,255,255,0.06)', color: 'var(--text-bright)', alignSelf: 'flex-start', fontSize: '10px' }}>
+                                            Stock: {totalCount}
+                                          </span>
                                           <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', fontSize: '10px' }}>
-                                            {countDisp - countReqService - countReviewed > 0 && <span className="badge status-available" style={{ fontSize: '9px', padding: '2px 5px' }}>{countDisp - countReqService - countReviewed} {language === 'es' ? 'Disp' : 'Avail'}</span>}
-                                            {countReviewed > 0 && <span className="badge status-reviewed" style={{ fontSize: '9px', padding: '2px 5px' }}>{countReviewed} {language === 'es' ? 'Rev.' : 'Serv.'}</span>}
-                                            {countReqService > 0 && <span className="badge status-lost" style={{ fontSize: '9px', padding: '2px 5px' }}>{countReqService} Req. Serv.</span>}
-                                            {countRent > 0 && <span className="badge status-rented" style={{ fontSize: '9px', padding: '2px 5px' }}>{countRent} Rent</span>}
-                                            {countShop > 0 && <span className="badge status-maintenance" style={{ fontSize: '9px', padding: '2px 5px' }}>{countShop} {language === 'es' ? 'Taller' : 'Shop'}</span>}
+                                            {displayDisp > 0 && <span className="badge status-available" style={{ fontSize: '9px', padding: '2px 5px' }}>{displayDisp} {language === 'es' ? 'Disp' : 'Avail'}</span>}
+                                            {!isConsolidated && countReviewed > 0 && <span className="badge status-reviewed" style={{ fontSize: '9px', padding: '2px 5px' }}>{countReviewed} {language === 'es' ? 'Rev.' : 'Serv.'}</span>}
+                                            {!isConsolidated && countReqService > 0 && <span className="badge status-lost" style={{ fontSize: '9px', padding: '2px 5px' }}>{countReqService} Req. Serv.</span>}
+                                            {displayRent > 0 && <span className="badge status-rented" style={{ fontSize: '9px', padding: '2px 5px' }}>{displayRent} Rent</span>}
+                                            {displayShop > 0 && <span className="badge status-maintenance" style={{ fontSize: '9px', padding: '2px 5px' }}>{displayShop} {language === 'es' ? 'Taller' : 'Shop'}</span>}
                                           </div>
-                                        )}
-                                      </div>
-                                    )}
+                                        </div>
+                                      );
+                                    })()}
                                   </td>
                                   {stockVisibleCols.frame_serial && (
                                   <td><span style={{ fontFamily: 'monospace', fontSize: '11px' }}>{prod.frame_serial || <span style={{ color: 'var(--text-muted)' }}>-</span>}</span></td>
@@ -7316,9 +7451,10 @@ USING (true);`;
                                   )}
                                   <td>
                                     <div style={{ display: 'flex', gap: '6px', flexWrap: 'nowrap', alignItems: 'center' }}>
-                                      {countDisp > 0 ? (
+                                      {(isConsolidated ? totalCount : countDisp) > 0 ? (
                                         <button className="btn-primary btn-xs" onClick={() => {
-                                          const availableUnit = group.find(p => p.status === 'Disponible');
+                                          // Prefer a Disponible row that still has real stock; fall back to any Disponible row
+                                          const availableUnit = group.find(p => p.status === 'Disponible' && (!isConsolidated || Object.values((p.custom_field_values?.location_distribution as Record<string, number>) || {}).reduce((a, b) => a + b, 0) > 0)) || group.find(p => p.status === 'Disponible');
                                           if (availableUnit) openSoldModal(availableUnit);
                                         }}>💶 {t.markSold}</button>
                                       ) : (
@@ -7344,314 +7480,25 @@ USING (true);`;
                                           style={{ display: 'flex', alignItems: 'center', gap: '4px' }}
                                           onClick={(e) => {
                                             e.stopPropagation();
-                                            setActiveStockMenuId(activeStockMenuId === prod.id ? null : prod.id);
+                                            const rect = e.currentTarget.getBoundingClientRect();
+                                            if (activeStockMenuId === prod.id) {
+                                              setActiveStockMenuId(null);
+                                              setMenuCoords(null);
+                                            } else {
+                                              setActiveStockMenuId(prod.id);
+                                              setMenuCoords({
+                                                top: rect.top,
+                                                left: rect.left,
+                                                width: rect.width,
+                                                height: rect.height
+                                              });
+                                            }
                                           }}
                                         >
                                           ➕ {language === 'es' ? 'Más' : 'More'}
                                         </button>
                                         
-                                        {activeStockMenuId === prod.id && (
-                                          <>
-                                            {/* Click-away overlay */}
-                                            <div 
-                                              style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 90, cursor: 'default' }}
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                setActiveStockMenuId(null);
-                                              }}
-                                            />
-                                            
-                                            {/* Dropdown Menu */}
-                                            <div 
-                                              style={{ 
-                                                position: 'absolute', 
-                                                ...(isLastFew ? { bottom: 'calc(100% + 4px)' } : { top: 'calc(100% + 4px)' }),
-                                                right: 0, 
-                                                background: 'rgba(23, 23, 37, 0.98)', 
-                                                backdropFilter: 'blur(12px)',
-                                                WebkitBackdropFilter: 'blur(12px)',
-                                                border: '1px solid rgba(255, 255, 255, 0.08)', 
-                                                borderRadius: '8px', 
-                                                padding: '6px', 
-                                                minWidth: '150px', 
-                                                zIndex: 100, 
-                                                boxShadow: '0 10px 25px rgba(0, 0, 0, 0.6)',
-                                                display: 'flex',
-                                                flexDirection: 'column',
-                                                gap: '4px'
-                                              }}
-                                            >
-                                              <button
-                                                className="dropdown-item"
-                                                style={{
-                                                  width: '100%',
-                                                  textAlign: 'left',
-                                                  background: 'transparent',
-                                                  border: 'none',
-                                                  borderRadius: '6px',
-                                                  padding: '8px 12px',
-                                                  fontSize: '12px',
-                                                  color: 'var(--text-muted)',
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease'
-                                                }}
-                                                onClick={() => {
-                                                  setActiveStockMenuId(null);
-                                                  openProductModal(prod);
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                  e.currentTarget.style.color = 'var(--text-bright)';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'var(--text-muted)';
-                                                }}
-                                              >
-                                                ✏️ {t.edit}
-                                              </button>
-
-                                              {prod.status !== 'Vendida' && prod.status !== 'Financiada' && (
-                                                <>
-                                                  <button
-                                                    className="dropdown-item"
-                                                    style={{ 
-                                                      width: '100%', 
-                                                      textAlign: 'left', 
-                                                      background: 'transparent', 
-                                                      border: 'none', 
-                                                      borderRadius: '6px', 
-                                                      padding: '8px 12px', 
-                                                      fontSize: '12px', 
-                                                      color: 'var(--text-muted)', 
-                                                      cursor: 'pointer',
-                                                      display: 'flex',
-                                                      alignItems: 'center',
-                                                      gap: '8px',
-                                                      transition: 'all 0.2s ease'
-                                                    }}
-                                                    onClick={() => {
-                                                      setActiveStockMenuId(null);
-                                                      setSelectedProductId(prod.id);
-                                                      setSelectedLocation((prod.custom_field_values?.location as string) || '');
-                                                      setSelectedLocationDate((prod.custom_field_values?.location_date as string) || new Date().toISOString().split('T')[0]);
-                                                      setModalType('changeLocation');
-                                                    }}
-                                                    onMouseEnter={(e) => {
-                                                      e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                      e.currentTarget.style.color = 'var(--text-bright)';
-                                                    }}
-                                                    onMouseLeave={(e) => {
-                                                      e.currentTarget.style.background = 'transparent';
-                                                      e.currentTarget.style.color = 'var(--text-muted)';
-                                                    }}
-                                                  >
-                                                    📍 {language === 'es' ? 'Ubicación' : 'Location'}
-                                                  </button>
-
-                                                  {(prod.category_id === catBikeId || prod.category_id === catBattId) && (
-                                                    <button 
-                                                      className="dropdown-item"
-                                                      style={{ 
-                                                        width: '100%', 
-                                                        textAlign: 'left', 
-                                                        background: 'transparent', 
-                                                        border: 'none', 
-                                                        borderRadius: '6px', 
-                                                        padding: '8px 12px', 
-                                                        fontSize: '12px', 
-                                                        color: 'var(--text-muted)', 
-                                                        cursor: 'pointer',
-                                                        display: 'flex',
-                                                        alignItems: 'center',
-                                                        gap: '8px',
-                                                        transition: 'all 0.2s ease'
-                                                      }}
-                                                      onClick={() => {
-                                                        setActiveStockMenuId(null);
-                                                        setSelectedProductId(prod.id);
-                                                        setSelectedCondition(prod.condition || 'bueno');
-                                                        setModalType('changeCondition');
-                                                      }}
-                                                      onMouseEnter={(e) => {
-                                                        e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                        e.currentTarget.style.color = 'var(--text-bright)';
-                                                      }}
-                                                      onMouseLeave={(e) => {
-                                                        e.currentTarget.style.background = 'transparent';
-                                                        e.currentTarget.style.color = 'var(--text-muted)';
-                                                      }}
-                                                    >
-                                                      ✨ {language === 'es' ? 'Condición' : 'Condition'}
-                                                    </button>
-                                                  )}
-                                                </>
-                                              )}
-
-                                              {(prod.category_id === catBikeId || prod.category_id === catBattId) && (prod.status || '') !== 'Vendida' && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    setModalType('bikeHistory');
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  🔧 Service
-                                                </button>
-                                              )}
-
-                                              {prod.category_id === catBikeId && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    setModalType('bikeModifications');
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  🛠️ {language === 'es' ? 'Modificaciones' : 'Modifications'}
-                                                </button>
-                                              )}
-
-
-                                              <button 
-                                                className="dropdown-item"
-                                                style={{ 
-                                                  width: '100%', 
-                                                  textAlign: 'left', 
-                                                  background: 'transparent', 
-                                                  border: 'none', 
-                                                  borderRadius: '6px', 
-                                                  padding: '8px 12px', 
-                                                  fontSize: '12px', 
-                                                  color: 'var(--text-muted)', 
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease'
-                                                }}
-                                                onClick={() => {
-                                                  setActiveStockMenuId(null);
-                                                  setActiveNoteProduct(prod);
-                                                  setActiveNoteProductGroup(group);
-                                                  setProductNotesText(prod.notes || '');
-                                                  setModalType('productNotes');
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                  e.currentTarget.style.color = 'var(--text-bright)';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'var(--text-muted)';
-                                                }}
-                                              >
-                                                📝 {language === 'es' ? 'Notas' : 'Notes'}
-                                              </button>
-
-                                              <button 
-                                                className="dropdown-item-danger"
-                                                style={{ 
-                                                  width: '100%', 
-                                                  textAlign: 'left', 
-                                                  background: 'transparent', 
-                                                  border: 'none', 
-                                                  borderRadius: '6px', 
-                                                  padding: '8px 12px', 
-                                                  fontSize: '12px', 
-                                                  color: 'rgba(239, 68, 68, 0.85)', 
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease',
-                                                  borderTop: '1px solid rgba(255, 255, 255, 0.06)',
-                                                  marginTop: '4px',
-                                                  paddingTop: '8px'
-                                                }}
-                                                onClick={async () => {
-                                                  setActiveStockMenuId(null);
-                                                  const confirmMsg = totalCount > 1 
-                                                    ? (language === 'es' ? `⚠️ ¿Eliminar TODAS las ${totalCount} unidades de este lote?` : `⚠️ Delete ALL ${totalCount} units of this batch?`)
-                                                    : (language === 'es' ? '¿Eliminar este producto del inventario?' : 'Delete this product from inventory?');
-                                                  
-                                                  if (hasRentals) {
-                                                    if (!confirm(language === 'es' ? '⚠️ Este lote/producto tiene alquileres activos. ¿Eliminar de todos modos?' : '⚠️ This batch/product has active rentals. Delete anyway?')) return;
-                                                  } else {
-                                                    if (!confirm(confirmMsg)) return;
-                                                  }
-
-                                                  try {
-                                                    await Promise.all(group.map(p => deleteProduct(p.id)));
-                                                    showToast(language === 'es' ? 'Stock eliminado.' : 'Stock deleted.');
-                                                    triggerReload();
-                                                  } catch { showToast(language === 'es' ? 'Error al eliminar.' : 'Delete error.', 'error'); }
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(239, 68, 68, 0.12)';
-                                                  e.currentTarget.style.color = '#f87171';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'rgba(239, 68, 68, 0.85)';
-                                                }}
-                                              >
-                                                🗑️ {t.delete}
-                                              </button>
-                                            </div>
-                                          </>
-                                        )}
+                                        
                                       </div>
                                     </div>
                                   </td>
@@ -7833,10 +7680,19 @@ USING (true);`;
                       return true;
                     });
 
+                    // Most recent sale first
+                    filteredSold.sort((a, b) => {
+                      const byDate = (b.sold_date || '').localeCompare(a.sold_date || '');
+                      if (byDate !== 0) return byDate;
+                      return (b.date_added || '').localeCompare(a.date_added || '');
+                    });
+
                     const unitsSold = filteredSold.length;
                     const totalRevenue = filteredSold.reduce((acc, p) => acc + (p.price_sold || 0), 0);
                     const totalCost = filteredSold.reduce((acc, p) => acc + (p.price_paid || 0), 0);
                     const totalProfit = totalRevenue - totalCost;
+                    const displayTotalProfit = totalProfit % 1 !== 0 ? totalProfit.toFixed(1) : totalProfit;
+                    const displayAbsTotalProfit = Math.abs(totalProfit) % 1 !== 0 ? Math.abs(totalProfit).toFixed(1) : Math.abs(totalProfit);
 
                     return (
                       <>
@@ -7856,7 +7712,7 @@ USING (true);`;
                           <div className="glass-card stat-card" style={{ padding: '16px' }}>
                             <div className="stat-label">{language === 'es' ? 'Ganancia Neta' : 'Net Profit'}</div>
                             <div className="stat-value" style={{ color: totalProfit >= 0 ? '#34d399' : '#f87171' }}>
-                              {totalProfit >= 0 ? `+€${totalProfit}` : `-€${Math.abs(totalProfit)}`}
+                              {totalProfit >= 0 ? `+€${displayTotalProfit}` : `-€${displayAbsTotalProfit}`}
                             </div>
                           </div>
                         </div>
@@ -7892,6 +7748,8 @@ USING (true);`;
                                 ) : (
                                   filteredSold.map(s => {
                                     const gain = (s.price_sold || 0) - (s.price_paid || 0);
+                                    const displayGain = gain % 1 !== 0 ? gain.toFixed(1) : gain;
+                                    const displayAbsGain = Math.abs(gain) % 1 !== 0 ? Math.abs(gain).toFixed(1) : Math.abs(gain);
                                     const serialDisplay = (s.serial_number || '').replace(/^([A-Za-z]+)(\d+)$/, '$1-$2');
                                     const catMatch = (categories || []).find(c => c && c.id === s.category_id);
                                     const categoryName = catMatch ? (language === 'es' ? catMatch.name_es : catMatch.name_en) : '';
@@ -7916,7 +7774,7 @@ USING (true);`;
                                         {soldVisibleCols.profit       && (
                                           <td>
                                             <span style={{ fontWeight: 'bold', color: gain >= 0 ? '#34d399' : '#f87171' }}>
-                                              {gain >= 0 ? `+€${gain}` : `-€${Math.abs(gain)}`}
+                                              {gain >= 0 ? `+€${displayGain}` : `-€${displayAbsGain}`}
                                             </span>
                                           </td>
                                         )}
@@ -7981,6 +7839,30 @@ USING (true);`;
                                           >
                                             ✏️ {language === 'es' ? 'Editar' : 'Edit'}
                                           </button>
+                                          {isProductGeneric(s) && (
+                                            <button 
+                                              className={`btn-secondary btn-xs ${activeStockMenuId === s.id ? 'active' : ''}`}
+                                              style={{ display: 'flex', alignItems: 'center', gap: '4px' }}
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                const rect = e.currentTarget.getBoundingClientRect();
+                                                if (activeStockMenuId === s.id) {
+                                                  setActiveStockMenuId(null);
+                                                  setMenuCoords(null);
+                                                } else {
+                                                  setActiveStockMenuId(s.id);
+                                                  setMenuCoords({
+                                                    top: rect.top,
+                                                    left: rect.left,
+                                                    width: rect.width,
+                                                    height: rect.height
+                                                  });
+                                                }
+                                              }}
+                                            >
+                                              ➕ {language === 'es' ? 'Más' : 'More'}
+                                            </button>
+                                          )}
                                         </td>
                                       </tr>
                                     );
@@ -8175,7 +8057,7 @@ USING (true);`;
                                         </button>
                                         <button className="btn-danger btn-xs" onClick={async () => {
                                           if ((pm.unit_count || 0) > 0) {
-                                            if (!confirm(language === 'es'
+                                            if (!await asyncConfirm(language === 'es'
                                               ? `Esta plantilla tiene ${pm.unit_count} unidades vinculadas. ¿Eliminar igualmente? Los productos no se borrarán.`
                                               : `This template has ${pm.unit_count} linked units. Delete anyway? Products won't be deleted.`
                                             )) return;
@@ -9072,7 +8954,7 @@ USING (true);`;
                                     className="btn-secondary btn-xs"
                                     style={{ padding: '2px 8px', height: '24px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px', color: '#f87171', borderColor: 'rgba(248,113,113,0.2)' }}
                                     onClick={async () => {
-                                      if (window.confirm(language === 'es' ? '¿Estás seguro de eliminar todas las imágenes del contrato?' : 'Are you sure you want to delete all contract images?')) {
+                                      if (await asyncConfirm(language === 'es' ? '¿Estás seguro de eliminar todas las imágenes del contrato?' : 'Are you sure you want to delete all contract images?')) {
                                         try {
                                           const updatedRental = { ...latestRental, contract_url: null, contract_type: 'digital' as const };
                                           await upsertRental(updatedRental);
@@ -9590,7 +9472,7 @@ USING (true);`;
                                         ✏️ {language === 'es' ? 'Editar' : 'Edit'}
                                       </button>
                                       <button onClick={async () => {
-                                        if (window.confirm(language === 'es' ? '¿Estás seguro de eliminar este alquiler permanentemente?' : 'Are you sure you want to permanently delete this rental?')) {
+                                        if (await asyncConfirm(language === 'es' ? '¿Estás seguro de eliminar este alquiler permanentemente?' : 'Are you sure you want to permanently delete this rental?')) {
                                           try {
                                             await deleteRental(r.id);
                                             showToast(language === 'es' ? 'Alquiler eliminado' : 'Rental deleted', 'success');
@@ -9811,7 +9693,7 @@ USING (true);`;
                                     )}
                                     <span className={`badge ${statusCls}`} style={{ fontSize: '10px', padding: '2px 6px' }}>{r.status === 'Inactivo' ? (language === 'es' ? 'Finalizado' : 'Finished') : r.status}</span>
                                     <button onClick={async () => {
-                                      if (window.confirm(language === 'es' ? '¿Estás seguro de eliminar este alquiler permanentemente?' : 'Are you sure you want to permanently delete this rental?')) {
+                                      if (await asyncConfirm(language === 'es' ? '¿Estás seguro de eliminar este alquiler permanentemente?' : 'Are you sure you want to permanently delete this rental?')) {
                                         try {
                                           await deleteRental(r.id);
                                           showToast(language === 'es' ? 'Alquiler eliminado' : 'Rental deleted', 'success');
@@ -9880,7 +9762,7 @@ USING (true);`;
                                       {ev.type === 'payment' && ev.id && (
                                         <button 
                                           onClick={async () => {
-                                            if (window.confirm(language === 'es' ? '¿Estás seguro de eliminar este pago?' : 'Are you sure you want to delete this payment?')) {
+                                            if (await asyncConfirm(language === 'es' ? '¿Estás seguro de eliminar este pago?' : 'Are you sure you want to delete this payment?')) {
                                               try {
                                                 await deletePayment(ev.id!);
                                                 triggerReload();
@@ -10176,7 +10058,7 @@ USING (true);`;
                                           }}
                                           onClick={async () => {
                                             setActiveLeadMenuId(null);
-                                            if (!confirm(language === 'es' ? '¿Eliminar lead?' : 'Delete lead?')) return;
+                                            if (!await asyncConfirm(language === 'es' ? '¿Eliminar lead?' : 'Delete lead?')) return;
                                             try {
                                               await deleteLead(lead.id);
                                               triggerReload();
@@ -10361,7 +10243,7 @@ USING (true);`;
                                   style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#f87171', borderColor: 'rgba(248,113,113,0.3)' }}
                                   title={language === 'es' ? 'Eliminar cuenta' : 'Delete account'}
                                   onClick={async () => {
-                                    if (!window.confirm(language === 'es' ? `¿Eliminar la cuenta "${acc.platform_account_number}"? Esta acción no se puede deshacer.` : `Delete account "${acc.platform_account_number}"? This cannot be undone.`)) return;
+                                    if (!await asyncConfirm(language === 'es' ? `¿Eliminar la cuenta "${acc.platform_account_number}"? Esta acción no se puede deshacer.` : `Delete account "${acc.platform_account_number}"? This cannot be undone.`)) return;
                                     try {
                                       await deleteAppAccount(acc.id);
                                       triggerReload();
@@ -10413,7 +10295,7 @@ USING (true);`;
                                     className="btn-danger btn-xs"
                                     style={{ padding: '2px 6px', fontSize: '10px', background: 'transparent', border: 'none', color: '#ff6b6b', cursor: 'pointer' }}
                                     onClick={async () => {
-                                      if (confirm(language === 'es' ? '¿Eliminar esta anotación?' : 'Delete this note?')) {
+                                      if (await asyncConfirm(language === 'es' ? '¿Eliminar esta anotación?' : 'Delete this note?')) {
                                         try {
                                           await deleteAccountNote(n.id);
                                           triggerReload();
@@ -10456,7 +10338,7 @@ USING (true);`;
                                         <button
                                           className="btn-danger btn-xs"
                                           onClick={async () => {
-                                            if (confirm(language === 'es' ? '¿Eliminar este registro de pago?' : 'Delete this payment record?')) {
+                                            if (await asyncConfirm(language === 'es' ? '¿Eliminar este registro de pago?' : 'Delete this payment record?')) {
                                               try {
                                                 await deleteAccountEarning(ae.id);
                                                 triggerReload();
@@ -10926,7 +10808,7 @@ USING (true);`;
                                         : (ev.status === 'Realizado' ? '✓ Reopen' : '✓ Mark as Completed')}
                                     </button>
                                     <button className="btn-danger btn-xs" onClick={async () => {
-                                      if (!confirm('¿Eliminar evento?')) return;
+                                      if (!await asyncConfirm('¿Eliminar evento?')) return;
                                       try { await deleteEvent(ev.id); triggerReload(); showToast('Evento eliminado.', 'success'); }
                                       catch { showToast('Error.', 'error'); }
                                     }}>✕</button>
@@ -10981,70 +10863,257 @@ USING (true);`;
                                  {bike.category_id === catBikeId && <p style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Km: {bike.odometer} km</p>}
                                </div>
                               {status === 'En Taller' && (
-                                <button className="btn-primary btn-xs" onClick={async () => {
-                                  try {
-                                    const todayStr = new Date().toISOString().split('T')[0];
-                                    await upsertProduct({ 
-                                      ...bike, 
-                                      maintenance_status: 'Al día', 
-                                      status: 'Disponible',
-                                      last_service_date: todayStr
-                                    });
-                                    triggerReload(); showToast(`${bike.serial_number} marcada como lista.`, 'success');
-                        } catch { showToast('Error.', 'error'); }
-                                }}>✓ {language === 'es' ? 'Finalizar Service' : 'Finish Service'}</button>
-                              )}
-                            {status === 'Requiere Service' && (
-                              <div style={{ display: 'flex', gap: '8px' }}>
-                                <button className="btn-secondary btn-xs" onClick={() => {
-                                  if (bike.status === 'Rentada') {
-                                    showToast(language === 'es' ? 'No es posible realizar un service a un vehículo mientras esté rentado.' : 'Cannot schedule a service for a vehicle while it is rented.', 'error');
-                                    return;
-                                  }
-                                  openServiceModal(bike.id);
-                                }}>🔧 Service</button>
-                                <button className="btn-primary btn-xs" onClick={async () => {
-                                  if (bike.status === 'Rentada') {
-                                    showToast(language === 'es' ? 'No es posible ingresar al taller un vehículo mientras esté rentado.' : 'Cannot put a vehicle in the workshop while it is rented.', 'error');
-                                    return;
-                                  }
-                                  try {
-                                    const todayStr = new Date().toISOString().split('T')[0];
-                                    
-                                    // Find and update the scheduled service record date to today (actual check-in date)
-                                    const record = records.find(r => r.bike_id === bike.id && r.service_date === bike.next_service_date);
-                                    if (record) {
-                                      await upsertRecord({
-                                        ...record,
-                                        service_date: todayStr
-                                      });
-                                      
-                                      // Mark the associated calendar event as completed (Realizado) and update its date
-                                      const existingEv = events.find(e => e.description.includes(`Service ID: ${record.id}`) && !e.description.includes('Recordatorio personalizado'));
-                                      if (existingEv) {
-                                        await upsertEvent({
-                                          ...existingEv,
-                                          event_date: todayStr,
-                                          status: 'Realizado'
-                                        });
-                                      }
-                                    }
+                                 <div style={{ display: 'flex', gap: '8px' }}>
+                                   <button className="btn-primary btn-xs" onClick={async () => {
+                                     try {
+                                       const todayStr = new Date().toISOString().split('T')[0];
+                                       
+                                       // Ensure we have a record in the maintenance timeline when finalizing service
+                                       const record = records.find(r => r.bike_id === bike.id && r.service_date === bike.last_service_date);
+                                       if (!record) {
+                                         await upsertRecord({
+                                           id: crypto.randomUUID(),
+                                           bike_id: bike.id,
+                                           service_date: todayStr,
+                                           location: 'Dublin Central Garage',
+                                           description: language === 'es' ? 'Mantenimiento finalizado / Puesta a punto' : 'Maintenance finished / Fine-tuning',
+                                           cost: 0,
+                                           performed_by: 'Mechanic Sean'
+                                         });
+                                       }
 
-                                    await upsertProduct({
-                                      ...bike,
-                                      maintenance_status: 'En Taller',
-                                      status: 'Mantenimiento',
-                                      last_service_date: todayStr,
-                                      next_service_date: null
-                                    });
-                                    triggerReload();
-                                    showToast(language === 'es' ? `${bike.serial_number} ingresada al taller.` : `${bike.serial_number} entered workshop.`, 'success');
-                                  } catch {
-                                    showToast('Error.', 'error');
-                                  }
-                                }}>🧰 {language === 'es' ? 'Ingresar al Taller' : 'Enter Shop'}</button>
-                              </div>
-                            )}
+                                       await upsertProduct({ 
+                                         ...bike, 
+                                         maintenance_status: 'Al día', 
+                                         status: 'Disponible',
+                                         last_service_date: todayStr
+                                       });
+                                       triggerReload(); showToast(`${bike.serial_number} marcada como lista.`, 'success');
+                                     } catch { showToast('Error.', 'error'); }
+                                   }}>✓ {language === 'es' ? 'Finalizar Service' : 'Finish Service'}</button>
+                                   <button className="btn-secondary btn-xs" onClick={async () => {
+                                     try {
+                                       const confirmMsg = language === 'es' 
+                                         ? '¿Cancelar el ingreso al taller de esta bicicleta?' 
+                                         : 'Cancel workshop entry for this bicycle?';
+                                       if (!await asyncConfirm(confirmMsg)) return;
+                                       
+                                       const todayStr = new Date().toISOString().split('T')[0];
+                                       // Find and delete the record created today for this bike
+                                       const recentRec = records.find(r => r.bike_id === bike.id && r.service_date === todayStr);
+                                       if (recentRec) {
+                                         await deleteRecord(recentRec.id);
+                                         const assocEvents = events.filter(ev => ev.description && ev.description.includes(`Service ID: ${recentRec.id}`));
+                                         for (const ev of assocEvents) {
+                                           await deleteEvent(ev.id);
+                                         }
+                                       }
+                                       
+                                       await upsertProduct({
+                                         ...bike,
+                                         maintenance_status: 'Requiere Service',
+                                         status: 'Disponible',
+                                         next_service_date: todayStr
+                                       });
+                                       triggerReload();
+                                       showToast(language === 'es' ? 'Ingreso al taller cancelado.' : 'Workshop entry canceled.', 'success');
+                                     } catch { showToast('Error.', 'error'); }
+                                   }} title={language === 'es' ? 'Cancelar ingreso y volver a Requiere Service' : 'Cancel entry and return to Service Due'}>✕</button>
+                                 </div>
+                               )}
+                               {status === 'Recién Revisada' && (
+                                 <button className="btn-secondary btn-xs" onClick={async () => {
+                                   try {
+                                     const confirmMsg = language === 'es'
+                                       ? '¿Deshacer la finalización del service y devolver la bicicleta al taller?'
+                                       : 'Undo service completion and return the bicycle to the workshop?';
+                                     if (!await asyncConfirm(confirmMsg)) return;
+
+                                     await upsertProduct({
+                                       ...bike,
+                                       maintenance_status: 'En Taller',
+                                       status: 'Mantenimiento'
+                                     });
+                                     triggerReload();
+                                     showToast(language === 'es' ? 'Finalización cancelada. Devuelta al taller.' : 'Completion canceled. Returned to workshop.', 'success');
+                                   } catch { showToast('Error.', 'error'); }
+                                 }}>↩️ {language === 'es' ? 'Deshacer' : 'Undo'}</button>
+                               )}
+                            {status === 'Requiere Service' && (
+                               <div style={{ position: 'relative' }}>
+                                 <button className="btn-secondary btn-xs" onClick={(e) => {
+                                   e.stopPropagation();
+                                   setOpenActionMenuBikeId(openActionMenuBikeId === bike.id ? null : bike.id);
+                                 }}>
+                                   {language === 'es' ? 'Acciones ▾' : 'Actions ▾'}
+                                 </button>
+                                 {openActionMenuBikeId === bike.id && (
+                                   <div style={{
+                                     position: 'absolute',
+                                     right: 0,
+                                     top: '100%',
+                                     marginTop: '4px',
+                                     background: 'rgba(25, 25, 35, 0.98)',
+                                     border: '1px solid rgba(255, 255, 255, 0.1)',
+                                     borderRadius: '8px',
+                                     boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+                                     zIndex: 10,
+                                     display: 'flex',
+                                     flexDirection: 'column',
+                                     minWidth: '160px',
+                                     overflow: 'hidden',
+                                     backdropFilter: 'blur(8px)'
+                                   }}>
+                                     <button style={{
+                                       background: 'none',
+                                       border: 'none',
+                                       color: 'var(--text-bright)',
+                                       padding: '10px 14px',
+                                       textAlign: 'left',
+                                       cursor: 'pointer',
+                                       fontSize: '13px',
+                                       display: 'flex',
+                                       alignItems: 'center',
+                                       gap: '8px',
+                                       transition: 'background 0.2s'
+                                     }} 
+                                     onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.06)')}
+                                     onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                                     onClick={(e) => {
+                                       e.stopPropagation();
+                                       setOpenActionMenuBikeId(null);
+                                       if (bike.status === 'Rentada') {
+                                         showToast(language === 'es' ? 'No es posible realizar un service a un vehículo mientras esté rentado.' : 'Cannot schedule a service for a vehicle while it is rented.', 'error');
+                                         return;
+                                       }
+                                       openServiceModal(bike.id);
+                                     }}>
+                                       🔧 {language === 'es' ? 'Editar Service' : 'Edit Service'}
+                                     </button>
+
+                                     <button style={{
+                                       background: 'none',
+                                       border: 'none',
+                                       color: 'var(--text-bright)',
+                                       padding: '10px 14px',
+                                       textAlign: 'left',
+                                       cursor: 'pointer',
+                                       fontSize: '13px',
+                                       display: 'flex',
+                                       alignItems: 'center',
+                                       gap: '8px',
+                                       transition: 'background 0.2s'
+                                     }} 
+                                     onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.06)')}
+                                     onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                                     onClick={async (e) => {
+                                       e.stopPropagation();
+                                       setOpenActionMenuBikeId(null);
+                                       if (bike.status === 'Rentada') {
+                                         showToast(language === 'es' ? 'No es posible ingresar al taller un vehículo mientras esté rentado.' : 'Cannot put a vehicle in the workshop while it is rented.', 'error');
+                                         return;
+                                       }
+                                       try {
+                                         const todayStr = new Date().toISOString().split('T')[0];
+                                         
+                                         // Find and update the scheduled service record date to today (actual check-in date)
+                                         const record = records.find(r => r.bike_id === bike.id && r.service_date === bike.next_service_date);
+                                         if (record) {
+                                           await upsertRecord({
+                                             ...record,
+                                             service_date: todayStr
+                                           });
+                                           
+                                           // Mark the associated calendar event as completed (Realizado) and update its date
+                                           const existingEv = events.find(ev => ev.description.includes(`Service ID: ${record.id}`) && !ev.description.includes('Recordatorio personalizado'));
+                                           if (existingEv) {
+                                             await upsertEvent({
+                                               ...existingEv,
+                                               event_date: todayStr,
+                                               status: 'Realizado'
+                                             });
+                                           }
+                                         } else {
+                                           // If no scheduled record exists, create a check-in record now!
+                                           await upsertRecord({
+                                             id: crypto.randomUUID(),
+                                             bike_id: bike.id,
+                                             service_date: todayStr,
+                                             location: 'Dublin Central Garage',
+                                             description: language === 'es' ? 'Ingreso directo a taller / Revisión general' : 'Direct check-in to workshop / General review',
+                                             cost: 0,
+                                             performed_by: 'Mechanic Sean'
+                                           });
+                                         }
+
+                                         await upsertProduct({
+                                           ...bike,
+                                           maintenance_status: 'En Taller',
+                                           status: 'Mantenimiento',
+                                           last_service_date: todayStr,
+                                           next_service_date: null
+                                         });
+                                         triggerReload();
+                                         showToast(language === 'es' ? `${bike.serial_number} ingresada al taller.` : `${bike.serial_number} entered workshop.`, 'success');
+                                       } catch {
+                                         showToast('Error.', 'error');
+                                       }
+                                     }}>
+                                       🧰 {language === 'es' ? 'Ingresar al Taller' : 'Enter Shop'}
+                                     </button>
+
+                                     <button style={{
+                                       background: 'none',
+                                       border: 'none',
+                                       color: '#f87171',
+                                       padding: '10px 14px',
+                                       textAlign: 'left',
+                                       cursor: 'pointer',
+                                       fontSize: '13px',
+                                       display: 'flex',
+                                       alignItems: 'center',
+                                       gap: '8px',
+                                       borderTop: '1px solid rgba(255,255,255,0.06)',
+                                       transition: 'background 0.2s'
+                                     }} 
+                                     onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.06)')}
+                                     onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                                     onClick={async (e) => {
+                                       e.stopPropagation();
+                                       setOpenActionMenuBikeId(null);
+                                       try {
+                                         const confirmMsg = language === 'es'
+                                           ? '¿Cancelar la solicitud de service para este vehículo?'
+                                           : 'Cancel the service request for this vehicle?';
+                                         if (!await asyncConfirm(confirmMsg)) return;
+
+                                         if (bike.next_service_date) {
+                                           const record = records.find(r => r.bike_id === bike.id && r.service_date === bike.next_service_date);
+                                           if (record) {
+                                             await deleteRecord(record.id);
+                                             const assocEvents = events.filter(ev => ev.description && ev.description.includes(`Service ID: ${record.id}`));
+                                             for (const ev of assocEvents) {
+                                               await deleteEvent(ev.id);
+                                             }
+                                           }
+                                         }
+
+                                         await upsertProduct({
+                                           ...bike,
+                                           maintenance_status: 'Al día',
+                                           next_service_date: null,
+                                           status: 'Disponible'
+                                         });
+                                         triggerReload();
+                                         showToast(language === 'es' ? 'Requerimiento de service cancelado.' : 'Service request canceled.', 'success');
+                                       } catch { showToast('Error.', 'error'); }
+                                     }}>
+                                       ✕ {language === 'es' ? 'Cancelar Solicitud' : 'Cancel Request'}
+                                     </button>
+                                   </div>
+                                 )}
+                               </div>
+                             )}
                           </div>
                         ))
                       }
@@ -11122,7 +11191,7 @@ USING (true);`;
                                       const confirmMsg = language === 'es'
                                         ? '¿Eliminar este registro de taller? Esto también eliminará los recordatorios del calendario asociados.'
                                         : 'Delete this service record? This will also remove any associated calendar reminders.';
-                                      if (!confirm(confirmMsg)) return;
+                                      if (!await asyncConfirm(confirmMsg)) return;
 
                                       try {
                                         // 1. Delete the maintenance record
@@ -11339,7 +11408,7 @@ USING (true);`;
                               <div style={{ display: 'flex', gap: '8px' }}>
                                 <button className="btn-secondary btn-xs" onClick={() => openSupplierModal(sup)}>✏️</button>
                                 <button className="btn-danger btn-xs" onClick={async () => {
-                                  if (!confirm(language === 'es' ? '¿Eliminar proveedor?' : 'Delete supplier?')) return;
+                                  if (!await asyncConfirm(language === 'es' ? '¿Eliminar proveedor?' : 'Delete supplier?')) return;
                                   try {
                                     await deleteSupplier(sup.id);
                                     triggerReload();
@@ -11429,7 +11498,7 @@ USING (true);`;
                                 <div style={{ display: 'flex', gap: '8px' }}>
                                   <button className="btn-secondary btn-xs" onClick={() => openSupplierProductModal(sprod)}>✏️</button>
                                   <button className="btn-danger btn-xs" onClick={async () => {
-                                    if (!confirm(language === 'es' ? '¿Eliminar producto?' : 'Delete product?')) return;
+                                    if (!await asyncConfirm(language === 'es' ? '¿Eliminar producto?' : 'Delete product?')) return;
                                     try {
                                       await deleteSupplierProduct(sprod.id);
                                       triggerReload();
@@ -11661,7 +11730,7 @@ USING (true);`;
                               <button
                                 className="qr-action-btn-inline qr-delete"
                                 onClick={async () => {
-                                  if (!confirm(language === 'es' ? '¿Eliminar esta respuesta rápida?' : 'Delete this quick reply?')) return;
+                                  if (!await asyncConfirm(language === 'es' ? '¿Eliminar esta respuesta rápida?' : 'Delete this quick reply?')) return;
                                   try { await deleteQuickReply(qr.id); triggerReload(); showToast(language === 'es' ? 'Respuesta eliminada' : 'Reply deleted', 'success'); }
                                   catch { showToast(language === 'es' ? 'Error al eliminar' : 'Error deleting', 'error'); }
                                 }}
@@ -12161,7 +12230,7 @@ USING (true);`;
                                         className="btn-secondary btn-xs"
                                         style={{ color: '#f87171', borderColor: 'rgba(248,113,113,0.3)' }}
                                         onClick={async () => {
-                                          if (!confirm(language === 'es' ? `¿Eliminar a ${cust.first_name} ${cust.last_name}?` : `Delete ${cust.first_name} ${cust.last_name}?`)) return;
+                                          if (!await asyncConfirm(language === 'es' ? `¿Eliminar a ${cust.first_name} ${cust.last_name}?` : `Delete ${cust.first_name} ${cust.last_name}?`)) return;
                                           try {
                                             await deleteCustomer(cust.id);
                                             triggerReload();
@@ -12355,6 +12424,366 @@ USING (true);`;
             );
           })()}
 
+          {/* ================================================
+              TAB: TAREAS (To-Do Lists / Cards)
+              ================================================ */}
+          {currentTab === 'tasks' && (() => {
+            const colorsList = Object.keys(colorTags).length > 0 ? Object.keys(colorTags) : ['#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6'];
+            
+            return (
+              <div style={{ padding: '0 24px 24px 24px' }}>
+                {/* Header Actions */}
+                <div className="filter-row" style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', gap: '16px', marginBottom: '24px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+                    <h2 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      📋 {language === 'es' ? 'Tablero de Tareas' : 'Task Board'}
+                    </h2>
+                    <button 
+                      className="btn-secondary btn-sm"
+                      onClick={() => setShowColorConfig(!showColorConfig)}
+                    >
+                      🎨 {language === 'es' ? 'Etiquetas de Colores' : 'Color Labels'} {showColorConfig ? '▲' : '▼'}
+                    </button>
+                  </div>
+
+                  {/* Add New Card Form */}
+                  <form 
+                    onSubmit={e => {
+                      e.preventDefault();
+                      if (!newCardTitle.trim()) return;
+                      handleSaveCard(newCardTitle.trim());
+                      setNewCardTitle('');
+                    }}
+                    style={{ display: 'flex', gap: '8px', alignItems: 'center' }}
+                  >
+                    <input 
+                      className="form-control"
+                      style={{ maxWidth: '240px' }}
+                      placeholder={language === 'es' ? 'Nueva Tarjeta (ej. Taller)' : 'New Card (e.g. Workshop)'}
+                      value={newCardTitle}
+                      onChange={e => setNewCardTitle(e.target.value)}
+                    />
+                    <button type="submit" className="btn-primary">
+                      ➕ {language === 'es' ? 'Crear' : 'Create'}
+                    </button>
+                  </form>
+                </div>
+
+                {/* Color Tag Labels Config Drawer */}
+                {showColorConfig && (
+                  <div className="glass-card" style={{ padding: '20px', marginBottom: '24px', background: 'rgba(255, 255, 255, 0.02)', border: '1px solid rgba(255, 255, 255, 0.08)' }}>
+                    <h3 style={{ marginTop: 0, marginBottom: '16px', fontSize: '16px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      🏷️ {language === 'es' ? 'Personalizar Etiquetas de Colores' : 'Customize Color Labels'}
+                    </h3>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: '16px' }}>
+                      {colorsList.map(c => (
+                        <div key={c} style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                          <span style={{ display: 'inline-block', width: '20px', height: '20px', borderRadius: '50%', backgroundColor: c, border: '2px solid rgba(255,255,255,0.2)', flexShrink: 0 }} />
+                          <input 
+                            className="form-control"
+                            style={{ fontSize: '13px', padding: '6px 10px', flex: 1 }}
+                            value={colorTags[c] || ''}
+                            placeholder={language === 'es' ? 'Sin etiqueta' : 'No label'}
+                            onChange={e => handleSaveColorTag(c, e.target.value)}
+                          />
+                          <button
+                            type="button"
+                            className="btn-secondary btn-xs"
+                            style={{ color: '#ef4444', background: 'rgba(239, 68, 68, 0.05)', border: '1px solid rgba(239, 68, 68, 0.15)', padding: '4px 8px', height: '32px' }}
+                            onClick={async () => {
+                              if (await asyncConfirm(language === 'es' ? '¿Eliminar esta etiqueta de color?' : 'Delete this color tag?')) {
+                                handleDeleteColorTag(c);
+                              }
+                            }}
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Form to Add New Tag */}
+                    <div style={{ marginTop: '20px', paddingTop: '16px', borderTop: '1px solid rgba(255, 255, 255, 0.06)', display: 'flex', flexWrap: 'wrap', gap: '12px', alignItems: 'center' }}>
+                      <h4 style={{ margin: 0, fontSize: '14px', fontWeight: 600 }}>
+                        ✨ {language === 'es' ? 'Nueva Etiqueta:' : 'New Label:'}
+                      </h4>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <input 
+                          type="color" 
+                          style={{ width: '40px', height: '32px', padding: 0, border: 'none', borderRadius: '4px', cursor: 'pointer', background: 'transparent' }}
+                          value={newTagColor}
+                          onChange={e => setNewTagColor(e.target.value)}
+                        />
+                        <input 
+                          className="form-control"
+                          style={{ fontSize: '13px', padding: '6px 10px', maxWidth: '180px' }}
+                          placeholder={language === 'es' ? 'Nombre (ej. Pendiente)' : 'Name (e.g. Pending)'}
+                          value={newTagLabel}
+                          onChange={e => setNewTagLabel(e.target.value)}
+                        />
+                        <button 
+                          type="button" 
+                          className="btn-primary btn-sm"
+                          style={{ height: '32px' }}
+                          onClick={() => {
+                            if (!newTagLabel.trim()) return;
+                            handleSaveColorTag(newTagColor, newTagLabel.trim());
+                            setNewTagLabel('');
+                            const randomColors = ['#ec4899', '#f43f5e', '#14b8a6', '#06b6d4', '#0ea5e9', '#6366f1', '#a855f7', '#d946ef'];
+                            const nextColor = randomColors[Math.floor(Math.random() * randomColors.length)];
+                            setNewTagColor(nextColor);
+                          }}
+                        >
+                          ➕ {language === 'es' ? 'Agregar' : 'Add'}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Grid of Task Cards */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: '24px', alignItems: 'flex-start' }}>
+                  {taskCards.map(card => {
+                    const cardTasks = taskItems.filter(item => item.card_id === card.id).sort((a, b) => a.position - b.position);
+
+                    return (
+                      <div key={card.id} className="glass-card" style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                        {/* Card Title Header */}
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid rgba(255,255,255,0.06)', paddingBottom: '10px' }}>
+                          {editingCardId === card.id ? (
+                            <div style={{ display: 'flex', gap: '6px', width: '100%' }}>
+                              <input 
+                                className="form-control"
+                                style={{ fontSize: '15px', fontWeight: 600, padding: '4px 8px' }}
+                                value={editingCardTitle}
+                                onChange={e => setEditingCardTitle(e.target.value)}
+                                autoFocus
+                              />
+                              <button 
+                                className="btn-primary btn-xs"
+                                onClick={() => {
+                                  if (editingCardTitle.trim()) {
+                                    handleSaveCard(editingCardTitle.trim(), card.id);
+                                  }
+                                  setEditingCardId(null);
+                                }}
+                              >
+                                ✓
+                              </button>
+                              <button 
+                                className="btn-secondary btn-xs"
+                                onClick={() => setEditingCardId(null)}
+                              >
+                                ✕
+                              </button>
+                            </div>
+                          ) : (
+                            <>
+                              <h3 
+                                style={{ margin: 0, fontSize: '16px', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px' }}
+                                onClick={() => {
+                                  setEditingCardId(card.id);
+                                  setEditingCardTitle(card.title);
+                                }}
+                                title={language === 'es' ? 'Haz click para editar' : 'Click to edit'}
+                              >
+                                {card.title}
+                                <span style={{ opacity: 0.4, fontSize: '12px' }}>✏️</span>
+                              </h3>
+                              <button 
+                                className="btn-secondary btn-xs" 
+                                style={{ color: '#ef4444', background: 'rgba(239, 68, 68, 0.05)', border: '1px solid rgba(239, 68, 68, 0.15)' }}
+                                onClick={async () => {
+                                  if (await asyncConfirm(language === 'es' ? '¿Eliminar tarjeta y todas sus tareas?' : 'Delete card and all its tasks?')) {
+                                    handleDeleteCard(card.id);
+                                  }
+                                }}
+                              >
+                                🗑️
+                              </button>
+                            </>
+                          )}
+                        </div>
+
+                        {/* List of Tasks inside Card */}
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', minHeight: '40px' }}>
+                          {cardTasks.length === 0 ? (
+                            <div style={{ textAlign: 'center', padding: '16px 0', opacity: 0.35, fontSize: '13px', fontStyle: 'italic' }}>
+                              {language === 'es' ? 'Sin tareas' : 'No tasks yet'}
+                            </div>
+                          ) : (
+                            cardTasks.map((item, idx) => (
+                              <div 
+                                key={item.id} 
+                                style={{ 
+                                  display: 'flex', 
+                                  flexDirection: 'column',
+                                  gap: '6px',
+                                  padding: '8px 10px', 
+                                  borderRadius: '6px', 
+                                  background: 'rgba(255,255,255,0.015)',
+                                  borderLeft: `4px solid ${item.color}`,
+                                  border: '1px solid rgba(255,255,255,0.03)',
+                                  borderLeftWidth: '4px'
+                                }}
+                              >
+                                <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px' }}>
+                                  {/* Checkbox */}
+                                  <input 
+                                    type="checkbox" 
+                                    checked={item.completed} 
+                                    style={{ marginTop: '3px', cursor: 'pointer', width: '15px', height: '15px' }}
+                                    onChange={e => handleSaveTask({ id: item.id, completed: e.target.checked })}
+                                  />
+
+                                  {/* Task Text */}
+                                  <div style={{ flex: 1, minWidth: 0 }}>
+                                    {editingTaskId === item.id ? (
+                                      <div style={{ display: 'flex', gap: '4px' }}>
+                                        <input 
+                                          className="form-control"
+                                          style={{ fontSize: '13px', padding: '2px 6px' }}
+                                          value={editingTaskText}
+                                          onChange={e => setEditingTaskText(e.target.value)}
+                                          autoFocus
+                                        />
+                                        <button 
+                                          className="btn-primary btn-xs"
+                                          onClick={() => {
+                                            if (editingTaskText.trim()) {
+                                              handleSaveTask({ id: item.id, text: editingTaskText.trim() });
+                                            }
+                                            setEditingTaskId(null);
+                                          }}
+                                        >
+                                          ✓
+                                        </button>
+                                        <button 
+                                          className="btn-secondary btn-xs"
+                                          onClick={() => setEditingTaskId(null)}
+                                        >
+                                          ✕
+                                        </button>
+                                      </div>
+                                    ) : (
+                                      <span 
+                                        style={{ 
+                                          fontSize: '13.5px', 
+                                          textDecoration: item.completed ? 'line-through' : 'none',
+                                          opacity: item.completed ? 0.5 : 0.9,
+                                          wordBreak: 'break-word',
+                                          cursor: 'pointer'
+                                        }}
+                                        onClick={() => {
+                                          setEditingTaskId(item.id);
+                                          setEditingTaskText(item.text);
+                                        }}
+                                        title={language === 'es' ? 'Haz click para editar' : 'Click to edit'}
+                                      >
+                                        {item.text}
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  {/* Action Buttons: Move and Delete */}
+                                  <div style={{ display: 'flex', gap: '3px', flexShrink: 0 }}>
+                                    <button 
+                                      className="btn-secondary btn-xs"
+                                      style={{ padding: '2px 4px', fontSize: '11px' }}
+                                      disabled={idx === 0}
+                                      onClick={() => handleMoveTask(item, 'up')}
+                                      title={language === 'es' ? 'Subir' : 'Move Up'}
+                                    >
+                                      ↑
+                                    </button>
+                                    <button 
+                                      className="btn-secondary btn-xs"
+                                      style={{ padding: '2px 4px', fontSize: '11px' }}
+                                      disabled={idx === cardTasks.length - 1}
+                                      onClick={() => handleMoveTask(item, 'down')}
+                                      title={language === 'es' ? 'Bajar' : 'Move Down'}
+                                    >
+                                      ↓
+                                    </button>
+                                    <button 
+                                      className="btn-secondary btn-xs"
+                                      style={{ padding: '2px 4px', color: '#ef4444', fontSize: '11px' }}
+                                      onClick={async () => {
+                                        if (await asyncConfirm(language === 'es' ? '¿Eliminar esta tarea?' : 'Delete this task?')) {
+                                          handleDeleteTask(item.id);
+                                        }
+                                      }}
+                                    >
+                                      ✕
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {/* Color Tag Selectors */}
+                                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '4px', paddingTop: '4px', borderTop: '1px solid rgba(255,255,255,0.02)' }}>
+                                  <div style={{ display: 'flex', gap: '5px' }}>
+                                    {colorsList.map(c => (
+                                      <button 
+                                        key={c}
+                                        onClick={() => handleSaveTask({ id: item.id, color: c })}
+                                        style={{
+                                          width: '12px',
+                                          height: '12px',
+                                          borderRadius: '50%',
+                                          backgroundColor: c,
+                                          border: item.color === c ? '2px solid white' : '1px solid rgba(255,255,255,0.2)',
+                                          cursor: 'pointer',
+                                          padding: 0,
+                                          boxShadow: item.color === c ? '0 0 4px rgba(255,255,255,0.6)' : 'none'
+                                        }}
+                                        title={colorTags[c] || c}
+                                      />
+                                    ))}
+                                  </div>
+                                  {colorTags[item.color] && (
+                                    <span style={{ fontSize: '10px', padding: '2px 6px', borderRadius: '4px', backgroundColor: `${item.color}15`, color: item.color, border: `1px solid ${item.color}30`, fontWeight: 600 }}>
+                                      {colorTags[item.color]}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            ))
+                          )}
+                        </div>
+
+                        {/* Inline Add Task Form */}
+                        <form 
+                          onSubmit={e => {
+                            e.preventDefault();
+                            const val = newTaskTexts[card.id] || '';
+                            if (!val.trim()) return;
+                            handleSaveTask({ card_id: card.id, text: val.trim() });
+                            setNewTaskTexts(prev => ({ ...prev, [card.id]: '' }));
+                          }}
+                          style={{ display: 'flex', gap: '6px', marginTop: '8px' }}
+                        >
+                          <input 
+                            className="form-control"
+                            style={{ fontSize: '13px', padding: '5px 8px' }}
+                            placeholder={language === 'es' ? 'Nueva tarea...' : 'New task...'}
+                            value={newTaskTexts[card.id] || ''}
+                            onChange={e => {
+                              const text = e.target.value;
+                              setNewTaskTexts(prev => ({ ...prev, [card.id]: text }));
+                            }}
+                          />
+                          <button type="submit" className="btn-primary btn-sm" style={{ padding: '4px 10px' }}>
+                            ➕
+                          </button>
+                        </form>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })()}
+
         </main>
       </div>
 
@@ -12367,6 +12796,11 @@ USING (true);`;
         const prod = products.find(p => p.id === selectedProductId);
 
         const renderLocationFormSection = () => {
+          // The declared "Cantidad" is the cap: the distribution splits those units across
+          // locations and must never sum to more than the declared/existing total.
+          const maxDistTotal = prodFormQuantity > 0 ? prodFormQuantity : 0;
+          const distributedSum = Object.values(prodFormLocDistribution).reduce((a, b) => a + (Number(b) || 0), 0);
+          const unassigned = Math.max(0, maxDistTotal - distributedSum);
           return (
             <div className="form-group" style={{ gridColumn: 'span 2', display: 'flex', flexDirection: 'column', gap: '8px', background: 'rgba(255, 255, 255, 0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255, 255, 255, 0.05)', marginTop: '8px' }}>
               <label className="form-label" style={{ fontWeight: 600, display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -12409,14 +12843,17 @@ USING (true);`;
                             className="form-control"
                             style={{ width: '80px', height: '32px', textAlign: 'center', padding: '0 6px' }}
                             min="0"
+                            max={maxDistTotal}
                             value={qty}
                             onChange={(e) => {
-                              const val = Math.max(0, Number(e.target.value));
-                              const updated = { ...prodFormLocDistribution, [loc]: val };
-                              setProdFormLocDistribution(updated);
-                              
-                              const totalSum = Object.values(updated).reduce((a, b) => a + b, 0);
-                              setProdFormQuantity(Math.max(1, totalSum));
+                              let val = Math.max(0, Number(e.target.value));
+                              const othersSum = Object.entries(prodFormLocDistribution).reduce((a, [k, v]) => k === loc ? a : a + (Number(v) || 0), 0);
+                              const allowed = Math.max(0, maxDistTotal - othersSum);
+                              if (val > allowed) {
+                                val = allowed;
+                                showToast(language === 'es' ? `La cantidad total es ${maxDistTotal}. No podés distribuir más unidades.` : `Total quantity is ${maxDistTotal}. You can't distribute more units.`, 'error');
+                              }
+                              setProdFormLocDistribution({ ...prodFormLocDistribution, [loc]: val });
                             }}
                           />
                         </div>
@@ -12427,10 +12864,15 @@ USING (true);`;
                     <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--color-primary)' }}>
                       {language === 'es' ? 'Total Distribuido:' : 'Total Distributed:'}
                     </span>
-                    <span style={{ fontSize: '15px', fontWeight: 700, color: 'var(--text-bright)' }}>
-                      {prodFormQuantity}
+                    <span style={{ fontSize: '15px', fontWeight: 700, color: unassigned > 0 ? '#fbbf24' : 'var(--text-bright)' }}>
+                      {distributedSum} / {maxDistTotal}
                     </span>
                   </div>
+                  {unassigned > 0 && (
+                    <div style={{ fontSize: '12px', color: '#fbbf24', textAlign: 'right' }}>
+                      {language === 'es' ? `Quedan ${unassigned} unidades sin asignar` : `${unassigned} units still unassigned`}
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
@@ -12470,8 +12912,9 @@ USING (true);`;
                       localStorage.setItem('fast_sheep_locations', JSON.stringify(updated));
                     }
                     if (prodFormIsGeneric && prodFormUseDistribution) {
-                      setProdFormLocDistribution(prev => ({ ...prev, [trimmed]: 1 }));
-                      setProdFormQuantity(prev => prev + 1);
+                      const currentSum = Object.values(prodFormLocDistribution).reduce((a, b) => a + (Number(b) || 0), 0);
+                      const canAddOne = currentSum < maxDistTotal;
+                      setProdFormLocDistribution(prev => ({ ...prev, [trimmed]: canAddOne ? 1 : 0 }));
                     } else {
                       setSelectedLocation(trimmed);
                     }
@@ -12558,8 +13001,8 @@ USING (true);`;
                                 type="button"
                                 className="btn-danger btn-xs"
                                 style={{ padding: '1px 4px', fontSize: '10px', background: 'rgba(239, 68, 68, 0.1)', color: '#ef4444', border: '1px solid rgba(239, 68, 68, 0.2)' }}
-                                onClick={() => {
-                                  if (confirm(language === 'es' ? `¿Estás seguro?` : `Are you sure?`)) {
+                                onClick={async () => {
+                                  if (await asyncConfirm(language === 'es' ? `¿Estás seguro?` : `Are you sure?`)) {
                                     const updated = locationsList.filter((_, i) => i !== idx);
                                     setLocationsList(updated);
                                     localStorage.setItem('fast_sheep_locations', JSON.stringify(updated));
@@ -12677,7 +13120,7 @@ USING (true);`;
                   </div>
                 )}
 
-                {!selectedProductId && prodFormCategory !== catBikeId && prodFormCategory !== catBattId && prodFormCategory !== catLockId && (
+                {prodFormCategory !== catBikeId && prodFormCategory !== catBattId && prodFormCategory !== catLockId && (
                   <div style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-start', gap: '10px', padding: '4px 0 10px 0' }}>
                     <input 
                       type="checkbox" 
@@ -12689,7 +13132,10 @@ USING (true);`;
                         setProdFormIsGeneric(generic);
                         if (generic) {
                           setProdFormPrefixId('');
-                          setProdFormSerialNo('');
+                          // Only clear serial number if not editing AND it is a default numeric serial
+                          if (!selectedProductId && /^\d+$/.test(prodFormSerialNo)) {
+                            setProdFormSerialNo('');
+                          }
                           setProdFormQuantity(1);
                         } else {
                           const catId = prodFormCategory;
@@ -12698,12 +13144,15 @@ USING (true);`;
                                    : catId === catLockId ? prefixes.find(p => p.prefix === 'L-')?.id ?? ''
                                    : '';
                           setProdFormPrefixId(pf);
-                          const selPrefix = prefixes.find(p => p.id === pf);
-                          if (selPrefix) {
-                            const samePrefixCount = products.filter(p => p.prefix_id === pf).length;
-                            setProdFormSerialNo(String(samePrefixCount + 1).padStart(3, '0'));
-                          } else {
-                            setProdFormSerialNo(Date.now().toString().slice(-4));
+                          // Only regenerate serial if not editing
+                          if (!selectedProductId) {
+                            const selPrefix = prefixes.find(p => p.id === pf);
+                            if (selPrefix) {
+                              const samePrefixCount = products.filter(p => p.prefix_id === pf).length;
+                              setProdFormSerialNo(String(samePrefixCount + 1).padStart(3, '0'));
+                            } else {
+                              setProdFormSerialNo(Date.now().toString().slice(-4));
+                            }
                           }
                           setProdFormQuantity(1);
                         }
@@ -12716,16 +13165,50 @@ USING (true);`;
                 )}
 
                 {prodFormIsGeneric ? (
-                  <div style={{ display: 'grid', gridTemplateColumns: '70% 30%', gap: '16px' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '28% 47% 25%', gap: '16px' }}>
+                    <div className="form-group">
+                      <label className="form-label">{t.prefix}</label>
+                      <div style={{ display: 'flex', gap: '8px' }}>
+                        <select className="form-control" style={{ flex: 1 }} value={prodFormPrefixId}
+                          onChange={e => {
+                            const newPrefId = e.target.value;
+                            setProdFormPrefixId(newPrefId);
+                            if (!selectedProductId) {
+                              const selPrefix = prefixes.find(p => p.id === newPrefId);
+                              if (selPrefix) {
+                                const samePrefixCount = products.filter(p => p.prefix_id === newPrefId).length;
+                                setProdFormSerialNo(String(samePrefixCount + 1).padStart(3, '0'));
+                              }
+                            }
+                          }}>
+                          <option value="">{language === 'es' ? '-- Sin prefijo --' : '-- No prefix --'}</option>
+                          {prefixes
+                            .filter(pf => pf.category_id === prodFormCategory)
+                            .map(pf => <option key={pf.id} value={pf.id}>{pf.prefix}</option>)}
+                        </select>
+                        <button type="button" className="btn-secondary" style={{ padding: '0 12px', minWidth: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={() => setModalType('prefix')} title={language === 'es' ? 'Agregar Prefijo' : 'Add Prefix'}>
+                          ➕
+                        </button>
+                      </div>
+                    </div>
                     <div className="form-group">
                       <label className="form-label">{language === 'es' ? 'Código / SKU del Lote' : 'Batch Code / SKU'}</label>
-                      <input
-                        type="text"
-                        className="form-control"
-                        placeholder={language === 'es' ? 'Ej: CASCO-NEG' : 'E.g.: HELMET-BLK'}
-                        value={prodFormSerialNo}
-                        onChange={e => setProdFormSerialNo(e.target.value)}
-                      />
+                      <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                        {(() => {
+                          const selPrefix = prefixes.find(pf => pf.id === prodFormPrefixId);
+                          return selPrefix ? (
+                            <span style={{ padding: '8px 12px', background: 'rgba(255,255,255,0.06)', borderRadius: '8px', fontWeight: 700, color: 'var(--text-bright)', whiteSpace: 'nowrap' }}>{selPrefix.prefix}</span>
+                          ) : null;
+                        })()}
+                        <input
+                          type="text"
+                          className="form-control"
+                          style={{ flex: 1 }}
+                          placeholder={language === 'es' ? 'Ej: CASCO-NEG' : 'E.g.: HELMET-BLK'}
+                          value={prodFormSerialNo}
+                          onChange={e => setProdFormSerialNo(e.target.value)}
+                        />
+                      </div>
                     </div>
                     <div className="form-group">
                       <label className="form-label">{language === 'es' ? 'Cantidad' : 'Quantity'}</label>
@@ -12759,7 +13242,9 @@ USING (true);`;
                             }
                           }}>
                           <option value="">-- None --</option>
-                          {prefixes.map(pf => <option key={pf.id} value={pf.id}>{pf.prefix}</option>)}
+                          {prefixes
+                            .filter(pf => pf.category_id === prodFormCategory)
+                            .map(pf => <option key={pf.id} value={pf.id}>{pf.prefix}</option>)}
                         </select>
                         <button type="button" className="btn-secondary" style={{ padding: '0 12px', minWidth: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={() => setModalType('prefix')} title={language === 'es' ? 'Agregar Prefijo' : 'Add Prefix'}>
                           ➕
@@ -12858,8 +13343,38 @@ USING (true);`;
 
                 <div className="form-grid">
                   <div className="form-group">
-                    <label className="form-label">{language === 'es' ? 'Costo (€)' : 'Acquisition Cost (€)'}</label>
+                    <label className="form-label">{prodFormIsGeneric ? (language === 'es' ? 'Costo por unidad (€)' : 'Unit Cost (€)') : (language === 'es' ? 'Costo (€)' : 'Acquisition Cost (€)')}</label>
                     <input type="number" className="form-control" value={prodFormPricePaid} onChange={e => setProdFormPricePaid(Number(e.target.value))} />
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px', cursor: 'pointer', fontSize: '13px', color: 'var(--text-bright)' }}>
+                      <input type="checkbox" checked={prodFormAddBat} onChange={e => setProdFormAddBat(e.target.checked)} style={{ width: '16px', height: '16px', cursor: 'pointer' }} />
+                      {language === 'es' ? 'Agregar BAT (23% impuestos)' : 'Add BAT (23% tax)'}
+                    </label>
+                    {(prodFormAddBat || prodFormIsGeneric) && (() => {
+                      const base = prodFormPricePaid || 0;
+                      const qty = prodFormQuantity > 0 ? prodFormQuantity : 1;
+                      const bat = prodFormAddBat ? Math.round(base * 0.23 * 100) / 100 : 0;
+                      const unitCost = base + bat;
+                      const purchaseTotal = unitCost * qty;
+                      return (
+                        <div style={{ marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '2px', fontSize: '12px', color: 'var(--text-muted)', background: 'rgba(16, 185, 129, 0.05)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(16, 185, 129, 0.1)' }}>
+                          {prodFormAddBat && (
+                            <>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>{language === 'es' ? 'Coste por unidad' : 'Unit cost'}</span><span>€{base.toLocaleString()}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>BAT (23%)</span><span>€{bat.toLocaleString()}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '3px', marginTop: '2px', color: 'var(--text-bright)', fontWeight: 700 }}>
+                                <span>{prodFormIsGeneric ? (language === 'es' ? 'Total por unidad' : 'Unit total') : 'Total'}</span><span>€{unitCost.toLocaleString()}</span>
+                              </div>
+                            </>
+                          )}
+                          {prodFormIsGeneric && (
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: prodFormAddBat ? '1px solid rgba(255,255,255,0.08)' : 'none', paddingTop: prodFormAddBat ? '4px' : '0', marginTop: prodFormAddBat ? '2px' : '0' }}>
+                              <span>{language === 'es' ? 'Total de la compra' : 'Total purchase'} ({qty} {language === 'es' ? 'uds' : 'units'} × €{unitCost.toLocaleString()})</span>
+                              <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{purchaseTotal.toLocaleString()}</strong>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
                   </div>
                   <div className="form-group">
                     <label className="form-label">{language === 'es' ? 'Precio de Venta (€)' : 'Sale Price (€)'}</label>
@@ -12992,7 +13507,7 @@ USING (true);`;
                                     e.currentTarget.style.backgroundColor = 'transparent';
                                   }}
                                   onClick={async () => {
-                                    if (!confirm(language === 'es' ? `¿Eliminar el campo "${d.field_name}"? Los valores existentes no se borrarán de los productos.` : `Delete field "${d.field_name}"? Existing values won't be removed from products.`)) return;
+                                    if (!await asyncConfirm(language === 'es' ? `¿Eliminar el campo "${d.field_name}"? Los valores existentes no se borrarán de los productos.` : `Delete field "${d.field_name}"? Existing values won't be removed from products.`)) return;
                                     try {
                                       await deleteCustomFieldDefinition(d.id);
                                       showToast(language === 'es' ? 'Campo eliminado.' : 'Field deleted.');
@@ -13076,9 +13591,9 @@ USING (true);`;
                   if (prodFormSubmitting) return;
                   try {
                     const selPrefix = prefixes.find(pf => pf.id === prodFormPrefixId);
-                    const finalSerial = prodFormIsGeneric 
-                      ? prodFormSerialNo.trim().toUpperCase()
-                      : (selPrefix ? `${selPrefix.prefix}${prodFormSerialNo.trim()}` : prodFormSerialNo.trim());
+                    const finalSerial = selPrefix
+                      ? `${selPrefix.prefix}${prodFormSerialNo.trim()}`
+                      : (prodFormIsGeneric ? prodFormSerialNo.trim().toUpperCase() : prodFormSerialNo.trim());
 
                     if (!finalSerial) {
                       showToast(language === 'es' ? 'El código/ID de inventario es obligatorio.' : 'Inventory code/ID is required.', 'error');
@@ -13090,6 +13605,15 @@ USING (true);`;
                       const duplicate = products.find(p => p.id !== (prod?.id ?? '') && p.serial_number.toLowerCase() === finalSerial.toLowerCase());
                       if (duplicate) {
                         showToast(language === 'es' ? `El código "${finalSerial}" ya existe en el inventario.` : `Code "${finalSerial}" already exists in inventory.`, 'error');
+                        return;
+                      }
+                    }
+
+                    // When distributing a generic across locations, every declared unit must be assigned.
+                    if (prodFormIsGeneric && prodFormUseDistribution) {
+                      const distSum = Object.values(prodFormLocDistribution).reduce((a, b) => a + (Number(b) || 0), 0);
+                      if (distSum !== prodFormQuantity) {
+                        showToast(language === 'es' ? `Distribuiste ${distSum} de ${prodFormQuantity} unidades. Asigná todas antes de guardar.` : `You distributed ${distSum} of ${prodFormQuantity} units. Assign them all before saving.`, 'error');
                         return;
                       }
                     }
@@ -13111,20 +13635,24 @@ USING (true);`;
                       imageUrl = null;
                     }
 
+                    // BAT (23% tax): the input holds the base cost; the stored price_paid includes the tax.
+                    const batAmount = prodFormAddBat ? Math.round(prodFormPricePaid * 0.23 * 100) / 100 : 0;
+                    const effectiveCost = prodFormPricePaid + batAmount;
                     const newProdBase = {
                       model_id: prodFormModelId || prod?.model_id || null,
                       serial_number: finalSerial,
-                      prefix_id: prodFormIsGeneric ? null : (prodFormPrefixId || null),
-                      name: [prodFormBrand, prodFormModel].filter(Boolean).join(' ') || 'Item Stock',
+                      prefix_id: prodFormPrefixId || null,
+                      name: [prodFormBrand, prodFormModel].filter(Boolean).join(' ') || (prodFormIsGeneric ? finalSerial : 'Item Stock'),
                       category_id: prodFormCategory,
-                      price_paid: prodFormPricePaid,
+                      price_paid: effectiveCost,
                       price_sold: prodFormPriceSold !== null ? prodFormPriceSold : (prod?.price_sold ?? null), sold_date: prod?.sold_date ?? null,
                       status: prod?.status ?? 'Disponible', notes: prodFormNotes,
                       suggested_weekly_rate: prodFormCategory === catBikeId ? prodFormWeeklyRate : null,
                       suggested_deposit: prodFormCategory === catBikeId ? prodFormDeposit : null,
                       odometer: prodFormOdo, frame_serial: prodFormFrame || null,
                       motor_brand: prodFormMotor || null, battery_capacity: null, wheel_size: null,
-                      brand: prodFormBrand || null, model: prodFormModel || null,
+                      brand: prodFormBrand || (prodFormIsGeneric ? finalSerial : null),
+                      model: prodFormModel || (prodFormIsGeneric ? '' : null),
                       battery_serial: prodFormBatSerial || null,
                       purchase_date: prodFormPurchase || null, arrival_date: prodFormArrival || null,
                       key_number: prodFormKey || null,
@@ -13140,6 +13668,9 @@ USING (true);`;
                       remind_service_odometer_threshold: prod?.remind_service_odometer_threshold ?? 50,
                       custom_field_values: {
                         ...prodFormCustomValues,
+                        is_generic: prodFormIsGeneric,
+                        bat_applied: prodFormAddBat,
+                        cost_base: prodFormAddBat ? prodFormPricePaid : null,
                         location: selectedLocation || null,
                         location_date: selectedLocation ? selectedLocationDate : null,
                         assembly_date: prodFormAssembly || null,
@@ -13286,6 +13817,49 @@ USING (true);`;
                           <span style={{ marginLeft: '8px', color: 'var(--text-muted)', fontSize: '12px' }}>
                             (Coste: €{p.price_paid})
                           </span>
+                          {(() => {
+                            const isGeneric = isProductGeneric(p);
+                            if (!isGeneric) return null;
+                            const pGroup = products.filter(item => item.serial_number === p.serial_number && item.status === 'Disponible');
+                            const locsMap: Record<string, number> = {};
+                            pGroup.forEach(mp => {
+                              const dist = (mp.custom_field_values?.location_distribution as Record<string, number>) || {};
+                              Object.entries(dist).forEach(([loc, qty]) => {
+                                if (qty > 0) {
+                                  locsMap[loc] = (locsMap[loc] || 0) + qty;
+                                }
+                              });
+                              const hasDistField = mp.custom_field_values?.location_distribution != null;
+                              if (!hasDistField && mp.custom_field_values?.location) {
+                                const singleLoc = mp.custom_field_values.location as string;
+                                locsMap[singleLoc] = (locsMap[singleLoc] || 0) + 1;
+                              }
+                            });
+                            const availableLocations = Object.keys(locsMap);
+                            if (availableLocations.length === 0) return null;
+                            return (
+                              <div style={{ marginTop: '6px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                                  📍 {language === 'es' ? 'Vender desde:' : 'Sell from:'}
+                                </span>
+                                <select
+                                  className="form-control"
+                                  style={{ width: '180px', padding: '2px 6px', height: '24px', fontSize: '12px', margin: 0, display: 'inline-block' }}
+                                  value={soldProductLocations[p.id] || ''}
+                                  onChange={e => {
+                                    const selectedLoc = e.target.value;
+                                    setSoldProductLocations(prev => ({ ...prev, [p.id]: selectedLoc }));
+                                  }}
+                                >
+                                  {availableLocations.map(loc => (
+                                    <option key={loc} value={loc}>
+                                      {loc} ({language === 'es' ? 'Disp:' : 'Avail:'} {locsMap[loc]})
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                            );
+                          })()}
                         </div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                           <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
@@ -13351,10 +13925,13 @@ USING (true);`;
                                 setSoldFormPrice(newSum);
                                 return next;
                               });
+                              const pDist = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
+                              const pLoc = pDist ? Object.entries(pDist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central' : (p.custom_field_values?.location as string || 'Almacén Central');
+                              setSoldProductLocations(prev => ({ ...prev, [p.id]: pLoc }));
                             }}
                           >
                             <span><strong>{p.serial_number}</strong> - {p.name}</span>
-                            <span style={{ color: 'var(--color-primary)', fontWeight: 600 }}>€{p.price_paid ? Math.round(p.price_paid * 1.5) : 500}</span>
+                            <span style={{ color: 'var(--color-primary)', fontWeight: 600 }}>€{p.price_sold ?? (p.price_paid ? Math.round(p.price_paid * 1.5) : 500)}</span>
                           </div>
                         ))}
                       </div>
@@ -13370,19 +13947,8 @@ USING (true);`;
                       type="number" 
                       className="form-control" 
                       value={soldFormPrice} 
-                      onChange={e => {
-                        const val = Number(e.target.value);
-                        setSoldFormPrice(val);
-                        setSoldProductPrices(prev => {
-                          const totalPrev = Object.values(prev).reduce((sum, v) => sum + v, 0);
-                          const factor = totalPrev > 0 ? (val / totalPrev) : 1;
-                          const next = { ...prev };
-                          Object.keys(next).forEach(key => {
-                            next[key] = Math.round(next[key] * factor * 100) / 100;
-                          });
-                          return next;
-                        });
-                      }} 
+                      readOnly
+                      style={{ backgroundColor: 'rgba(255, 255, 255, 0.05)', cursor: 'not-allowed' }}
                     />
                   </div>
                   <div className="form-group">
@@ -13551,11 +14117,14 @@ USING (true);`;
                         </div>
                         <div className="form-group">
                           <label className="form-label">🔢 {language === 'es' ? 'Cantidad Cuotas' : 'Installments'}</label>
-                          <select className="form-control" value={soldInstallments} onChange={e => setSoldInstallments(Number(e.target.value))}>
-                            {[2,3,4,5,6,8,10,12,18,24].map(num => (
-                              <option key={num} value={num}>{num}</option>
-                            ))}
-                          </select>
+                          <input
+                            type="number"
+                            className="form-control"
+                            min={1}
+                            step={1}
+                            value={soldInstallments}
+                            onChange={e => setSoldInstallments(Math.max(1, Math.floor(Number(e.target.value) || 1)))}
+                          />
                         </div>
                         <div className="form-group">
                           <label className="form-label">📅 {language === 'es' ? 'Frecuencia' : 'Frequency'}</label>
@@ -13653,67 +14222,200 @@ USING (true);`;
 
                       // 3. Create Sale Items & Update Product status
                       const saleItemsToInsert = [];
+                      // Working copy kept in sync with every DB mutation below, so that selling several
+                      // units of the same consolidated/generic serial in a single sale always reads the
+                      // up-to-date distribution (prevents stale-snapshot double counting).
+                      let currentProducts = products.map(pp => ({ ...pp, custom_field_values: { ...pp.custom_field_values } }));
+                      const applyUpsert = async (row: Product) => {
+                        await upsertProduct(row);
+                        const syncedRow = { ...row, custom_field_values: { ...row.custom_field_values } };
+                        const idx = currentProducts.findIndex(cp => cp.id === row.id);
+                        if (idx >= 0) currentProducts[idx] = syncedRow; else currentProducts.push(syncedRow);
+                      };
+                      const applyDelete = async (id: string) => {
+                        await deleteProduct(id);
+                        currentProducts = currentProducts.filter(cp => cp.id !== id);
+                      };
                       for (const p of soldProducts) {
                         const actualUnitPrice = soldProductPrices[p.id] ?? p.price_sold ?? (p.price_paid ? Math.round(p.price_paid * 1.5) : 500);
+                        const statusToSet = soldPaymentType === 'financiado' ? 'Financiada' : 'Vendida';
+                        const isGeneric = isProductGeneric(p);
+                        const selectedLoc = soldProductLocations[p.id] || 'Almacén Central';
                         const dist = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
                         const totalQty = dist ? Object.values(dist).reduce((a, b) => a + b, 0) : 0;
-                        const statusToSet = soldPaymentType === 'financiado' ? 'Financiada' : 'Vendida';
 
-                        if (dist && totalQty > 1) {
-                          const splitId = crypto.randomUUID();
-                          const mainLoc = Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central';
-                          
-                          // Insert the split-off sold unit
-                          await upsertProduct({
-                            ...p,
-                            id: splitId,
-                            status: statusToSet,
-                            price_sold: actualUnitPrice,
-                            sold_date: soldFormDate,
-                            custom_field_values: { ...p.custom_field_values, location: mainLoc, location_distribution: undefined },
-                          });
+                        if (isGeneric) {
+                          const pGroup = currentProducts.filter(item => item.serial_number === p.serial_number && item.status === 'Disponible');
 
-                          saleItemsToInsert.push({
-                            sale_id: newSaleId,
-                            product_id: splitId,
-                            unit_price: actualUnitPrice
-                          });
+                          // Find the product in the group that has the selected location in its distribution (or as its single location)
+                          const targetProduct = pGroup.find(mp => {
+                            const distMap = (mp.custom_field_values?.location_distribution as Record<string, number>) || {};
+                            if (distMap[selectedLoc] > 0) return true;
+                            if (Object.keys(distMap).length === 0 && mp.custom_field_values?.location === selectedLoc) return true;
+                            return false;
+                          }) || pGroup[0] || p;
 
-                          // Decrement quantity from the main product
-                          const updatedDist = { ...dist };
-                          const locToDecrement = Object.keys(updatedDist).find(k => updatedDist[k] > 0) || mainLoc;
-                          updatedDist[locToDecrement] = (updatedDist[locToDecrement] || 1) - 1;
-                          Object.keys(updatedDist).forEach(k => { if (updatedDist[k] <= 0) delete updatedDist[k]; });
-                          const newTotal = Object.values(updatedDist).reduce((a, b) => a + b, 0);
+                          const tDist = (targetProduct.custom_field_values?.location_distribution as Record<string, number>) || {};
+                          const tTotalQty = Object.values(tDist).reduce((a, b) => a + b, 0);
 
-                          if (newTotal <= 0) {
-                            await upsertProduct({
-                              ...p,
+                          if (Object.keys(tDist).length > 0 && tTotalQty > 1) {
+                            const splitId = crypto.randomUUID();
+                            
+                            // Insert the split-off sold unit
+                            await applyUpsert({
+                              ...targetProduct,
+                              id: splitId,
                               status: statusToSet,
                               price_sold: actualUnitPrice,
                               sold_date: soldFormDate,
-                              custom_field_values: { ...p.custom_field_values, location_distribution: undefined }
+                              custom_field_values: { 
+                                ...targetProduct.custom_field_values, 
+                                location: selectedLoc, 
+                                location_distribution: undefined 
+                              },
                             });
+
+                            saleItemsToInsert.push({
+                              sale_id: newSaleId,
+                              product_id: splitId,
+                              unit_price: actualUnitPrice
+                            });
+
+                            // Decrement quantity from targetProduct
+                            const updatedDist = { ...tDist };
+                            updatedDist[selectedLoc] = (updatedDist[selectedLoc] || 1) - 1;
+                            Object.keys(updatedDist).forEach(k => { if (updatedDist[k] <= 0) delete updatedDist[k]; });
+                            const newTotal = Object.values(updatedDist).reduce((a, b) => a + b, 0);
+
+                            if (newTotal <= 0) {
+                              const totalRowsInGroup = currentProducts.filter(item => item.serial_number === p.serial_number).length;
+                              if (totalRowsInGroup <= 1) {
+                                await applyUpsert({
+                                  ...targetProduct,
+                                  custom_field_values: {
+                                    ...targetProduct.custom_field_values,
+                                    location: null,
+                                    location_distribution: {}
+                                  }
+                                });
+                              } else {
+                                await applyDelete(targetProduct.id);
+                              }
+                            } else {
+                              let mainLocation = '';
+                              let maxQ = -1;
+                              Object.entries(updatedDist).forEach(([l, v]) => {
+                                  if (v > maxQ) {
+                                    maxQ = v;
+                                    mainLocation = l;
+                                  }
+                              });
+                              await applyUpsert({
+                                ...targetProduct,
+                                custom_field_values: { 
+                                  ...targetProduct.custom_field_values, 
+                                  location: mainLocation || 'Almacén Central',
+                                  location_distribution: updatedDist 
+                                }
+                              });
+                            }
                           } else {
-                            await upsertProduct({
-                              ...p,
-                              custom_field_values: { ...p.custom_field_values, location_distribution: updatedDist }
-                            });
+                            // Standard or last unit of generic item
+                            const totalRowsInGroup = currentProducts.filter(item => item.serial_number === p.serial_number).length;
+                            if (totalRowsInGroup <= 1) {
+                              await applyUpsert({
+                                ...targetProduct,
+                                status: statusToSet,
+                                price_sold: actualUnitPrice,
+                                sold_date: soldFormDate,
+                                custom_field_values: { 
+                                  ...targetProduct.custom_field_values, 
+                                  location: selectedLoc, 
+                                  location_distribution: undefined 
+                                }
+                              });
+                              saleItemsToInsert.push({
+                                sale_id: newSaleId,
+                                product_id: targetProduct.id,
+                                unit_price: actualUnitPrice
+                              });
+                            } else {
+                              const splitId = crypto.randomUUID();
+                              await applyUpsert({
+                                ...targetProduct,
+                                id: splitId,
+                                status: statusToSet,
+                                price_sold: actualUnitPrice,
+                                sold_date: soldFormDate,
+                                custom_field_values: { 
+                                  ...targetProduct.custom_field_values, 
+                                  location: selectedLoc, 
+                                  location_distribution: undefined 
+                                }
+                              });
+                              saleItemsToInsert.push({
+                                sale_id: newSaleId,
+                                product_id: splitId,
+                                unit_price: actualUnitPrice
+                              });
+                              await applyDelete(targetProduct.id);
+                            }
                           }
                         } else {
-                          // Standard or last unit
-                          await upsertProduct({
-                            ...p,
-                            status: statusToSet,
-                            price_sold: actualUnitPrice,
-                            sold_date: soldFormDate
-                          });
+                          // Standard non-generic (unique item)
+                          if (dist && totalQty > 1) {
+                            const splitId = crypto.randomUUID();
+                            const mainLoc = Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central';
+                            
+                            await applyUpsert({
+                              ...p,
+                              id: splitId,
+                              status: statusToSet,
+                              price_sold: actualUnitPrice,
+                              sold_date: soldFormDate,
+                              custom_field_values: { ...p.custom_field_values, location: mainLoc, location_distribution: undefined },
+                            });
 
-                          saleItemsToInsert.push({
-                            sale_id: newSaleId,
-                            product_id: p.id,
-                            unit_price: actualUnitPrice
-                          });
+                            saleItemsToInsert.push({
+                              sale_id: newSaleId,
+                              product_id: splitId,
+                              unit_price: actualUnitPrice
+                            });
+
+                            const updatedDist = { ...dist };
+                            const locToDecrement = Object.keys(updatedDist).find(k => updatedDist[k] > 0) || mainLoc;
+                            updatedDist[locToDecrement] = (updatedDist[locToDecrement] || 1) - 1;
+                            Object.keys(updatedDist).forEach(k => { if (updatedDist[k] <= 0) delete updatedDist[k]; });
+                            const newTotal = Object.values(updatedDist).reduce((a, b) => a + b, 0);
+
+                            if (newTotal <= 0) {
+                              await applyUpsert({
+                                ...p,
+                                status: statusToSet,
+                                price_sold: actualUnitPrice,
+                                sold_date: soldFormDate,
+                                custom_field_values: { ...p.custom_field_values, location_distribution: undefined }
+                              });
+                            } else {
+                              await applyUpsert({
+                                ...p,
+                                custom_field_values: { ...p.custom_field_values, location_distribution: updatedDist }
+                              });
+                            }
+                          } else {
+                            await applyUpsert({
+                              ...p,
+                              status: statusToSet,
+                              price_sold: actualUnitPrice,
+                              sold_date: soldFormDate
+                            });
+
+                            saleItemsToInsert.push({
+                              sale_id: newSaleId,
+                              product_id: p.id,
+                              unit_price: actualUnitPrice
+                            });
+                          }
                         }
                       }
                       await insertSaleItems(saleItemsToInsert);
@@ -14599,13 +15301,13 @@ USING (true);`;
                         {/* Delete */}
                         <button 
                           type="button" 
-                          onClick={() => {
+                          onClick={async () => {
                             const isUsed = otherExpenses.some(e => e.categoryId === cat.id);
                             if (isUsed) {
                               showToast(language === 'es' ? 'No puedes eliminar esta categoría porque tiene gastos asociados.' : 'Cannot delete category with associated expenses.', 'error');
                               return;
                             }
-                            if (confirm(language === 'es' ? `¿Seguro que deseas eliminar la categoría "${cat.name}"?` : `Are you sure you want to delete category "${cat.name}"?`)) {
+                            if (await asyncConfirm(language === 'es' ? `¿Seguro que deseas eliminar la categoría "${cat.name}"?` : `Are you sure you want to delete category "${cat.name}"?`)) {
                               setExpenseCategories(prev => prev.filter(c => c.id !== cat.id));
                               showToast(language === 'es' ? 'Categoría eliminada.' : 'Category deleted.', 'success');
                             }
@@ -15635,8 +16337,8 @@ USING (true);`;
                                     type="button"
                                     className="btn-danger btn-xs"
                                     style={{ padding: '2px 6px', fontSize: '11px', background: 'rgba(239, 68, 68, 0.1)', color: '#ef4444', border: '1px solid rgba(239, 68, 68, 0.2)' }}
-                                    onClick={() => {
-                                      if (confirm(language === 'es' ? `¿Estás seguro de que quieres borrar la ubicación "${loc}"?` : `Are you sure you want to delete the location "${loc}"?`)) {
+                                    onClick={async () => {
+                                      if (await asyncConfirm(language === 'es' ? `¿Estás seguro de que quieres borrar la ubicación "${loc}"?` : `Are you sure you want to delete the location "${loc}"?`)) {
                                         const updated = locationsList.filter((_, i) => i !== idx);
                                         setLocationsList(updated);
                                         localStorage.setItem('fast_sheep_locations', JSON.stringify(updated));
@@ -16771,7 +17473,7 @@ USING (true);`;
                                     }
                                   }}>✓</button>
                                   <button className="btn-danger btn-xs" style={{ padding: '2px 8px' }} onClick={async () => {
-                                    if (!confirm(language === 'es' ? '¿Eliminar recordatorio?' : 'Delete reminder?')) return;
+                                    if (!await asyncConfirm(language === 'es' ? '¿Eliminar recordatorio?' : 'Delete reminder?')) return;
                                     try {
                                       await deleteEvent(e.id);
                                       triggerReload();
@@ -17180,7 +17882,7 @@ USING (true);`;
                         ? `¿Estás seguro de que quieres reportar este vehículo como ${statusStr}?`
                         : `Are you sure you want to report this vehicle as ${statusStr}?`;
 
-                      if (!window.confirm(confirmMsg)) return;
+                      if (!await asyncConfirm(confirmMsg)) return;
 
                       try {
                         const updates: Promise<void>[] = [];
@@ -17775,39 +18477,101 @@ USING (true);`;
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                {prefixes.map(pf => (
-                  <div key={pf.id} style={{ display: 'flex', justifyContent: 'space-between', padding: '10px', background: 'rgba(0,0,0,0.1)', borderRadius: '8px' }}>
-                    <span><strong>{pf.prefix}</strong> — {pf.description}</span>
-                    <button className="btn-danger btn-xs" onClick={async () => {
-                      try {
-                        await deletePrefix(pf.id);
-                        triggerReload();
-                        showToast(language === 'es' ? 'Prefijo eliminado.' : 'Prefix deleted.', 'success');
-                      } catch (err) {
-                        console.error('Error deleting prefix:', err);
-                        showToast(language === 'es' ? 'Error al eliminar prefijo.' : 'Error deleting prefix.', 'error');
-                      }
-                    }}>✕</button>
-                  </div>
-                ))}
+                {prefixes.map(pf => {
+                  const cat = categories.find(c => c.id === pf.category_id);
+                  const catLabel = cat ? ` (${language === 'es' ? cat.name_es : cat.name_en})` : '';
+                  return (
+                    <div key={pf.id} style={{ display: 'flex', justifyContent: 'space-between', padding: '10px', background: 'rgba(0,0,0,0.1)', borderRadius: '8px' }}>
+                      <span><strong>{pf.prefix}</strong> — {pf.description}{catLabel}</span>
+                      <div style={{ display: 'flex', gap: '6px' }}>
+                        <button className="btn-secondary btn-xs" onClick={() => {
+                          setEditingPrefixId(pf.id);
+                          setPfFormPrefix(pf.prefix);
+                          setPfFormDesc(pf.description);
+                          setPfFormCategoryId(pf.category_id || '');
+                        }} title={language === 'es' ? 'Editar' : 'Edit'}>✏️</button>
+                        <button className="btn-danger btn-xs" onClick={async () => {
+                          try {
+                            await deletePrefix(pf.id);
+                            triggerReload();
+                            showToast(language === 'es' ? 'Prefijo eliminado.' : 'Prefix deleted.', 'success');
+                          } catch (err) {
+                            console.error('Error deleting prefix:', err);
+                            showToast(language === 'es' ? 'Error al eliminar prefijo.' : 'Error deleting prefix.', 'error');
+                          }
+                        }}>✕</button>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
               <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '16px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                <h4>+ {language === 'es' ? 'Crear Nuevo Prefijo' : 'Create New Prefix'}</h4>
-                <div className="form-grid">
+                <h4>{editingPrefixId ? (language === 'es' ? '✏️ Editar Prefijo' : '✏️ Edit Prefix') : `+ ${language === 'es' ? 'Crear Nuevo Prefijo' : 'Create New Prefix'}`}</h4>
+                <div className="form-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))' }}>
                   <div className="form-group"><label className="form-label">{language === 'es' ? 'Prefijo (ej: B-)' : 'Prefix (e.g., B-)'}</label><input type="text" className="form-control" value={pfFormPrefix} onChange={e => setPfFormPrefix(e.target.value)} /></div>
                   <div className="form-group"><label className="form-label">{language === 'es' ? 'Descripción' : 'Description'}</label><input type="text" className="form-control" value={pfFormDesc} onChange={e => setPfFormDesc(e.target.value)} /></div>
+                  <div className="form-group">
+                    <label className="form-label">{language === 'es' ? 'Categoría' : 'Category'}</label>
+                    <select 
+                      className="form-control" 
+                      value={pfFormCategoryId} 
+                      onChange={e => setPfFormCategoryId(e.target.value)}
+                      disabled={!isPrefixCategorySupported}
+                    >
+                      <option value="">{language === 'es' ? '-- Sin categoría --' : '-- No category --'}</option>
+                      {categories.map(c => (
+                        <option key={c.id} value={c.id}>
+                          {language === 'es' ? c.name_es : c.name_en}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
                 </div>
-                <button className="btn-primary" onClick={async () => {
-                  if (!pfFormPrefix) return;
-                  try {
-                    await upsertPrefix({ id: crypto.randomUUID(), prefix: pfFormPrefix, description: pfFormDesc });
-                    setPfFormPrefix(''); setPfFormDesc(''); triggerReload();
-                    showToast(language === 'es' ? 'Prefijo creado.' : 'Prefix created.', 'success');
-                  } catch (err) {
-                    console.error('Error creating prefix:', err);
-                    showToast(language === 'es' ? 'Error al crear prefijo.' : 'Error creating prefix.', 'error');
-                  }
-                }}>💾 {t.save}</button>
+                {!isPrefixCategorySupported && (
+                  <div className="glass-card" style={{ padding: '12px', background: 'rgba(239, 68, 68, 0.08)', border: '1px solid rgba(239, 68, 68, 0.3)', borderRadius: '8px', fontSize: '12px' }}>
+                    <p style={{ margin: 0, color: '#f87171' }}>
+                      ⚠️ <strong>Actualización SQL necesaria:</strong> Para habilitar la selección de categorías en los prefijos, copia y ejecuta el siguiente comando en el SQL Editor de tu Dashboard de Supabase:
+                    </p>
+                    <code style={{ display: 'block', margin: '8px 0', background: 'rgba(0,0,0,0.3)', padding: '6px', borderRadius: '4px', wordBreak: 'break-all', fontFamily: 'monospace' }}>
+                      ALTER TABLE public.serial_prefixes ADD COLUMN IF NOT EXISTS category_id UUID REFERENCES public.categories(id) ON DELETE SET NULL;
+                    </code>
+                    <button 
+                      type="button" 
+                      className="btn-secondary btn-xs" 
+                      onClick={() => {
+                        navigator.clipboard.writeText('ALTER TABLE public.serial_prefixes ADD COLUMN IF NOT EXISTS category_id UUID REFERENCES public.categories(id) ON DELETE SET NULL;');
+                        showToast(language === 'es' ? 'SQL copiado al portapapeles.' : 'SQL copied to clipboard.', 'success');
+                      }}
+                    >
+                      📋 Copiar SQL
+                    </button>
+                  </div>
+                )}
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button className="btn-primary" onClick={async () => {
+                    if (!pfFormPrefix) return;
+                    try {
+                      await upsertPrefix({ 
+                        id: editingPrefixId || crypto.randomUUID(), 
+                        prefix: pfFormPrefix, 
+                        description: pfFormDesc,
+                        category_id: isPrefixCategorySupported && pfFormCategoryId ? pfFormCategoryId : null
+                      });
+                      setPfFormPrefix(''); setPfFormDesc(''); setPfFormCategoryId(''); setEditingPrefixId(null); triggerReload();
+                      showToast(editingPrefixId ? (language === 'es' ? 'Prefijo actualizado.' : 'Prefix updated.') : (language === 'es' ? 'Prefijo creado.' : 'Prefix created.'), 'success');
+                    } catch (err) {
+                      console.error('Error saving prefix:', err);
+                      showToast(language === 'es' ? 'Error al guardar prefijo.' : 'Error saving prefix.', 'error');
+                    }
+                  }}>💾 {t.save}</button>
+                  {editingPrefixId && (
+                    <button type="button" className="btn-secondary" onClick={() => {
+                      setPfFormPrefix(''); setPfFormDesc(''); setPfFormCategoryId(''); setEditingPrefixId(null);
+                    }}>
+                      {language === 'es' ? 'Cancelar' : 'Cancel'}
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           </div>
@@ -17928,7 +18692,7 @@ USING (true);`;
                             className="btn-danger btn-xs"
                             type="button"
                             onClick={async () => {
-                              if (!confirm(language === 'es' ? `¿Seguro que quieres eliminar "${p.name}"?` : `Are you sure you want to delete "${p.name}"?`)) return;
+                              if (!await asyncConfirm(language === 'es' ? `¿Seguro que quieres eliminar "${p.name}"?` : `Are you sure you want to delete "${p.name}"?`)) return;
                               try {
                                 await deletePlatform(p.id);
                                 const plats = await getPlatforms();
@@ -18057,7 +18821,7 @@ USING (true);`;
                             className="btn-danger btn-xs"
                             type="button"
                             onClick={async () => {
-                              if (!confirm(language === 'es' ? `¿Seguro que quieres eliminar "${v.name}"?` : `Are you sure you want to delete "${v.name}"?`)) return;
+                              if (!await asyncConfirm(language === 'es' ? `¿Seguro que quieres eliminar "${v.name}"?` : `Are you sure you want to delete "${v.name}"?`)) return;
                               try {
                                 await deleteVehicle(v.id);
                                 const vehs = await getVehicles();
@@ -18571,7 +19335,9 @@ USING (true);`;
                   <div style={{ display: 'flex', gap: '8px' }}>
                     <select className="form-control" style={{ flex: 1 }} value={tmplPrefixId} onChange={e => setTmplPrefixId(e.target.value)}>
                       <option value="">-- None --</option>
-                      {prefixes.map(pf => <option key={pf.id} value={pf.id}>{pf.prefix}</option>)}
+                      {prefixes
+                        .filter(pf => pf.category_id === tmplCategory)
+                        .map(pf => <option key={pf.id} value={pf.id}>{pf.prefix}</option>)}
                     </select>
                     <button type="button" className="btn-secondary" style={{ padding: '0 12px', minWidth: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={() => setModalType('prefix')} title={language === 'es' ? 'Agregar Prefijo' : 'Add Prefix'}>
                       ➕
@@ -18693,7 +19459,7 @@ USING (true);`;
                             justifyContent: 'center'
                           }}
                           onClick={async () => {
-                            if (!confirm(language === 'es' ? `¿Eliminar el campo "${d.field_name}"? Los valores existentes no se borrarán de los productos.` : `Delete field "${d.field_name}"? Existing values won't be removed from products.`)) return;
+                            if (!await asyncConfirm(language === 'es' ? `¿Eliminar el campo "${d.field_name}"? Los valores existentes no se borrarán de los productos.` : `Delete field "${d.field_name}"? Existing values won't be removed from products.`)) return;
                             try {
                               await deleteCustomFieldDefinition(d.id);
                               showToast(language === 'es' ? 'Campo eliminado.' : 'Field deleted.');
@@ -18908,7 +19674,7 @@ USING (true);`;
                             <td>{typeLabels[d.field_type] ?? d.field_type}</td>
                             <td>
                               <button className="btn-danger btn-xs" onClick={async () => {
-                                if (!confirm(language === 'es' ? `¿Eliminar el campo "${d.field_name}"? Los valores existentes no se borrarán de los productos.` : `Delete field "${d.field_name}"? Existing values won't be removed from products.`)) return;
+                                if (!await asyncConfirm(language === 'es' ? `¿Eliminar el campo "${d.field_name}"? Los valores existentes no se borrarán de los productos.` : `Delete field "${d.field_name}"? Existing values won't be removed from products.`)) return;
                                 try {
                                   await deleteCustomFieldDefinition(d.id);
                                   showToast(language === 'es' ? 'Campo eliminado.' : 'Field deleted.');
@@ -19368,7 +20134,754 @@ USING (true);`;
         </div>
       )}
 
+      
+      {/* ===== ADD GENERIC STOCK MODAL ===== */}
+      {addGenStockModalOpen && (() => {
+        const prod = products.find(p => p.id === selectedProductId);
+        if (!prod) return null;
+        
+        return (
+          <div className="modal-overlay" style={{ zIndex: 1300 }} onClick={() => setAddGenStockModalOpen(false)}>
+            <div className="modal-content" style={{ maxWidth: '450px', width: '100%', padding: '24px' }} onClick={e => e.stopPropagation()}>
+              <div className="modal-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                <h3>➕ {language === 'es' ? 'Agregar Existencias' : 'Add Stock'} ({prod.serial_number})</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setAddGenStockModalOpen(false)}>✕</button>
+              </div>
+              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                <div className="form-group">
+                  <label className="form-label">{language === 'es' ? 'Cantidad a agregar' : 'Quantity to add'}</label>
+                  <input 
+                    type="number" 
+                    className="form-control" 
+                    min={1} 
+                    value={genStockQty} 
+                    onChange={e => setGenStockQty(Math.max(1, Number(e.target.value)))} 
+                  />
+                </div>
+                <div className="form-group" style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  <label className="form-label">{language === 'es' ? 'Ubicación' : 'Location'}</label>
+                  <select
+                    className="form-control"
+                    value={genStockLocation}
+                    onChange={(e) => setGenStockLocation(e.target.value)}
+                  >
+                    <option value="">{language === 'es' ? '-- Seleccione ubicación --' : '-- Select location --'}</option>
+                    {locationsList.map((loc) => (
+                      <option key={loc} value={loc}>{loc}</option>
+                    ))}
+                  </select>
+                  
+                  <div style={{ display: 'flex', gap: '6px', marginTop: '4px' }}>
+                    <input
+                      type="text"
+                      className="form-control"
+                      style={{ flex: 1 }}
+                      placeholder={language === 'es' ? 'Crear nueva ubicación' : 'Create new location'}
+                      value={newLocationInput}
+                      onChange={(e) => setNewLocationInput(e.target.value)}
+                    />
+                    <button
+                      type="button"
+                      className="btn-primary"
+                      style={{ height: '38px', padding: '0 12px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                      onClick={() => {
+                        const trimmed = newLocationInput.trim();
+                        if (!trimmed) return;
+                        if (!locationsList.includes(trimmed)) {
+                          const updated = [...locationsList, trimmed];
+                          setLocationsList(updated);
+                          localStorage.setItem('fast_sheep_locations', JSON.stringify(updated));
+                        }
+                        setGenStockLocation(trimmed);
+                        setNewLocationInput('');
+                        showToast(
+                          language === 'es' ? `Ubicación "${trimmed}" creada.` : `Location "${trimmed}" created.`,
+                          'success'
+                        );
+                      }}
+                    >
+                      ➕ {language === 'es' ? 'Crear' : 'Create'}
+                    </button>
+                  </div>
+                </div>
+                <div className="form-group">
+                  <label className="form-label">{language === 'es' ? 'Costo unitario (€)' : 'Unit Cost (€)'}</label>
+                  <input
+                    type="number"
+                    className="form-control"
+                    min={0}
+                    value={genStockCost}
+                    onChange={e => setGenStockCost(Math.max(0, Number(e.target.value)))}
+                  />
+                  {(() => {
+                    const qty = genStockQty > 0 ? genStockQty : 1;
+                    const total = (genStockCost || 0) * qty;
+                    return (
+                      <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '6px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(16, 185, 129, 0.05)', padding: '6px 10px', borderRadius: '6px', border: '1px solid rgba(16, 185, 129, 0.1)' }}>
+                        <span>{language === 'es' ? 'Total de la compra' : 'Total purchase'} ({qty} {language === 'es' ? 'uds' : 'units'} × €{genStockCost || 0})</span>
+                        <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{total.toLocaleString()}</strong>
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+              <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
+                <button className="btn-secondary" onClick={() => setAddGenStockModalOpen(false)}>
+                  {language === 'es' ? 'Cancelar' : 'Cancel'}
+                </button>
+                <button 
+                  className="btn-primary" 
+                  onClick={async () => {
+                    const cleanLocation = genStockLocation.trim() || 'Almacén Central';
+                    try {
+                      // Insert new product row representing these new generic units
+                      const newId = crypto.randomUUID();
+                      await upsertProduct({
+                        ...prod,
+                        id: newId,
+                        status: 'Disponible',
+                        price_paid: genStockCost,
+                        price_sold: null,
+                        sold_date: null,
+                        purchase_date: new Date().toISOString().split('T')[0],
+                        date_added: new Date().toISOString(),
+                        custom_field_values: {
+                          ...prod.custom_field_values,
+                          location: cleanLocation,
+                          location_distribution: {
+                            [cleanLocation]: genStockQty
+                          }
+                        }
+                      });
+                      showToast(language === 'es' ? 'Existencias añadidas correctamente.' : 'Stock added successfully.', 'success');
+                      setAddGenStockModalOpen(false);
+                      triggerReload();
+                    } catch (err) {
+                      console.error('Error adding generic stock:', err);
+                      showToast(language === 'es' ? 'Error al agregar existencias.' : 'Error adding stock.', 'error');
+                    }
+                  }}
+                >
+                  💾 {language === 'es' ? 'Guardar' : 'Save'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ===== REMOVE GENERIC STOCK MODAL ===== */}
+      {removeGenStockModalOpen && (() => {
+        const prod = products.find(p => p.id === selectedProductId);
+        if (!prod) return null;
+
+        // Find all rows with the same serial number
+        const matchingProducts = products.filter(p => p.serial_number === prod.serial_number && p.status === 'Disponible');
+
+        // Compile location distribution across all matching available products
+        const locStockMap: Record<string, number> = {};
+        matchingProducts.forEach(mp => {
+          const dist = (mp.custom_field_values?.location_distribution as Record<string, number>) || {};
+          Object.entries(dist).forEach(([loc, qty]) => {
+            if (qty > 0) {
+              locStockMap[loc] = (locStockMap[loc] || 0) + qty;
+            }
+          });
+          // Also fallback to single location if no distribution
+          if (Object.keys(dist).length === 0 && mp.custom_field_values?.location) {
+            const singleLoc = mp.custom_field_values.location as string;
+            locStockMap[singleLoc] = (locStockMap[singleLoc] || 0) + 1;
+          }
+        });
+
+        const availableLocations = Object.keys(locStockMap);
+        const maxQty = locStockMap[genStockLocation] || 0;
+
+        return (
+          <div className="modal-overlay" style={{ zIndex: 1300 }} onClick={() => setRemoveGenStockModalOpen(false)}>
+            <div className="modal-content" style={{ maxWidth: '450px', width: '100%', padding: '24px' }} onClick={e => e.stopPropagation()}>
+              <div className="modal-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                <h3>➖ {language === 'es' ? 'Quitar Existencias' : 'Remove Stock'} ({prod.serial_number})</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setRemoveGenStockModalOpen(false)}>✕</button>
+              </div>
+              
+              {availableLocations.length === 0 ? (
+                <div className="modal-body" style={{ padding: '16px 0', textAlign: 'center', color: 'var(--text-muted)' }}>
+                  {language === 'es' ? 'No hay existencias disponibles para retirar.' : 'No available stock to remove.'}
+                </div>
+              ) : (
+                <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                  <div className="form-group">
+                    <label className="form-label">{language === 'es' ? 'Ubicación' : 'Location'}</label>
+                    <select 
+                      className="form-control" 
+                      value={genStockLocation} 
+                      onChange={e => {
+                        setGenStockLocation(e.target.value);
+                        setGenStockQty(1);
+                      }}
+                    >
+                      {availableLocations.map(loc => (
+                        <option key={loc} value={loc}>
+                          {loc} ({language === 'es' ? 'Disp:' : 'Avail:'} {locStockMap[loc]})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">
+                      {language === 'es' ? 'Cantidad a retirar' : 'Quantity to remove'}
+                    </label>
+                    <input 
+                      type="number" 
+                      className="form-control" 
+                      min={1} 
+                      max={maxQty}
+                      value={genStockQty} 
+                      onChange={e => setGenStockQty(Math.min(maxQty, Math.max(1, Number(e.target.value))))} 
+                    />
+                  </div>
+                </div>
+              )}
+              
+              <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
+                <button className="btn-secondary" onClick={() => setRemoveGenStockModalOpen(false)}>
+                  {language === 'es' ? 'Cancelar' : 'Cancel'}
+                </button>
+                <button 
+                  className="btn-primary" 
+                  disabled={availableLocations.length === 0}
+                  onClick={async () => {
+                    try {
+                      let qtyToRemove = genStockQty;
+                      const updates = [];
+                      const deletes = [];
+
+                      // Iterate through matching products to deduct quantity
+                      for (const mp of matchingProducts) {
+                        if (qtyToRemove <= 0) break;
+
+                        const dist = { ...((mp.custom_field_values?.location_distribution as Record<string, number>) || {}) };
+                        const locQty = dist[genStockLocation] || 0;
+
+                        if (locQty > 0) {
+                          const deduct = Math.min(qtyToRemove, locQty);
+                          dist[genStockLocation] = locQty - deduct;
+                          qtyToRemove -= deduct;
+
+                          // Clean up 0 quantities
+                          if (dist[genStockLocation] <= 0) {
+                            delete dist[genStockLocation];
+                          }
+
+                          const newTotal = Object.values(dist).reduce((a, b) => a + b, 0);
+
+                          if (newTotal <= 0) {
+                            // If it's the very last remaining row in the entire serial number group, 
+                            // keep it but with empty distribution and status set to 'Disponible' (0 stock),
+                            // to avoid deleting the product definition completely.
+                            const totalRowsInGroup = products.filter(p => p.serial_number === prod.serial_number).length;
+                            if (totalRowsInGroup <= 1) {
+                              updates.push(upsertProduct({
+                                ...mp,
+                                custom_field_values: {
+                                  ...mp.custom_field_values,
+                                  location: null,
+                                  location_distribution: {}
+                                }
+                              }));
+                            } else {
+                              deletes.push(deleteProduct(mp.id));
+                            }
+                          } else {
+                            // Find new main location
+                            let mainLocation = '';
+                            let maxQ = -1;
+                            Object.entries(dist).forEach(([l, v]) => {
+                              if (v > maxQ) {
+                                maxQ = v;
+                                mainLocation = l;
+                              }
+                            });
+
+                            updates.push(upsertProduct({
+                              ...mp,
+                              custom_field_values: {
+                                ...mp.custom_field_values,
+                                location: mainLocation,
+                                location_distribution: dist
+                              }
+                            }));
+                          }
+                        }
+                      }
+
+                      // Run db calls
+                      if (updates.length > 0) {
+                        await Promise.all(updates.map(up => up));
+                      }
+                      if (deletes.length > 0) {
+                        await Promise.all(deletes.map(del => del));
+                      }
+
+                      showToast(language === 'es' ? 'Existencias retiradas correctamente.' : 'Stock removed successfully.', 'success');
+                      setRemoveGenStockModalOpen(false);
+                      triggerReload();
+                    } catch (err) {
+                      console.error('Error removing generic stock:', err);
+                      showToast(language === 'es' ? 'Error al retirar existencias.' : 'Error removing stock.', 'error');
+                    }
+                  }}
+                >
+                  {language === 'es' ? 'Confirmar' : 'Confirm'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {/* ===== GOOGLE AUTH ACCESS CONTROL WHITELIST MODAL ===== */}
+      
+      {/* ===== GLOBAL STOCK ACTIONS DROPDOWN ===== */}
+      {activeStockMenuId && menuCoords && activeStockMenuData && (() => {
+        const { prod, group, hasRentals, isGeneric, hasAvailableStock } = activeStockMenuData;
+        return (
+          <>
+            {/* Click-away overlay */}
+            <div 
+              style={{ position: 'fixed', inset: 0, zIndex: 1190, cursor: 'default' }}
+              onClick={(e) => {
+                e.stopPropagation();
+                setActiveStockMenuId(null);
+                setMenuCoords(null);
+              }}
+            />
+            {/* Dropdown Menu */}
+            <div 
+              style={{ 
+                position: 'fixed', 
+                top: (menuCoords.top + 320 > window.innerHeight)
+                  ? `${menuCoords.top - 4}px` 
+                  : `${menuCoords.top + menuCoords.height + 4}px`,
+                left: 'auto',
+                right: `${window.innerWidth - (menuCoords.left + menuCoords.width)}px`,
+                transform: (menuCoords.top + 320 > window.innerHeight) ? 'translateY(-100%)' : 'none',
+                background: 'rgba(23, 23, 37, 0.98)', 
+                backdropFilter: 'blur(12px)',
+                WebkitBackdropFilter: 'blur(12px)',
+                border: '1px solid rgba(255, 255, 255, 0.08)', 
+                borderRadius: '8px', 
+                padding: '6px', 
+                minWidth: '160px', 
+                zIndex: 1200, 
+                boxShadow: '0 10px 25px rgba(0, 0, 0, 0.6)',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '4px'
+              }}
+            >
+              <button
+                className="dropdown-item"
+                style={{
+                  width: '100%',
+                  textAlign: 'left',
+                  background: 'transparent',
+                  border: 'none',
+                  borderRadius: '6px',
+                  padding: '8px 12px',
+                  fontSize: '12px',
+                  color: 'var(--text-muted)',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  transition: 'all 0.2s ease'
+                }}
+                onClick={() => {
+                  setActiveStockMenuId(null);
+                  openProductModal(prod);
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
+                  e.currentTarget.style.color = 'var(--text-bright)';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = 'transparent';
+                  e.currentTarget.style.color = 'var(--text-muted)';
+                }}
+              >
+                ✏️ {t.edit}
+              </button>
+              
+              {isGeneric && (
+                <>
+                  <button
+                    className="dropdown-item"
+                    style={{ 
+                      width: '100%', 
+                      textAlign: 'left', 
+                      background: 'transparent', 
+                      border: 'none', 
+                      borderRadius: '6px', 
+                      padding: '8px 12px', 
+                      fontSize: '12px', 
+                      color: 'var(--text-muted)', 
+                      cursor: 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '8px',
+                      transition: 'all 0.2s ease'
+                    }}
+                    onClick={() => {
+                      setActiveStockMenuId(null);
+                      setSelectedProductId(prod.id);
+                      setGenStockQty(1);
+                      setGenStockLocation('Almacén Central');
+                      setGenStockCost(prod.price_paid || 0);
+                      setAddGenStockModalOpen(true);
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
+                      e.currentTarget.style.color = 'var(--text-bright)';
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.background = 'transparent';
+                      e.currentTarget.style.color = 'var(--text-muted)';
+                    }}
+                  >
+                    ➕ {language === 'es' ? 'Agregar existencias' : 'Add Stock'}
+                  </button>
+                  {hasAvailableStock && (
+                    <button
+                      className="dropdown-item"
+                      style={{ 
+                        width: '100%', 
+                        textAlign: 'left', 
+                        background: 'transparent', 
+                        border: 'none', 
+                        borderRadius: '6px', 
+                        padding: '8px 12px', 
+                        fontSize: '12px', 
+                        color: 'var(--text-muted)', 
+                        cursor: 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px',
+                        transition: 'all 0.2s ease'
+                      }}
+                      onClick={() => {
+                        setActiveStockMenuId(null);
+                        setSelectedProductId(prod.id);
+                        setGenStockQty(1);
+                        const distObj = (prod.custom_field_values?.location_distribution as Record<string, number>) || {};
+                        const locs = Object.keys(distObj).filter(k => distObj[k] > 0);
+                        setGenStockLocation(locs[0] || 'Almacén Central');
+                        setRemoveGenStockModalOpen(true);
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
+                        e.currentTarget.style.color = 'var(--text-bright)';
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.background = 'transparent';
+                        e.currentTarget.style.color = 'var(--text-muted)';
+                      }}
+                    >
+                      ➖ {language === 'es' ? 'Quitar existencias' : 'Remove Stock'}
+                    </button>
+                  )}
+                </>
+              )}
+
+              {prod.status !== 'Vendida' && prod.status !== 'Financiada' && (
+                <>
+                  <button
+                    className="dropdown-item"
+                    style={{ 
+                      width: '100%', 
+                      textAlign: 'left', 
+                      background: 'transparent', 
+                      border: 'none', 
+                      borderRadius: '6px', 
+                      padding: '8px 12px', 
+                      fontSize: '12px', 
+                      color: 'var(--text-muted)', 
+                      cursor: 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '8px',
+                      transition: 'all 0.2s ease'
+                    }}
+                    onClick={() => {
+                      setActiveStockMenuId(null);
+                      setSelectedProductId(prod.id);
+                      setSelectedLocation((prod.custom_field_values?.location as string) || '');
+                      setSelectedLocationDate((prod.custom_field_values?.location_date as string) || new Date().toISOString().split('T')[0]);
+                      setModalType('changeLocation');
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
+                      e.currentTarget.style.color = 'var(--text-bright)';
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.background = 'transparent';
+                      e.currentTarget.style.color = 'var(--text-muted)';
+                    }}
+                  >
+                    📍 {language === 'es' ? 'Ubicación' : 'Location'}
+                  </button>
+
+                  {(prod.category_id === catBikeId || prod.category_id === catBattId) && (
+                    <button 
+                      className="dropdown-item"
+                      style={{ 
+                        width: '100%', 
+                        textAlign: 'left', 
+                        background: 'transparent', 
+                        border: 'none', 
+                        borderRadius: '6px', 
+                        padding: '8px 12px', 
+                        fontSize: '12px', 
+                        color: 'var(--text-muted)', 
+                        cursor: 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px',
+                        transition: 'all 0.2s ease'
+                      }}
+                      onClick={() => {
+                        setActiveStockMenuId(null);
+                        setSelectedProductId(prod.id);
+                        setSelectedCondition(prod.condition || 'bueno');
+                        setModalType('changeCondition');
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
+                        e.currentTarget.style.color = 'var(--text-bright)';
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.background = 'transparent';
+                        e.currentTarget.style.color = 'var(--text-muted)';
+                      }}
+                    >
+                      ✨ {language === 'es' ? 'Condición' : 'Condition'}
+                    </button>
+                  )}
+                </>
+              )}
+
+              {(prod.category_id === catBikeId || prod.category_id === catBattId) && (prod.status || '') !== 'Vendida' && (
+                <button 
+                  className="dropdown-item"
+                  style={{ 
+                    width: '100%', 
+                    textAlign: 'left', 
+                    background: 'transparent', 
+                    border: 'none', 
+                    borderRadius: '6px', 
+                    padding: '8px 12px', 
+                    fontSize: '12px', 
+                    color: 'var(--text-muted)', 
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    transition: 'all 0.2s ease'
+                  }}
+                  onClick={() => {
+                    setActiveStockMenuId(null);
+                    setSelectedProductId(prod.id);
+                    setModalType('bikeHistory');
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
+                    e.currentTarget.style.color = 'var(--text-bright)';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = 'transparent';
+                    e.currentTarget.style.color = 'var(--text-muted)';
+                  }}
+                >
+                  🔧 Service
+                </button>
+              )}
+
+              {prod.category_id === catBikeId && (
+                <button 
+                  className="dropdown-item"
+                  style={{ 
+                    width: '100%', 
+                    textAlign: 'left', 
+                    background: 'transparent', 
+                    border: 'none', 
+                    borderRadius: '6px', 
+                    padding: '8px 12px', 
+                    fontSize: '12px', 
+                    color: 'var(--text-muted)', 
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    transition: 'all 0.2s ease'
+                  }}
+                  onClick={() => {
+                    setActiveStockMenuId(null);
+                    setSelectedProductId(prod.id);
+                    setModalType('bikeModifications');
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
+                    e.currentTarget.style.color = 'var(--text-bright)';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = 'transparent';
+                    e.currentTarget.style.color = 'var(--text-muted)';
+                  }}
+                >
+                  🛠️ {language === 'es' ? 'Modificaciones' : 'Modifications'}
+                </button>
+              )}
+
+              <button 
+                className="dropdown-item"
+                style={{ 
+                  width: '100%', 
+                  textAlign: 'left', 
+                  background: 'transparent', 
+                  border: 'none', 
+                  borderRadius: '6px', 
+                  padding: '8px 12px', 
+                  fontSize: '12px', 
+                  color: 'var(--text-muted)', 
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  transition: 'all 0.2s ease'
+                }}
+                onClick={() => {
+                  setActiveStockMenuId(null);
+                  setActiveNoteProduct(prod);
+                  setActiveNoteProductGroup(group);
+                  setProductNotesText(prod.notes || '');
+                  setModalType('productNotes');
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
+                  e.currentTarget.style.color = 'var(--text-bright)';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = 'transparent';
+                  e.currentTarget.style.color = 'var(--text-muted)';
+                }}
+              >
+                📝 {language === 'es' ? 'Notas' : 'Notes'}
+              </button>
+
+              <button 
+                className="dropdown-item-danger"
+                style={{ 
+                  width: '100%', 
+                  textAlign: 'left', 
+                  background: 'transparent', 
+                  border: 'none', 
+                  borderRadius: '6px', 
+                  padding: '8px 12px', 
+                  fontSize: '12px', 
+                  color: 'rgba(239, 68, 68, 0.85)', 
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  transition: 'all 0.2s ease',
+                  borderTop: '1px solid rgba(255, 255, 255, 0.06)',
+                  marginTop: '4px',
+                  paddingTop: '8px'
+                }}
+                onClick={async () => {
+                  setActiveStockMenuId(null);
+                  const inactiveStatuses = ['Vendida', 'Financiada', 'Robada', 'Perdida', 'Perdida/Garda'];
+
+                  // If the menu was opened on a single sold/lost/stolen unit (e.g. from the Sold tab),
+                  // delete ONLY that unit — never the available stock of the same batch — and also
+                  // remove its sale transaction from the financial balance.
+                  if (inactiveStatuses.includes(prod.status)) {
+                    if (!await asyncConfirm(language === 'es' ? '¿Eliminar este artículo vendido? También se quitará su venta del balance financiero. No afecta al stock disponible del lote.' : 'Delete this sold item? Its sale will also be removed from the financial balance. It will not affect the batch available stock.')) return;
+                    try {
+                      // Clean up the linked sale(s) so the income disappears from the balance.
+                      const allItems = await getSaleItems();
+                      const linkedItems = allItems.filter(si => si.product_id === prod.id);
+                      for (const si of linkedItems) {
+                        const remaining = allItems.filter(other => other.sale_id === si.sale_id && other.id !== si.id);
+                        if (remaining.length === 0) {
+                          // This product was the sale's only item → remove the whole sale (+ financing).
+                          const plan = financingPlans.find(fp => fp.sale_id === si.sale_id);
+                          if (plan) {
+                            const sale = sales.find(s => s.id === si.sale_id);
+                            const cust = sale ? customers.find(c => c.id === sale.customer_id) : null;
+                            const custName = cust ? `${cust.first_name} ${cust.last_name}` : null;
+                            const linkedEvents = events.filter(e => e.title.includes('💳 Cuota') && (custName ? e.title.includes(custName) : false));
+                            for (const ev of linkedEvents) await deleteEvent(ev.id);
+                            await deleteFinancingPayments(plan.id);
+                            await deleteFinancingPlan(plan.id);
+                          }
+                          await deleteSaleItems(si.sale_id);
+                          await deleteSale(si.sale_id);
+                        } else {
+                          // Sale has other items → drop just this item and reduce the sale total.
+                          await deleteSaleItem(si.id);
+                          const sale = sales.find(s => s.id === si.sale_id);
+                          if (sale) {
+                            await updateSaleTotal(si.sale_id, Math.max(0, (sale.total_amount || 0) - (si.unit_price || 0)));
+                          }
+                        }
+                      }
+                      await deleteProduct(prod.id);
+                      showToast(language === 'es' ? 'Artículo y venta eliminados.' : 'Item and sale deleted.');
+                      triggerReload();
+                    } catch { showToast(language === 'es' ? 'Error al eliminar.' : 'Delete error.', 'error'); }
+                    return;
+                  }
+
+                  // Active stock: delete the active units of this batch, preserving sold/lost history.
+                  const rowsToDelete = group.filter(p => !inactiveStatuses.includes(p.status));
+                  const unitsToDelete = rowsToDelete.reduce((sum, p) => {
+                    const d = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
+                    return sum + (d != null ? Object.values(d).reduce((a, b) => a + (Number(b) || 0), 0) : 1);
+                  }, 0);
+                  const confirmMsg = unitsToDelete > 1
+                    ? (language === 'es' ? `⚠️ ¿Eliminar TODAS las ${unitsToDelete} unidades en stock de este lote?` : `⚠️ Delete ALL ${unitsToDelete} stock units of this batch?`)
+                    : (language === 'es' ? '¿Eliminar este producto del inventario?' : 'Delete this product from inventory?');
+
+                  if (hasRentals) {
+                    if (!await asyncConfirm(language === 'es' ? '⚠️ Este lote/producto tiene alquileres activos. ¿Eliminar de todos modos?' : '⚠️ This batch/product has active rentals. Delete anyway?')) return;
+                  } else {
+                    if (!await asyncConfirm(confirmMsg)) return;
+                  }
+
+                  try {
+                    await Promise.all(rowsToDelete.map(p => deleteProduct(p.id)));
+                    showToast(language === 'es' ? 'Stock eliminado.' : 'Stock deleted.');
+                    triggerReload();
+                  } catch { showToast(language === 'es' ? 'Error al eliminar.' : 'Delete error.', 'error'); }
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = 'rgba(239, 68, 68, 0.12)';
+                  e.currentTarget.style.color = '#f87171';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = 'transparent';
+                  e.currentTarget.style.color = 'rgba(239, 68, 68, 0.85)';
+                }}
+              >
+                🗑️ {t.delete}
+              </button>
+            </div>
+          </>
+        );
+      })()}
+
       {whitelistModalOpen && (
         <div
           className="modal-overlay"
@@ -19669,6 +21182,7 @@ USING (true);`;
             { key: 'suppliers',     icon: '🏬', label: t.suppliers },
             { key: 'quick_replies', icon: '💬', label: t.quick_replies },
             { key: 'emails',        icon: '📧', label: language === 'es' ? 'Plantillas' : 'Templates' },
+            { key: 'tasks',         icon: '📋', label: t.tasks },
           ].filter(({ key }) => !(key === 'balance' && isManager)).map(({ key, icon, label }) => (
             <li key={key}>
               <a className={`menu-item ${currentTab === key ? 'active' : ''}`}
@@ -19704,7 +21218,50 @@ USING (true);`;
           </div>
         )}
       </nav>
+      {confirmPromise && (
+        <div className="modal-backdrop" style={{ zIndex: 99999, display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(8px)' }}>
+          <div className="glass-card" style={{ maxWidth: '440px', width: '90%', padding: '24px', borderRadius: '16px', border: '1px solid rgba(255, 255, 255, 0.08)', background: 'rgba(15, 15, 25, 0.75)', boxShadow: '0 8px 32px rgba(0, 0, 0, 0.4)', display: 'flex', flexDirection: 'column', gap: '20px', animation: 'scaleUpConfirm 0.2s cubic-bezier(0.34, 1.56, 0.64, 1)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+              <span style={{ fontSize: '24px' }}>⚠️</span>
+              <h3 style={{ margin: 0, fontSize: '18px', fontWeight: 600, color: 'var(--text-bright)' }}>
+                {confirmPromise.title || (language === 'es' ? '¿Estás seguro?' : 'Are you sure?')}
+              </h3>
+            </div>
+            <p style={{ margin: 0, fontSize: '14px', color: 'var(--text-muted)', lineHeight: 1.6, textAlign: 'left', whiteSpace: 'pre-wrap' }}>
+              {confirmPromise.message}
+            </p>
+            <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end', marginTop: '4px' }}>
+              <button 
+                className="btn-secondary" 
+                style={{ padding: '8px 16px', borderRadius: '8px', minWidth: '90px' }}
+                onClick={() => {
+                  confirmPromise.resolve(false);
+                  setConfirmPromise(null);
+                }}
+              >
+                {language === 'es' ? 'Cancelar' : 'Cancel'}
+              </button>
+              <button 
+                className="btn-primary" 
+                style={{ padding: '8px 16px', borderRadius: '8px', minWidth: '90px', backgroundColor: '#ef4444', borderColor: '#ef4444' }}
+                onClick={() => {
+                  confirmPromise.resolve(true);
+                  setConfirmPromise(null);
+                }}
+              >
+                {language === 'es' ? 'Confirmar' : 'Confirm'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
+      <style>{`
+        @keyframes scaleUpConfirm {
+          from { transform: scale(0.95); opacity: 0; }
+          to { transform: scale(1); opacity: 1; }
+        }
+      `}</style>
 
     </div>
 

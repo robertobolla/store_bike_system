@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "Bash(awk -F: '$1>=13880 && $1<=14040')",
+      "Bash(npx tsc *)",
+      "Bash(node scratch/migrate-is-generic.mjs --apply)",
+      "Bash(node scratch/audit-stock.mjs)",
+      "Bash(git stash *)"
     ]
   }
 }

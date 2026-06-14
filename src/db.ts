@@ -12,6 +12,7 @@ export interface SerialPrefix {
   id: string;
   prefix: string;
   description: string;
+  category_id?: string | null;
 }
 
 export interface Category {
@@ -482,7 +483,7 @@ async function findOrCreateProductModel(p: Product): Promise<string | null> {
 
   const brand = p.brand || (p.name ? p.name.split(' ')[0] : 'Unknown');
   const modelName =
-    p.model || (p.name ? p.name.split(' ').slice(1).join(' ') || p.name : 'Model');
+    p.model !== undefined && p.model !== null ? p.model : (p.name ? p.name.split(' ').slice(1).join(' ') || p.name : 'Model');
 
   // Search both with and without color suffix
   const { data: existing, error: fetchErr } = await supabase
@@ -550,10 +551,30 @@ export async function getPrefixes(): Promise<SerialPrefix[]> {
 }
 
 export async function upsertPrefix(p: SerialPrefix): Promise<void> {
-  const { error } = await supabase
-    .from('serial_prefixes')
-    .upsert({ id: p.id, prefix: p.prefix, description: p.description });
-  if (error) throw error;
+  try {
+    const { error } = await supabase
+      .from('serial_prefixes')
+      .upsert({ 
+        id: p.id, 
+        prefix: p.prefix, 
+        description: p.description, 
+        category_id: p.category_id || null 
+      });
+    if (error) throw error;
+  } catch (err: any) {
+    if (err.message && err.message.includes('category_id')) {
+      const { error } = await supabase
+        .from('serial_prefixes')
+        .upsert({ 
+          id: p.id, 
+          prefix: p.prefix, 
+          description: p.description 
+        });
+      if (error) throw error;
+    } else {
+      throw err;
+    }
+  }
 }
 
 export async function deletePrefix(id: string): Promise<void> {
@@ -1471,6 +1492,16 @@ export async function deleteSaleItems(saleId: string): Promise<void> {
   if (error) throw error;
 }
 
+export async function deleteSaleItem(id: string): Promise<void> {
+  const { error } = await supabase.from('sale_items').delete().eq('id', id);
+  if (error) throw error;
+}
+
+export async function updateSaleTotal(id: string, total_amount: number): Promise<void> {
+  const { error } = await supabase.from('sales').update({ total_amount }).eq('id', id);
+  if (error) throw error;
+}
+
 // ================================================================
 // FINANCING PLANS
 // ================================================================
@@ -2118,5 +2149,102 @@ export async function deleteBikeModification(id: string): Promise<void> {
     .eq('id', id);
   if (error) throw error;
 }
+
+// ================================================================
+// TASK BOARD (To-Do Lists)
+// ================================================================
+
+export interface TaskCard {
+  id: string;
+  title: string;
+  created_at: string;
+}
+
+export interface TaskItem {
+  id: string;
+  card_id: string;
+  text: string;
+  completed: boolean;
+  color: string;
+  position: number;
+  created_at?: string;
+}
+
+export interface TaskColorTag {
+  color: string;
+  label: string;
+}
+
+export async function getTaskCards(): Promise<TaskCard[]> {
+  const { data, error } = await supabase
+    .from('task_cards')
+    .select('*')
+    .order('created_at', { ascending: true });
+  if (error) throw error;
+  return (data ?? []) as TaskCard[];
+}
+
+export async function upsertTaskCard(card: Partial<TaskCard>): Promise<void> {
+  const { error } = await supabase
+    .from('task_cards')
+    .upsert(card);
+  if (error) throw error;
+}
+
+export async function deleteTaskCard(id: string): Promise<void> {
+  const { error } = await supabase
+    .from('task_cards')
+    .delete()
+    .eq('id', id);
+  if (error) throw error;
+}
+
+export async function getTaskItems(): Promise<TaskItem[]> {
+  const { data, error } = await supabase
+    .from('task_items')
+    .select('*')
+    .order('position', { ascending: true });
+  if (error) throw error;
+  return (data ?? []) as TaskItem[];
+}
+
+export async function upsertTaskItem(item: Partial<TaskItem>): Promise<void> {
+  const { error } = await supabase
+    .from('task_items')
+    .upsert(item);
+  if (error) throw error;
+}
+
+export async function deleteTaskItem(id: string): Promise<void> {
+  const { error } = await supabase
+    .from('task_items')
+    .delete()
+    .eq('id', id);
+  if (error) throw error;
+}
+
+export async function getColorTags(): Promise<TaskColorTag[]> {
+  const { data, error } = await supabase
+    .from('task_color_tags')
+    .select('*');
+  if (error) throw error;
+  return (data ?? []) as TaskColorTag[];
+}
+
+export async function upsertColorTag(tag: TaskColorTag): Promise<void> {
+  const { error } = await supabase
+    .from('task_color_tags')
+    .upsert(tag);
+  if (error) throw error;
+}
+
+export async function deleteColorTag(color: string): Promise<void> {
+  const { error } = await supabase
+    .from('task_color_tags')
+    .delete()
+    .eq('color', color);
+  if (error) throw error;
+}
+
 
 
