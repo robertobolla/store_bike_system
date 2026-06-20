@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+Â­ÂRimport { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { Session, User } from '@supabase/supabase-js';
 import { supabase } from './supabaseClient';
 import type {
@@ -22,6 +22,8 @@ import {
   getPayments, insertPayment, deletePayment,
   getExpenses, insertExpense,
   uploadRentalPhoto, uploadRiderDocument, uploadContractPhoto, uploadSignatureImage,
+  uploadChecklistSignature, createDeliveryChecklist, getDeliveryChecklist, getDeliveryChecklists, submitDeliveryChecklist,
+  createInternalChecklist, updateDeliveryChecklist,
   getLeadCategories, getLeads, upsertLead, deleteLead, insertLeadCategory,
   getSuppliers, upsertSupplier, deleteSupplier, getSupplierProducts, upsertSupplierProduct, deleteSupplierProduct,
   getPlatforms, getVehicles, getAppAccounts, upsertAppAccount, deleteAppAccount, insertPlatform, insertVehicle, updatePlatform, deletePlatform, updateVehicle, deleteVehicle,
@@ -35,13 +37,14 @@ import {
   getFinancingPayments, insertFinancingPayments, markFinancingPaymentPaid, unmarkFinancingPaymentPaid,
   getEmailTemplates, upsertEmailTemplate,
   getAllowedEmails, addAllowedEmail, deleteAllowedEmail,
-  getBikeModifications, addBikeModification, deleteBikeModification,
+  getBikeModifications, getAllBikeModifications, addBikeModification, deleteBikeModification,
   deleteExpense,
   getTaskCards, upsertTaskCard, deleteTaskCard,
   getTaskItems, upsertTaskItem, deleteTaskItem,
   getColorTags, upsertColorTag, deleteColorTag,
 } from './db';
-import type { AllowedEmail, BikeModification } from './db';
+import type { AllowedEmail, BikeModification, DeliveryChecklist } from './db';
+import { downloadBackupXlsx } from './backup';
 
 
 
@@ -204,9 +207,15 @@ function parseLeadNotes(notesRaw: string | null | undefined): NoteEntry[] {
   } catch (e) {
     // not JSON
   }
-  // 2. Try legacy format: [ISO_DATE] content\n---\n...
-  if (notesRaw.includes('\n---\n') || /^\[20\d{2}-/.test(notesRaw)) {
-    const segments = notesRaw.split('\n---\n').filter(s => s.trim());
+  // 2. Try legacy format: [ISO_DATE] content\
+---\
+...
+  if (notesRaw.includes('\
+---\
+') || /^\[20\d{2}-/.test(notesRaw)) {
+    const segments = notesRaw.split('\
+---\
+').filter(s => s.trim());
     const entries: NoteEntry[] = segments.map(seg => {
       const match = seg.match(/^\[([^\]]+)\]\s*([\s\S]*)$/);
       if (match) {
@@ -272,29 +281,426 @@ async function executeEmailSend(to: string, subject: string, html: string) {
 }
 
 // ----------------------------------------------------
+// DELIVERY CHECKLIST Ã¢ÂÂ content & emails
+// Items mirror public/CHECKLIST2-bikeDelivery.pdf
+// ----------------------------------------------------
+// The delivery checklist document is always in English (matches the PDF model).
+const DELIVERY_CHECKLIST_GROUPS: {
+  key: string;
+  title: string;
+  kind: 'checkbox' | 'declaration';
+  items: { key: string; text: string }[];
+}[] = [
+  {
+    key: 'condition',
+    title: 'Condition & Equipment',
+    kind: 'checkbox',
+    items: [
+      {
+        key: 'working_condition',
+        text: 'I confirm that the e-bike has been inspected and delivered in good working condition, including brakes, tyres, wheels, steering, drivetrain, saddle, lights, electrical system, battery security and safety equipment.',
+      },
+      {
+        key: 'accessories',
+        text: 'I confirm that I have received all accessories provided with the rental, including any keys, lock, charger and other listed equipment, and that their condition is satisfactory.',
+      },
+      {
+        key: 'defects_recorded',
+        text: 'I confirm that any existing scratches, damage or cosmetic defects have been identified, recorded and explained to me. Photographs of the e-bike have been taken and attached to the rental record.',
+      },
+      {
+        key: 'instructions',
+        text: 'I confirm that I have received instructions regarding the safe operation of the e-bike, including braking, gear shifting, electric assistance, battery use, lock operation, estimated range, road safety and applicable traffic regulations.',
+      },
+    ],
+  },
+  {
+    key: 'declaration',
+    title: 'Customer Declaration',
+    kind: 'declaration',
+    items: [
+      {
+        key: 'accept_condition',
+        text: 'I acknowledge that I have inspected the e-bike and accept its condition at the time of delivery.',
+      },
+      {
+        key: 'safety_instructions',
+        text: 'I acknowledge that I have received safety instructions, including recommendations regarding helmet use, visibility and compliance with local traffic regulations.',
+      },
+      {
+        key: 'responsible_use',
+        text: 'I accept responsibility for operating the e-bike in a safe and lawful manner during the rental period.',
+      },
+      {
+        key: 'return_condition',
+        text: 'I agree to return the e-bike and all accessories in the same condition as received, excluding normal wear and tear. I understand that I may be charged for loss, theft, damage or missing accessories in accordance with the Rental Agreement.',
+      },
+    ],
+  },
+];
+
+// Only the 'checkbox' groups are individually ticked by the customer; the
+// 'declaration' groups are statements accepted via the signature.
+const DELIVERY_CHECKLIST_CHECKBOX_KEYS = DELIVERY_CHECKLIST_GROUPS
+  .filter(g => g.kind === 'checkbox')
+  .flatMap(g => g.items.map(i => i.key));
+
+// ----------------------------------------------------
+// INTERNAL TECHNICAL INSPECTION CHECKLIST (operator-filled)
+// Mirrors public/Checklist-Technical-inspection.pdf. Items with `input`
+// also show a free-text field stored under notes[input].
+// ----------------------------------------------------
+type InternalChecklistItem = { key: string; text: string; input?: string };
+const INTERNAL_CHECKLIST_GROUPS: { key: string; title: string; items: InternalChecklistItem[] }[] = [
+  { key: 'brakes', title: 'Brakes', items: [
+    { key: 'brake_front', text: 'Front brake operates correctly' },
+    { key: 'brake_rear', text: 'Rear brake operates correctly' },
+    { key: 'brake_noise', text: 'No unusual noises detected' },
+    { key: 'brake_levers', text: 'Brake levers feel firm and responsive' },
+  ]},
+  { key: 'wheels', title: 'Wheels & Tyres', items: [
+    { key: 'tyre_pressure', text: 'Correct tyre pressure on both wheels' },
+    { key: 'tyre_wear', text: 'Tyres show no significant cuts or excessive wear' },
+    { key: 'wheels_secured', text: 'Wheels are properly secured' },
+    { key: 'spokes', text: 'No broken spokes' },
+  ]},
+  { key: 'lights', title: 'Lights & Safety', items: [
+    { key: 'light_front', text: 'Front light operates correctly' },
+    { key: 'light_rear', text: 'Rear light operates correctly' },
+    { key: 'horn', text: 'Horn/Bell operates correctly' },
+    { key: 'reflectors', text: 'Reflectors are present and in good condition' },
+    { key: 'advise_helmet', text: 'Customer has been advised to wear a helmet while riding' },
+    { key: 'advise_reflective', text: 'Customer has been advised to wear reflective clothing' },
+    { key: 'advise_lights', text: 'Customer has been advised to use lights when riding in low-light conditions' },
+  ]},
+  { key: 'drivetrain', title: 'Chain & Drivetrain', items: [
+    { key: 'chain_lube', text: 'Chain is properly lubricated' },
+    { key: 'gears', text: 'Gears shift correctly' },
+    { key: 'pedals', text: 'Pedals are securely attached' },
+    { key: 'pedal_noise', text: 'No unusual noises while pedalling' },
+  ]},
+  { key: 'steering', title: 'Steering & Handlebar', items: [
+    { key: 'handlebar_fastened', text: 'Handlebar is securely fastened' },
+    { key: 'steering_smooth', text: 'Steering turns smoothly' },
+    { key: 'grips', text: 'Grips are in good condition' },
+  ]},
+  { key: 'saddle', title: 'Saddle', items: [
+    { key: 'saddle_height', text: 'Saddle height adjusted for the customer' },
+    { key: 'saddle_fastened', text: 'Saddle is securely fastened' },
+    { key: 'seatpost', text: 'Seat post is properly tightened' },
+  ]},
+  { key: 'electrical', title: 'Electrical System', items: [
+    { key: 'battery_locked', text: 'Battery is securely installed and locked' },
+    { key: 'display', text: 'Display functions correctly' },
+    { key: 'assist', text: 'Electric assistance functions correctly' },
+    { key: 'no_errors', text: 'No visible error codes displayed' },
+  ]},
+  { key: 'accessories', title: 'Accessories Provided', items: [
+    { key: 'acc_lock', text: 'Lock' },
+    { key: 'acc_lock_keys', text: 'Lock keys' },
+    { key: 'acc_battery_keys', text: 'Battery keys' },
+    { key: 'acc_phone_holder', text: 'Phone holder' },
+    { key: 'acc_charger', text: 'Battery charger' },
+    { key: 'acc_pump', text: 'Tyre pump' },
+    { key: 'acc_multitool', text: 'Multi-tool' },
+    { key: 'acc_usb', text: 'USB charging port' },
+    { key: 'acc_other', text: 'Other:', input: 'other_accessory' },
+  ]},
+  { key: 'visual', title: 'Visual Condition', items: [
+    { key: 'frame_inspected', text: 'Frame inspected' },
+    { key: 'fork_inspected', text: 'Fork inspected' },
+    { key: 'battery_casing', text: 'Battery casing inspected' },
+    { key: 'photos_taken', text: 'Photos taken before delivery and attached to rental record' },
+    { key: 'damage_recorded', text: 'Existing scratches or damage recorded:', input: 'existing_damage' },
+  ]},
+  { key: 'briefing', title: 'Customer Briefing', items: [
+    { key: 'brief_brakes', text: 'Brake operation explained' },
+    { key: 'brief_gears', text: 'Gear shifting explained' },
+    { key: 'brief_lock', text: 'Lock usage explained' },
+    { key: 'brief_assist', text: 'Electric assistance explained' },
+    { key: 'brief_range', text: 'Approximate battery range explained' },
+    { key: 'brief_safety', text: 'Basic road safety and traffic rules explained' },
+  ]},
+  { key: 'final', title: 'Final Confirmation', items: [
+    { key: 'certify', text: 'I certify that the above inspection has been completed and that the e-bike was inspected prior to delivery. All applicable items were checked and found to be in satisfactory working condition at the time of handover.' },
+  ]},
+];
+const INTERNAL_CHECKLIST_ITEM_KEYS = INTERNAL_CHECKLIST_GROUPS.flatMap(g => g.items.map(i => i.key));
+
+interface InternalChecklistValue {
+  battery_level: string;
+  items: Record<string, boolean>;
+  notes: Record<string, string>;
+  signatureUrl?: string | null;      // already-saved inspector signature (for display)
+  signatureDataUrl?: string | null;  // freshly drawn signature to upload on save
+}
+const emptyInternalChecklist = (): InternalChecklistValue => ({
+  battery_level: '', items: {},
+  notes: { inspected_date: new Date().toISOString().split('T')[0] },
+  signatureUrl: null, signatureDataUrl: null,
+});
+
+// Reusable editor used both in the rental wizard (step 7) and the customer profile.
+// The checklist is an internal English document, so all its labels are in English.
+function InternalChecklistEditor({ value, onChange }: {
+  value: InternalChecklistValue;
+  onChange: (v: InternalChecklistValue) => void;
+}) {
+  const allChecked = INTERNAL_CHECKLIST_ITEM_KEYS.every(k => value.items[k]);
+  const toggleAll = () => {
+    const next = !allChecked;
+    const items: Record<string, boolean> = {};
+    INTERNAL_CHECKLIST_ITEM_KEYS.forEach(k => { items[k] = next; });
+    onChange({ ...value, items });
+  };
+  const toggleItem = (k: string) => onChange({ ...value, items: { ...value.items, [k]: !value.items[k] } });
+  const setNote = (field: string, val: string) => onChange({ ...value, notes: { ...value.notes, [field]: val } });
+  const checkedCount = INTERNAL_CHECKLIST_ITEM_KEYS.filter(k => value.items[k]).length;
+
+  // Inspector signature (finger / mouse). The drawn image is kept on the canvas
+  // and pushed to the value as a data URL; the save handler uploads it.
+  const sigCanvasRef = useRef<HTMLCanvasElement>(null);
+  const [sigDrawing, setSigDrawing] = useState(false);
+  const [reSign, setReSign] = useState(false);
+  const sigPoint = (canvas: HTMLCanvasElement, e: React.TouchEvent | React.MouseEvent) => {
+    const rect = canvas.getBoundingClientRect();
+    const sx = canvas.width / rect.width, sy = canvas.height / rect.height;
+    if ('touches' in e) return { x: (e.touches[0].clientX - rect.left) * sx, y: (e.touches[0].clientY - rect.top) * sy };
+    return { x: ((e as React.MouseEvent).clientX - rect.left) * sx, y: ((e as React.MouseEvent).clientY - rect.top) * sy };
+  };
+  const sigStart = (e: React.TouchEvent<HTMLCanvasElement> | React.MouseEvent<HTMLCanvasElement>) => {
+    const c = sigCanvasRef.current; if (!c) return;
+    const ctx = c.getContext('2d'); if (!ctx) return;
+    setSigDrawing(true);
+    const { x, y } = sigPoint(c, e); ctx.beginPath(); ctx.moveTo(x, y);
+  };
+  const sigMove = (e: React.TouchEvent<HTMLCanvasElement> | React.MouseEvent<HTMLCanvasElement>) => {
+    if (!sigDrawing) return;
+    const c = sigCanvasRef.current; if (!c) return;
+    const ctx = c.getContext('2d'); if (!ctx) return;
+    const { x, y } = sigPoint(c, e);
+    ctx.lineWidth = 2.5; ctx.lineCap = 'round'; ctx.strokeStyle = '#10b981'; ctx.lineTo(x, y); ctx.stroke();
+  };
+  const sigEnd = () => {
+    setSigDrawing(false);
+    const c = sigCanvasRef.current; if (!c) return;
+    onChange({ ...value, signatureDataUrl: c.toDataURL('image/png') });
+  };
+  const sigClear = () => {
+    const c = sigCanvasRef.current; if (!c) return;
+    const ctx = c.getContext('2d'); if (ctx) ctx.clearRect(0, 0, c.width, c.height);
+    onChange({ ...value, signatureDataUrl: null });
+  };
+
+  return (
+    <div className="checklist-scope">
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', marginBottom: '12px', flexWrap: 'wrap' }}>
+        <div className="checklist-field" style={{ margin: 0, flex: 1, minWidth: '160px' }}>
+          <label>Ã°ÂÂÂ Battery Charge Level</label>
+          <input type="text" inputMode="numeric" placeholder="e.g. 100%" value={value.battery_level} onChange={(e) => onChange({ ...value, battery_level: e.target.value })} />
+        </div>
+        <button type="button" className="btn-secondary" style={{ whiteSpace: 'nowrap', alignSelf: 'flex-end' }} onClick={toggleAll}>
+          {allChecked ? 'Ã¢ÂÂ Uncheck all' : 'Ã¢ÂÂ Check all'}
+        </button>
+      </div>
+      <p style={{ fontSize: '12px', color: 'var(--text-muted)', margin: '0 0 10px' }}>
+        {checkedCount}/{INTERNAL_CHECKLIST_ITEM_KEYS.length} checked
+      </p>
+
+      {INTERNAL_CHECKLIST_GROUPS.map(group => (
+        <div key={group.key} className="checklist-group">
+          <p className="checklist-group-title">{group.title}</p>
+          {group.items.map(item => (
+            <div key={item.key}>
+              <label className={`checklist-item ${value.items[item.key] ? 'checked' : ''}`}>
+                <input type="checkbox" checked={!!value.items[item.key]} onChange={() => toggleItem(item.key)} />
+                <span>{item.text}</span>
+              </label>
+              {item.input && (
+                <input
+                  type="text"
+                  value={value.notes[item.input] ?? ''}
+                  onChange={(e) => setNote(item.input!, e.target.value)}
+                  placeholder="Detail..."
+                  style={{ width: '100%', padding: '8px 10px', margin: '2px 0 8px', border: '1px solid var(--border-color)', borderRadius: '8px', background: 'rgba(0,0,0,0.2)', color: 'inherit', fontSize: '13px' }}
+                />
+              )}
+            </div>
+          ))}
+          {group.key === 'final' && (
+            <>
+              <div className="checklist-field" style={{ marginTop: '8px' }}>
+                <label>Inspected By</label>
+                <input type="text" value={value.notes.inspected_by ?? ''} onChange={(e) => setNote('inspected_by', e.target.value)} placeholder="Name" />
+              </div>
+              <div className="checklist-field">
+                <label>Ã¢ÂÂÃ¯Â¸Â Signature</label>
+                {value.signatureUrl && !reSign ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', alignItems: 'flex-start' }}>
+                    <img src={value.signatureUrl} alt="signature" style={{ maxWidth: '280px', width: '100%', border: '1px solid var(--border-color)', borderRadius: '8px', background: '#fff' }} />
+                    <button type="button" className="btn-secondary btn-xs" onClick={() => setReSign(true)}>Ã¢ÂÂÃ¯Â¸Â Re-sign</button>
+                  </div>
+                ) : (
+                  <>
+                    <canvas
+                      ref={sigCanvasRef}
+                      width={480}
+                      height={150}
+                      style={{ width: '100%', height: '150px', border: '2px dashed var(--border-color)', borderRadius: '10px', background: 'rgba(0,0,0,0.2)', cursor: 'crosshair', touchAction: 'none' }}
+                      onMouseDown={sigStart}
+                      onMouseMove={sigMove}
+                      onMouseUp={sigEnd}
+                      onMouseLeave={() => sigDrawing && sigEnd()}
+                      onTouchStart={sigStart}
+                      onTouchMove={sigMove}
+                      onTouchEnd={sigEnd}
+                    />
+                    <button type="button" className="btn-secondary btn-xs" style={{ marginTop: '6px' }} onClick={sigClear}>Ã°ÂÂÂÃ¯Â¸Â Clear signature</button>
+                  </>
+                )}
+              </div>
+              <div className="checklist-field">
+                <label>Date</label>
+                <input
+                  type="text"
+                  readOnly
+                  value={value.notes.inspected_date || new Date().toISOString().split('T')[0]}
+                  style={{ opacity: 0.7, cursor: 'default' }}
+                />
+              </div>
+            </>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Localized framing strings for the checklist emails. The checklist DOCUMENT
+// itself (titles, field labels, acknowledgement items, signature) is always in
+// English; only the surrounding email copy follows the configured language.
+const CHECKLIST_EMAIL_T = {
+  es: {
+    inviteSubject: 'Checklist de entrega de tu e-bike - The Fast Sheep',
+    greeting: (n: string) => `Hola ${n},`,
+    intro: (m: string, s: string) => `Antes de retirar tu e-bike <strong>${m}</strong> (${s}), por favor revisÃÂ¡ y confirmÃÂ¡ el checklist de entrega.`,
+    button: 'Abrir checklist y firmar',
+    fallback: 'Si el botÃÂ³n no funciona, copiÃÂ¡ y pegÃÂ¡ este enlace en tu navegador:',
+    copySubject: 'Copia de tu checklist de entrega aceptado - The Fast Sheep',
+    copyIntro: (n: string) => `Hola ${n}, a continuaciÃÂ³n encontrarÃÂ¡s una copia del checklist de entrega que aceptaste y firmaste.`,
+  },
+  en: {
+    inviteSubject: 'E-Bike Delivery Checklist - The Fast Sheep',
+    greeting: (n: string) => `Hi ${n},`,
+    intro: (m: string, s: string) => `Before taking your e-bike <strong>${m}</strong> (${s}), please review and confirm the delivery checklist.`,
+    button: 'Open checklist &amp; sign',
+    fallback: 'If the button does not work, copy and paste this link into your browser:',
+    copySubject: 'Copy of your accepted delivery checklist - The Fast Sheep',
+    copyIntro: (n: string) => `Hi ${n}, below is a copy of the delivery checklist you accepted and signed.`,
+  },
+  pt: {
+    inviteSubject: 'Checklist de entrega da tua e-bike - The Fast Sheep',
+    greeting: (n: string) => `OlÃÂ¡ ${n},`,
+    intro: (m: string, s: string) => `Antes de levantar a tua e-bike <strong>${m}</strong> (${s}), por favor revÃÂª e confirma o checklist de entrega.`,
+    button: 'Abrir checklist e assinar',
+    fallback: 'Se o botÃÂ£o nÃÂ£o funcionar, copia e cola este link no teu navegador:',
+    copySubject: 'CÃÂ³pia do teu checklist de entrega aceite - The Fast Sheep',
+    copyIntro: (n: string) => `OlÃÂ¡ ${n}, em baixo encontras uma cÃÂ³pia do checklist de entrega que aceitaste e assinaste.`,
+  },
+} as const;
+
+// Email 1: invitation with link to the public checklist page (localized cover note)
+function sendDeliveryChecklistInviteEmail(checklist: DeliveryChecklist, url: string, lang: 'es' | 'en' | 'pt') {
+  const t = CHECKLIST_EMAIL_T[lang] ?? CHECKLIST_EMAIL_T.en;
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 560px; margin: 0 auto; color: #1f2937;">
+      <div style="text-align:center; padding: 16px 0;">
+        <div style="font-size: 28px;">Ã°ÂÂÂ</div>
+        <h2 style="margin: 4px 0;">The Fast Sheep</h2>
+      </div>
+      <p>${t.greeting(checklist.customer_name)}</p>
+      <p>${t.intro(checklist.bike_model, checklist.bike_serial)}</p>
+      <div style="text-align:center; margin: 28px 0;">
+        <a href="${url}" style="background:#10b981; color:#fff; text-decoration:none; padding: 14px 28px; border-radius: 10px; font-weight: 600; display:inline-block;">
+          ${t.button}
+        </a>
+      </div>
+      <p style="font-size: 12px; color:#6b7280;">${t.fallback}<br>
+        <a href="${url}" style="color:#10b981;">${url}</a></p>
+      <hr style="border:none; border-top:1px solid #e5e7eb; margin: 20px 0;">
+      <p style="font-size: 11px; color:#9ca3af; text-align:center;">THE FAST SHEEP LIMITED Ã¢ÂÂ 802654<br>www.thefastsheep.com ÃÂ· +353 83 042 9732</p>
+    </div>`;
+  executeEmailSend(checklist.customer_email, t.inviteSubject, html);
+}
+
+// Email 2: accepted copy of the document. Subject + intro follow the configured
+// language; the reproduced document below stays in English (matches the PDF).
+function sendDeliveryChecklistCopyEmail(
+  checklist: DeliveryChecklist,
+  payload: { items: Record<string, boolean>; battery_level: string; signature_url: string },
+  lang: 'es' | 'en' | 'pt'
+) {
+  const t = CHECKLIST_EMAIL_T[lang] ?? CHECKLIST_EMAIL_T.en;
+  const subject = t.copySubject;
+
+  const groupsHtml = DELIVERY_CHECKLIST_GROUPS.map(g => `
+    <h3 style="font-size:14px; margin: 18px 0 6px;">${g.title}</h3>
+    ${g.items.map(it => g.kind === 'checkbox'
+      ? `<p style="margin: 4px 0; font-size: 12px; line-height: 1.5;"><span style="color:#10b981; font-weight:700;">Ã¢ÂÂ</span> ${it.text}</p>`
+      : `<p style="margin: 4px 0; font-size: 12px; line-height: 1.5;">${it.text}</p>`).join('')}
+  `).join('');
+
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #1f2937;">
+      <div style="text-align:center; padding: 16px 0;">
+        <div style="font-size: 28px;">Ã°ÂÂÂ</div>
+        <h2 style="margin: 4px 0;">The Fast Sheep</h2>
+        <p style="margin:0; font-size: 13px; color:#6b7280;">E-Bike Delivery Checklist</p>
+        <p style="margin:0; font-size: 12px; color:#9ca3af;">Customer Acknowledgement &amp; Liability Waiver</p>
+      </div>
+      <p style="font-size: 13px;">${t.copyIntro(checklist.customer_name)}</p>
+      <table style="width:100%; font-size: 13px; border-collapse: collapse; margin-bottom: 8px;">
+        <tr><td style="padding:4px 0; color:#6b7280;">E-Bike Model</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.bike_model}</td></tr>
+        <tr><td style="padding:4px 0; color:#6b7280;">E-Bike Serial Number</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.bike_serial}</td></tr>
+        <tr><td style="padding:4px 0; color:#6b7280;">Date</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.delivery_date}</td></tr>
+        <tr><td style="padding:4px 0; color:#6b7280;">Battery Charge Level</td><td style="padding:4px 0; text-align:right; font-weight:600;">${payload.battery_level || 'Ã¢ÂÂ'}</td></tr>
+        <tr><td style="padding:4px 0; color:#6b7280;">Customer Name</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.customer_name}</td></tr>
+      </table>
+      ${groupsHtml}
+      <p style="font-size: 12px; line-height: 1.5; margin: 14px 0;">By signing below, the customer confirms acceptance of all the aforementioned conditions and declarations.</p>
+      <h3 style="font-size:14px; margin: 18px 0 6px;">Customer Signature</h3>
+      <img src="${payload.signature_url}" alt="signature" style="max-width: 320px; border:1px solid #e5e7eb; border-radius: 8px; background:#fff;" />
+      <p style="font-size: 12px; color:#6b7280; margin-top: 8px;">Accepted on ${checklist.delivery_date} by ${checklist.customer_name}.</p>
+      <hr style="border:none; border-top:1px solid #e5e7eb; margin: 20px 0;">
+      <p style="font-size: 11px; color:#9ca3af; text-align:center;">THE FAST SHEEP LIMITED Ã¢ÂÂ 802654<br>Explore the world and enjoy cycling<br>www.thefastsheep.com ÃÂ· +353 83 042 9732 ÃÂ· T23 AT2P</p>
+    </div>`;
+  executeEmailSend(checklist.customer_email, subject, html);
+}
+
+// ----------------------------------------------------
 // EMAIL TEMPLATES & MOCK DELIVERY SYSTEM (Resend ready)
 // ----------------------------------------------------
 function sendSaleConfirmationEmail(sale: any, items: any[], customer: any, lang: 'es' | 'en' | 'pt', emailTemplates?: EmailTemplate[]) {
   const customTemplate = emailTemplates?.find(t => t.template_key === 'sale_contado' && t.language === lang);
 
-  let subject = customTemplate?.subject || `Confirmación de compra - The Fast Sheep`;
+  let subject = customTemplate?.subject || `ConfirmaciÃÂ³n de compra - The Fast Sheep`;
   let html = '';
 
   if (customTemplate) {
     let body = customTemplate.body_text;
     body = body.replace(/\{\{CLIENT_NAME\}\}/g, `${customer.first_name} ${customer.last_name}`.trim());
-    body = body.replace(/\{\{TOTAL_SALE\}\}/g, `€${sale.total_amount}`);
+    body = body.replace(/\{\{TOTAL_SALE\}\}/g, `Ã¢ÂÂ¬${sale.total_amount}`);
     
     const prodListHtml = `
       <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
         <tr style="border-bottom: 1px solid rgba(255,255,255,0.1); text-align: left;">
-          <th style="padding: 8px 0; color: #a78bfa; font-size: 13px;">Artículo</th>
+          <th style="padding: 8px 0; color: #a78bfa; font-size: 13px;">ArtÃÂ­culo</th>
           <th style="padding: 8px 0; text-align: right; color: #a78bfa; font-size: 13px;">Precio</th>
         </tr>
         ${items.map(item => `
           <tr>
             <td style="padding: 8px 0; font-size: 12px; color: #e2e8f0;">${item.name} (${item.serial_number})</td>
-            <td style="padding: 8px 0; text-align: right; font-size: 12px; color: #e2e8f0; font-weight: bold;">€${item.price_sold || item.price_paid}</td>
+            <td style="padding: 8px 0; text-align: right; font-size: 12px; color: #e2e8f0; font-weight: bold;">Ã¢ÂÂ¬${item.price_sold || item.price_paid}</td>
           </tr>
         `).join('')}
       </table>
@@ -304,10 +710,10 @@ function sendSaleConfirmationEmail(sale: any, items: any[], customer: any, lang:
   } else {
     const t = {
       es: {
-        subject: `Confirmación de compra - The Fast Sheep`,
+        subject: `ConfirmaciÃÂ³n de compra - The Fast Sheep`,
         hello: `Hola ${customer.first_name},`,
-        thankYou: `Gracias por tu compra de contado. Aquí tienes el detalle de tu compra:`,
-        item: `Artículo`,
+        thankYou: `Gracias por tu compra de contado. AquÃÂ­ tienes el detalle de tu compra:`,
+        item: `ArtÃÂ­culo`,
         price: `Precio`,
         total: `Total Pagado`,
         date: `Fecha de Venta`,
@@ -324,20 +730,20 @@ function sendSaleConfirmationEmail(sale: any, items: any[], customer: any, lang:
         footer: `If you have any questions, feel free to contact us.`
       },
       pt: {
-        subject: `Confirmação de compra - The Fast Sheep`,
-        hello: `Olá ${customer.first_name},`,
-        thankYou: `Obrigado pela sua compra à vista. Aqui estão os detalhes da sua transação:`,
+        subject: `ConfirmaÃÂ§ÃÂ£o de compra - The Fast Sheep`,
+        hello: `OlÃÂ¡ ${customer.first_name},`,
+        thankYou: `Obrigado pela sua compra ÃÂ  vista. Aqui estÃÂ£o os detalhes da sua transaÃÂ§ÃÂ£o:`,
         item: `Artigo`,
-        price: `Preço`,
+        price: `PreÃÂ§o`,
         total: `Total Pago`,
         date: `Data da Venda`,
-        footer: `Se você tiver alguma dúvida, não hesite em contactar-nos.`
+        footer: `Se vocÃÂª tiver alguma dÃÂºvida, nÃÂ£o hesite em contactar-nos.`
       }
     }[lang] || {
-      subject: `Confirmación de compra - The Fast Sheep`,
+      subject: `ConfirmaciÃÂ³n de compra - The Fast Sheep`,
       hello: `Hola ${customer.first_name},`,
-      thankYou: `Gracias por tu compra de contado. Aquí tienes el detalle de tu compra:`,
-      item: `Artículo`,
+      thankYou: `Gracias por tu compra de contado. AquÃÂ­ tienes el detalle de tu compra:`,
+      item: `ArtÃÂ­culo`,
       price: `Precio`,
       total: `Total Pagado`,
       date: `Fecha de Venta`,
@@ -351,10 +757,10 @@ function sendSaleConfirmationEmail(sale: any, items: any[], customer: any, lang:
         <p>${t.thankYou}</p>
         <hr />
         <ul>
-          ${items.map(item => `<li><strong>${item.serial_number}</strong> - ${item.name}: €${item.price_sold || item.price_paid}</li>`).join('')}
+          ${items.map(item => `<li><strong>${item.serial_number}</strong> - ${item.name}: Ã¢ÂÂ¬${item.price_sold || item.price_paid}</li>`).join('')}
         </ul>
         <p><strong>${t.date}:</strong> ${sale.sale_date}</p>
-        <p><strong>${t.total}:</strong> €${sale.total_amount}</p>
+        <p><strong>${t.total}:</strong> Ã¢ÂÂ¬${sale.total_amount}</p>
         <hr />
         <p style="font-size: 12px; color: #777;">${t.footer}</p>
       </div>
@@ -374,20 +780,20 @@ function sendFinancingPlanEmail(sale: any, plan: any, payments: any[], items: an
   if (customTemplate) {
     let body = customTemplate.body_text;
     body = body.replace(/\{\{CLIENT_NAME\}\}/g, `${customer.first_name} ${customer.last_name}`.trim());
-    body = body.replace(/\{\{TOTAL_SALE\}\}/g, `€${sale.total_amount}`);
-    body = body.replace(/\{\{DOWN_PAYMENT\}\}/g, `€${sale.down_payment}`);
-    body = body.replace(/\{\{FINANCED_AMOUNT\}\}/g, `€${plan.total_financed}`);
+    body = body.replace(/\{\{TOTAL_SALE\}\}/g, `Ã¢ÂÂ¬${sale.total_amount}`);
+    body = body.replace(/\{\{DOWN_PAYMENT\}\}/g, `Ã¢ÂÂ¬${sale.down_payment}`);
+    body = body.replace(/\{\{FINANCED_AMOUNT\}\}/g, `Ã¢ÂÂ¬${plan.total_financed}`);
     body = body.replace(/\{\{INSTALLMENTS_COUNT\}\}/g, `${plan.num_installments}`);
-    body = body.replace(/\{\{INSTALLMENT_AMOUNT\}\}/g, `€${plan.installment_amount}`);
+    body = body.replace(/\{\{INSTALLMENT_AMOUNT\}\}/g, `Ã¢ÂÂ¬${plan.installment_amount}`);
     body = body.replace(/\{\{PAYMENT_FREQUENCY\}\}/g, plan.payment_frequency === 'semanal' ? (lang === 'es' ? 'semanal' : lang === 'en' ? 'weekly' : 'semanal') : (lang === 'es' ? 'mensual' : lang === 'en' ? 'monthly' : 'mensal'));
-    body = body.replace(/\{\{FIRST_DUE_DATE\}\}/g, plan.start_date ? plan.start_date.split('-').reverse().join('/') : '—');
+    body = body.replace(/\{\{FIRST_DUE_DATE\}\}/g, plan.start_date ? plan.start_date.split('-').reverse().join('/') : 'Ã¢ÂÂ');
     html = body;
   } else {
     const t = {
       es: {
         subject: `Detalle de tu Plan de Financiamiento - The Fast Sheep`,
         hello: `Hola ${customer.first_name},`,
-        intro: `Se ha registrado un plan de financiamiento para tu compra. A continuación tienes el detalle de tu plan y calendario de pagos:`,
+        intro: `Se ha registrado un plan de financiamiento para tu compra. A continuaciÃÂ³n tienes el detalle de tu plan y calendario de pagos:`,
         totalSale: `Total Venta`,
         downPayment: `Entrada Pagada`,
         totalFinanced: `Monto Financiado`,
@@ -397,7 +803,7 @@ function sendFinancingPlanEmail(sale: any, plan: any, payments: any[], items: an
         dueDate: `Vencimiento`,
         amount: `Monto`,
         status: `Estado`,
-        footer: `Recibirás un recordatorio antes de cada fecha de vencimiento. ¡Gracias por confiar en nosotros!`
+        footer: `RecibirÃÂ¡s un recordatorio antes de cada fecha de vencimiento. ÃÂ¡Gracias por confiar en nosotros!`
       },
       en: {
         subject: `Your Financing Plan Details - The Fast Sheep`,
@@ -416,23 +822,23 @@ function sendFinancingPlanEmail(sale: any, plan: any, payments: any[], items: an
       },
       pt: {
         subject: `Detalhes do seu Plano de Financiamento - The Fast Sheep`,
-        hello: `Olá ${customer.first_name},`,
-        intro: `Um plano de financiamento foi registrado para a sua compra. Abaixo estão os detalhes do seu plano e o calendário de pagamentos:`,
+        hello: `OlÃÂ¡ ${customer.first_name},`,
+        intro: `Um plano de financiamento foi registrado para a sua compra. Abaixo estÃÂ£o os detalhes do seu plano e o calendÃÂ¡rio de pagamentos:`,
         totalSale: `Total da Venda`,
         downPayment: `Entrada Paga`,
         totalFinanced: `Valor Financiado`,
         installments: `Parcelas`,
-        paymentSchedule: `Calendário de Pagamentos`,
+        paymentSchedule: `CalendÃÂ¡rio de Pagamentos`,
         installment: `Parcela`,
         dueDate: `Vencimento`,
         amount: `Valor`,
         status: `Estado`,
-        footer: `Você receberá um lembrete antes de cada data de vencimento. Obrigado por confiar em nós!`
+        footer: `VocÃÂª receberÃÂ¡ um lembrete antes de cada data de vencimento. Obrigado por confiar em nÃÂ³s!`
       }
     }[lang] || {
       subject: `Detalle de tu Plan de Financiamiento - The Fast Sheep`,
       hello: `Hola ${customer.first_name},`,
-      intro: `Se ha registrado un plan de financiamiento para tu compra. A continuación tienes el detalle de tu plan y calendario de pagos:`,
+      intro: `Se ha registrado un plan de financiamiento para tu compra. A continuaciÃÂ³n tienes el detalle de tu plan y calendario de pagos:`,
       totalSale: `Total Venta`,
       downPayment: `Entrada Pagada`,
       totalFinanced: `Monto Financiado`,
@@ -442,7 +848,7 @@ function sendFinancingPlanEmail(sale: any, plan: any, payments: any[], items: an
       dueDate: `Vencimiento`,
       amount: `Monto`,
       status: `Estado`,
-      footer: `Recibirás un recordatorio antes de cada fecha de vencimiento. ¡Gracias por confiar en nosotros!`
+      footer: `RecibirÃÂ¡s un recordatorio antes de cada fecha de vencimiento. ÃÂ¡Gracias por confiar en nosotros!`
     };
 
     html = `
@@ -451,14 +857,14 @@ function sendFinancingPlanEmail(sale: any, plan: any, payments: any[], items: an
         <p>${t.hello}</p>
         <p>${t.intro}</p>
         <hr />
-        <h3>Artículos:</h3>
+        <h3>ArtÃÂ­culos:</h3>
         <ul>
           ${items.map(item => `<li><strong>${item.serial_number}</strong> - ${item.name}</li>`).join('')}
         </ul>
-        <p><strong>${t.totalSale}:</strong> €${sale.total_amount}</p>
-        <p><strong>${t.downPayment}:</strong> €${sale.down_payment}</p>
-        <p><strong>${t.totalFinanced}:</strong> €${plan.total_financed}</p>
-        <p><strong>${t.installments}:</strong> ${plan.num_installments} x €${plan.installment_amount} (${plan.payment_frequency === 'semanal' ? 'Semanal' : 'Mensual'})</p>
+        <p><strong>${t.totalSale}:</strong> Ã¢ÂÂ¬${sale.total_amount}</p>
+        <p><strong>${t.downPayment}:</strong> Ã¢ÂÂ¬${sale.down_payment}</p>
+        <p><strong>${t.totalFinanced}:</strong> Ã¢ÂÂ¬${plan.total_financed}</p>
+        <p><strong>${t.installments}:</strong> ${plan.num_installments} x Ã¢ÂÂ¬${plan.installment_amount} (${plan.payment_frequency === 'semanal' ? 'Semanal' : 'Mensual'})</p>
         
         <h3>${t.paymentSchedule}:</h3>
         <table border="1" cellpadding="8" style="border-collapse: collapse; width: 100%;">
@@ -475,7 +881,7 @@ function sendFinancingPlanEmail(sale: any, plan: any, payments: any[], items: an
               <tr>
                 <td>${p.installment_number}</td>
                 <td>${p.due_date}</td>
-                <td>€${p.amount}</td>
+                <td>Ã¢ÂÂ¬${p.amount}</td>
                 <td>${p.status}</td>
               </tr>
             `).join('')}
@@ -497,16 +903,16 @@ function sendRentalConfirmationEmail(rental: any, vehicle: any, customer: any, l
   const brandModel = vehicle ? [vehicle.brand, vehicle.model].filter(Boolean).join(' ') : '';
   const vehicleStr = vehicle 
     ? (brandModel ? `${brandModel} - N/S: ${vehicle.serial_number || 'S/N'}` : `${vehicle.name} - N/S: ${vehicle.serial_number || 'S/N'}`)
-    : 'Bicicleta Eléctrica';
+    : 'Bicicleta ElÃÂ©ctrica';
 
-  let subject = customTemplate?.subject || `Confirmación de Alquiler - The Fast Sheep`;
+  let subject = customTemplate?.subject || `ConfirmaciÃÂ³n de Alquiler - The Fast Sheep`;
   let html = '';
 
   if (customTemplate) {
     let body = customTemplate.body_text;
     body = body.replace(/\{\{CLIENT_NAME\}\}/g, `${customer.first_name} ${customer.last_name}`.trim());
     body = body.replace(/\{\{VEHICLE_NAME\}\}/g, vehicleStr);
-    body = body.replace(/\{\{START_DATE\}\}/g, rental.start_date ? rental.start_date.split('-').reverse().join('/') : '—');
+    body = body.replace(/\{\{START_DATE\}\}/g, rental.start_date ? rental.start_date.split('-').reverse().join('/') : 'Ã¢ÂÂ');
     
     // Adapt labels and rate dynamically
     const rateType = rental.rate_type || 'mensual';
@@ -514,23 +920,23 @@ function sendRentalConfirmationEmail(rental: any, vehicle: any, customer: any, l
       body = body.replace(/Alquiler Mensual:/gi, lang === 'es' ? 'Alquiler Semanal:' : lang === 'en' ? 'Weekly Rent:' : 'Aluguer Semanal:');
       body = body.replace(/Monthly Rent:/gi, 'Weekly Rent:');
       body = body.replace(/Aluguer Mensal:/gi, 'Aluguer Semanal:');
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${rental.rental_rate || Math.round(rental.monthly_rate / 4)}`);
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `Ã¢ÂÂ¬${rental.rental_rate || Math.round(rental.monthly_rate / 4)}`);
       
-      body = body.replace(/mensualidades/gi, lang === 'es' ? 'cuotas semanales' : lang === 'en' ? 'weekly payments' : 'prestações semanais');
-      body = body.replace(/cobrarán el mismo día de cada mes/gi, lang === 'es' ? 'cobrarán cada semana' : lang === 'en' ? 'charged every week' : 'cobrarão a cada semana');
+      body = body.replace(/mensualidades/gi, lang === 'es' ? 'cuotas semanales' : lang === 'en' ? 'weekly payments' : 'prestaÃÂ§ÃÂµes semanais');
+      body = body.replace(/cobrarÃÂ¡n el mismo dÃÂ­a de cada mes/gi, lang === 'es' ? 'cobrarÃÂ¡n cada semana' : lang === 'en' ? 'charged every week' : 'cobrarÃÂ£o a cada semana');
     } else if (rateType === 'diario') {
-      body = body.replace(/Alquiler Mensual:/gi, lang === 'es' ? 'Alquiler Diario:' : lang === 'en' ? 'Daily Rent:' : 'Aluguer Diário:');
+      body = body.replace(/Alquiler Mensual:/gi, lang === 'es' ? 'Alquiler Diario:' : lang === 'en' ? 'Daily Rent:' : 'Aluguer DiÃÂ¡rio:');
       body = body.replace(/Monthly Rent:/gi, 'Daily Rent:');
-      body = body.replace(/Aluguer Mensal:/gi, 'Aluguer Diário:');
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${rental.rental_rate}`);
+      body = body.replace(/Aluguer Mensal:/gi, 'Aluguer DiÃÂ¡rio:');
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `Ã¢ÂÂ¬${rental.rental_rate}`);
       
-      body = body.replace(/mensualidades/gi, lang === 'es' ? 'cuotas diarias' : lang === 'en' ? 'daily payments' : 'prestações diárias');
-      body = body.replace(/cobrarán el mismo día de cada mes/gi, lang === 'es' ? 'cobrarán cada día' : lang === 'en' ? 'charged every day' : 'cobrarão a cada dia');
+      body = body.replace(/mensualidades/gi, lang === 'es' ? 'cuotas diarias' : lang === 'en' ? 'daily payments' : 'prestaÃÂ§ÃÂµes diÃÂ¡rias');
+      body = body.replace(/cobrarÃÂ¡n el mismo dÃÂ­a de cada mes/gi, lang === 'es' ? 'cobrarÃÂ¡n cada dÃÂ­a' : lang === 'en' ? 'charged every day' : 'cobrarÃÂ£o a cada dia');
     } else {
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${rental.monthly_rate}`);
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `Ã¢ÂÂ¬${rental.monthly_rate}`);
     }
     
-    body = body.replace(/\{\{DEPOSIT_AMOUNT\}\}/g, `€${rental.deposit_amount || 0}`);
+    body = body.replace(/\{\{DEPOSIT_AMOUNT\}\}/g, `Ã¢ÂÂ¬${rental.deposit_amount || 0}`);
     html = body;
   } else {
     const rateType = rental.rate_type || 'mensual';
@@ -539,24 +945,24 @@ function sendRentalConfirmationEmail(rental: any, vehicle: any, customer: any, l
     const labelRent = rateType === 'semanal' 
       ? { es: 'Alquiler Semanal', en: 'Weekly Rent', pt: 'Aluguer Semanal' }[lang] 
       : rateType === 'diario' 
-      ? { es: 'Alquiler Diario', en: 'Daily Rent', pt: 'Aluguer Diário' }[lang] 
+      ? { es: 'Alquiler Diario', en: 'Daily Rent', pt: 'Aluguer DiÃÂ¡rio' }[lang] 
       : { es: 'Alquiler Mensual', en: 'Monthly Rate', pt: 'Mensalidade de Aluguer' }[lang];
 
     const labelFooter = rateType === 'semanal'
-      ? { es: 'Por favor, mantén tu cuenta al día para seguir disfrutando del servicio. ¡Gracias!', en: 'Please keep your payments current to enjoy uninterrupted service. Thank you!', pt: 'Por favor, mantenha os seus pagamentos em dia para usufruir do serviço. Obrigado!' }[lang]
+      ? { es: 'Por favor, mantÃÂ©n tu cuenta al dÃÂ­a para seguir disfrutando del servicio. ÃÂ¡Gracias!', en: 'Please keep your payments current to enjoy uninterrupted service. Thank you!', pt: 'Por favor, mantenha os seus pagamentos em dia para usufruir do serviÃÂ§o. Obrigado!' }[lang]
       : rateType === 'diario'
-      ? { es: 'Por favor, mantén tu cuenta al día para seguir disfrutando del servicio. ¡Gracias!', en: 'Please keep your payments current to enjoy uninterrupted service. Thank you!', pt: 'Por favor, mantenha os seus pagamentos em dia para usufruir do serviço. Obrigado!' }[lang]
-      : { es: 'Por favor, mantén tu cuenta al día para seguir disfrutando del servicio. ¡Gracias por confiar en nosotros!', en: 'Please keep your payments current to enjoy uninterrupted service. Thank you for choosing us!', pt: 'Por favor, mantenha a sua cuenta ativa para usufruir do serviço sem interrupções. Obrigado!' }[lang];
+      ? { es: 'Por favor, mantÃÂ©n tu cuenta al dÃÂ­a para seguir disfrutando del servicio. ÃÂ¡Gracias!', en: 'Please keep your payments current to enjoy uninterrupted service. Thank you!', pt: 'Por favor, mantenha os seus pagamentos em dia para usufruir do serviÃÂ§o. Obrigado!' }[lang]
+      : { es: 'Por favor, mantÃÂ©n tu cuenta al dÃÂ­a para seguir disfrutando del servicio. ÃÂ¡Gracias por confiar en nosotros!', en: 'Please keep your payments current to enjoy uninterrupted service. Thank you for choosing us!', pt: 'Por favor, mantenha a sua cuenta ativa para usufruir do serviÃÂ§o sem interrupÃÂ§ÃÂµes. Obrigado!' }[lang];
 
     const t = {
       es: {
-        subject: `Confirmación de Alquiler - The Fast Sheep`,
+        subject: `ConfirmaciÃÂ³n de Alquiler - The Fast Sheep`,
         hello: `Hola ${customer.first_name},`,
-        intro: `Tu alquiler en The Fast Sheep ha sido confirmado. A continuación tienes los detalles de tu e-bike y acuerdo de alquiler:`,
+        intro: `Tu alquiler en The Fast Sheep ha sido confirmado. A continuaciÃÂ³n tienes los detalles de tu e-bike y acuerdo de alquiler:`,
         vehicle: `E-Bike Alquilada`,
         startDate: `Fecha de Inicio`,
         monthlyRate: labelRent,
-        deposit: `Depósito / Fianza`,
+        deposit: `DepÃÂ³sito / Fianza`,
         footer: labelFooter
       },
       en: {
@@ -570,23 +976,23 @@ function sendRentalConfirmationEmail(rental: any, vehicle: any, customer: any, l
         footer: labelFooter
       },
       pt: {
-        subject: `Confirmação de Aluguer - The Fast Sheep`,
-        hello: `Olá ${customer.first_name},`,
-        intro: `O seu aluguer de e-bike com a The Fast Sheep foi registado. Abaixo estão os detalhes do acordo:`,
+        subject: `ConfirmaÃÂ§ÃÂ£o de Aluguer - The Fast Sheep`,
+        hello: `OlÃÂ¡ ${customer.first_name},`,
+        intro: `O seu aluguer de e-bike com a The Fast Sheep foi registado. Abaixo estÃÂ£o os detalhes do acordo:`,
         vehicle: `E-Bike Alugada`,
-        startDate: `Data de Início`,
+        startDate: `Data de InÃÂ­cio`,
         monthlyRate: labelRent,
-        deposit: `Depósito / Fiança`,
+        deposit: `DepÃÂ³sito / FianÃÂ§a`,
         footer: labelFooter
       }
     }[lang] || {
-      subject: `Confirmación de Alquiler - The Fast Sheep`,
+      subject: `ConfirmaciÃÂ³n de Alquiler - The Fast Sheep`,
       hello: `Hola ${customer.first_name},`,
-      intro: `Tu alquiler en The Fast Sheep ha sido confirmado. A continuación tienes los detalles de tu e-bike y acuerdo de alquiler:`,
+      intro: `Tu alquiler en The Fast Sheep ha sido confirmado. A continuaciÃÂ³n tienes los detalles de tu e-bike y acuerdo de alquiler:`,
       vehicle: `E-Bike Alquilada`,
       startDate: `Fecha de Inicio`,
       monthlyRate: labelRent,
-      deposit: `Depósito / Fianza`,
+      deposit: `DepÃÂ³sito / Fianza`,
       footer: labelFooter
     };
 
@@ -599,8 +1005,8 @@ function sendRentalConfirmationEmail(rental: any, vehicle: any, customer: any, l
         <ul>
           <li><strong>${t.vehicle}:</strong> ${vehicleStr}</li>
           <li><strong>${t.startDate}:</strong> ${rental.start_date}</li>
-          <li><strong>${t.monthlyRate}:</strong> €${rateVal}</li>
-          <li><strong>${t.deposit}:</strong> €${rental.deposit_amount || 0}</li>
+          <li><strong>${t.monthlyRate}:</strong> Ã¢ÂÂ¬${rateVal}</li>
+          <li><strong>${t.deposit}:</strong> Ã¢ÂÂ¬${rental.deposit_amount || 0}</li>
         </ul>
         <hr />
         <p style="font-size: 12px; color: #777;">${t.footer}</p>
@@ -618,7 +1024,7 @@ function sendRentalReminderEmail(rental: any, vehicle: any, customer: any, dueDa
   const brandModel = vehicle ? [vehicle.brand, vehicle.model].filter(Boolean).join(' ') : '';
   const vehicleStr = vehicle 
     ? (brandModel ? `${brandModel} - N/S: ${vehicle.serial_number || 'S/N'}` : `${vehicle.name} - N/S: ${vehicle.serial_number || 'S/N'}`)
-    : 'Bicicleta Eléctrica';
+    : 'Bicicleta ElÃÂ©ctrica';
 
   let subject = customTemplate?.subject || `Recordatorio de Pago de Alquiler - The Fast Sheep`;
   let html = '';
@@ -634,20 +1040,20 @@ function sendRentalReminderEmail(rental: any, vehicle: any, customer: any, dueDa
       body = body.replace(/Monto de Mensualidad:/gi, lang === 'es' ? 'Monto Semanal:' : lang === 'en' ? 'Weekly Rate:' : 'Valor Semanal:');
       body = body.replace(/Monthly Rate:/gi, 'Weekly Rate:');
       body = body.replace(/Mensalidade de Aluguer:/gi, 'Aluguer Semanal:');
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${rental.rental_rate || Math.round(rental.monthly_rate / 4)}`);
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `Ã¢ÂÂ¬${rental.rental_rate || Math.round(rental.monthly_rate / 4)}`);
       
       body = body.replace(/mensualidad/gi, lang === 'es' ? 'cuota semanal' : lang === 'en' ? 'weekly rate' : 'mensualidade');
       body = body.replace(/cobro mensual/gi, lang === 'es' ? 'cobro semanal' : lang === 'en' ? 'weekly payment' : 'cobro semanal');
     } else if (rateType === 'diario') {
-      body = body.replace(/Monto de Mensualidad:/gi, lang === 'es' ? 'Monto Diario:' : lang === 'en' ? 'Daily Rate:' : 'Valor Diário:');
+      body = body.replace(/Monto de Mensualidad:/gi, lang === 'es' ? 'Monto Diario:' : lang === 'en' ? 'Daily Rate:' : 'Valor DiÃÂ¡rio:');
       body = body.replace(/Monthly Rate:/gi, 'Daily Rate:');
-      body = body.replace(/Mensalidade de Aluguer:/gi, 'Aluguer Diário:');
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${rental.rental_rate}`);
+      body = body.replace(/Mensalidade de Aluguer:/gi, 'Aluguer DiÃÂ¡rio:');
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `Ã¢ÂÂ¬${rental.rental_rate}`);
       
       body = body.replace(/mensualidad/gi, lang === 'es' ? 'cuota diaria' : lang === 'en' ? 'daily rate' : 'mensualidade');
-      body = body.replace(/cobro mensual/gi, lang === 'es' ? 'cobro diario' : lang === 'en' ? 'daily payment' : 'cobro diário');
+      body = body.replace(/cobro mensual/gi, lang === 'es' ? 'cobro diario' : lang === 'en' ? 'daily payment' : 'cobro diÃÂ¡rio');
     } else {
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${rental.monthly_rate}`);
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `Ã¢ÂÂ¬${rental.monthly_rate}`);
     }
     
     body = body.replace(/\{\{DUE_DATE\}\}/g, dueDate.split('-').reverse().join('/'));
@@ -659,13 +1065,13 @@ function sendRentalReminderEmail(rental: any, vehicle: any, customer: any, dueDa
     const labelIntro = rateType === 'semanal'
       ? { es: 'Te recordamos que hoy vence la cuota de tu alquiler activo:', en: 'This is a reminder that the weekly rate for your active rental is due today:', pt: 'Relembramos que a taxa semanal do seu aluguer ativo vence no dia de hoje:' }[lang]
       : rateType === 'diario'
-      ? { es: 'Te recordamos que hoy vence el pago de tu alquiler activo:', en: 'This is a reminder that the daily rate for your active rental is due today:', pt: 'Relembramos que a taxa diária do seu aluguer ativo vence no dia de hoje:' }[lang]
+      ? { es: 'Te recordamos que hoy vence el pago de tu alquiler activo:', en: 'This is a reminder that the daily rate for your active rental is due today:', pt: 'Relembramos que a taxa diÃÂ¡ria do seu aluguer ativo vence no dia de hoje:' }[lang]
       : { es: 'Te recordamos que hoy vence la mensualidad de tu alquiler activo:', en: 'This is a reminder that the monthly rate for your active rental is due today:', pt: 'Relembramos que a mensalidade do seu aluguer ativo vence no dia de hoje:' }[lang];
 
     const labelAmount = rateType === 'semanal'
       ? { es: 'Monto de Alquiler Semanal', en: 'Weekly Rate', pt: 'Aluguer Semanal' }[lang]
       : rateType === 'diario'
-      ? { es: 'Monto de Alquiler Diario', en: 'Daily Rate', pt: 'Aluguer Diário' }[lang]
+      ? { es: 'Monto de Alquiler Diario', en: 'Daily Rate', pt: 'Aluguer DiÃÂ¡rio' }[lang]
       : { es: 'Monto de Mensualidad', en: 'Monthly Rate', pt: 'Mensalidade de Aluguer' }[lang];
 
     const t = {
@@ -676,7 +1082,7 @@ function sendRentalReminderEmail(rental: any, vehicle: any, customer: any, dueDa
         vehicle: `E-Bike`,
         dueDate: `Fecha de Vencimiento`,
         amount: labelAmount,
-        footer: `Mantener tu cuenta al día te permite continuar con el servicio sin suspensiones. ¡Gracias!`
+        footer: `Mantener tu cuenta al dÃÂ­a te permite continuar con el servicio sin suspensiones. ÃÂ¡Gracias!`
       },
       en: {
         subject: `Rental Payment Due Reminder - The Fast Sheep`,
@@ -689,12 +1095,12 @@ function sendRentalReminderEmail(rental: any, vehicle: any, customer: any, dueDa
       },
       pt: {
         subject: `Lembrete de Pagamento de Aluguer - The Fast Sheep`,
-        hello: `Olá ${customer.first_name},`,
+        hello: `OlÃÂ¡ ${customer.first_name},`,
         intro: labelIntro,
         vehicle: `E-Bike`,
         dueDate: `Data de Vencimento`,
         amount: labelAmount,
-        footer: `Efetue o pagamento para continuar com o seu servicio sem interrupções. Muito obrigado!`
+        footer: `Efetue o pagamento para continuar com o seu servicio sem interrupÃÂ§ÃÂµes. Muito obrigado!`
       }
     }[lang] || {
       subject: `Recordatorio de Pago de Alquiler - The Fast Sheep`,
@@ -703,7 +1109,7 @@ function sendRentalReminderEmail(rental: any, vehicle: any, customer: any, dueDa
       vehicle: `E-Bike`,
       dueDate: `Fecha de Vencimiento`,
       amount: labelAmount,
-      footer: `Mantener tu cuenta al día te permite continuar con el servicio sin suspensiones. ¡Gracias!`
+      footer: `Mantener tu cuenta al dÃÂ­a te permite continuar con el servicio sin suspensiones. ÃÂ¡Gracias!`
     };
 
     html = `
@@ -714,7 +1120,7 @@ function sendRentalReminderEmail(rental: any, vehicle: any, customer: any, dueDa
         <hr />
         <ul>
           <li><strong>${t.vehicle}:</strong> ${vehicleStr}</li>
-          <li><strong>${t.amount}:</strong> €${rateVal}</li>
+          <li><strong>${t.amount}:</strong> Ã¢ÂÂ¬${rateVal}</li>
           <li><strong>${t.dueDate}:</strong> ${dueDate}</li>
         </ul>
         <hr />
@@ -730,13 +1136,13 @@ function sendRentalReminderEmail(rental: any, vehicle: any, customer: any, dueDa
 function sendRentalPaymentReceivedEmail(customer: any, amount: number, date: string, method: string, lang: 'es' | 'en' | 'pt', emailTemplates?: EmailTemplate[]) {
   const customTemplate = emailTemplates?.find(t => t.template_key === 'rental_payment_received' && t.language === lang);
 
-  let subject = customTemplate?.subject || `Confirmación de Pago - The Fast Sheep`;
+  let subject = customTemplate?.subject || `ConfirmaciÃÂ³n de Pago - The Fast Sheep`;
   let html = '';
 
   if (customTemplate) {
     let body = customTemplate.body_text;
     body = body.replace(/\{\{CLIENT_NAME\}\}/g, `${customer.first_name} ${customer.last_name}`.trim());
-    body = body.replace(/\{\{PAYMENT_AMOUNT\}\}/g, `€${amount}`);
+    body = body.replace(/\{\{PAYMENT_AMOUNT\}\}/g, `Ã¢ÂÂ¬${amount}`);
     body = body.replace(/\{\{PAYMENT_DATE\}\}/g, date.split('-').reverse().join('/'));
     body = body.replace(/\{\{PAYMENT_METHOD\}\}/g, method);
     html = body;
@@ -748,12 +1154,12 @@ function sendRentalPaymentReceivedEmail(customer: any, amount: number, date: str
         <p>Te confirmamos que hemos recibido tu pago correctamente:</p>
         <hr />
         <ul>
-          <li><strong>Monto:</strong> €${amount}</li>
+          <li><strong>Monto:</strong> Ã¢ÂÂ¬${amount}</li>
           <li><strong>Fecha:</strong> ${date}</li>
           <li><strong>Detalle:</strong> ${method}</li>
         </ul>
         <hr />
-        <p style="font-size: 12px; color: #777;">Gracias por tu pago. ¡Buen viaje!</p>
+        <p style="font-size: 12px; color: #777;">Gracias por tu pago. ÃÂ¡Buen viaje!</p>
       </div>
     `;
   }
@@ -764,7 +1170,7 @@ function sendRentalPaymentReceivedEmail(customer: any, amount: number, date: str
 function sendAppAccountAssignedEmail(customer: any, platform: string, username: string, password: string, bankDetails: string, lang: 'es' | 'en' | 'pt', emailTemplates?: EmailTemplate[]) {
   const customTemplate = emailTemplates?.find(t => t.template_key === 'app_account_assigned' && t.language === lang);
 
-  let subject = customTemplate?.subject || `Tu Cuenta de App de Reparto está lista - The Fast Sheep`;
+  let subject = customTemplate?.subject || `Tu Cuenta de App de Reparto estÃÂ¡ lista - The Fast Sheep`;
   let html = '';
 
   if (customTemplate) {
@@ -787,7 +1193,7 @@ function sendAppAccountAssignedEmail(customer: any, platform: string, username: 
           <li><strong>Datos Banco:</strong> ${bankDetails}</li>
         </ul>
         <hr />
-        <p style="font-size: 12px; color: #777;">Inicia sesión para comenzar. ¡Éxito!</p>
+        <p style="font-size: 12px; color: #777;">Inicia sesiÃÂ³n para comenzar. ÃÂ¡ÃÂxito!</p>
       </div>
     `;
   }
@@ -802,9 +1208,9 @@ function sendRentalReturnedEmail(rental: any, vehicle: any, customer: any, lang:
   const brandModel = vehicle ? [vehicle.brand, vehicle.model].filter(Boolean).join(' ') : '';
   const vehicleStr = vehicle 
     ? (brandModel ? `${brandModel} - N/S: ${vehicle.serial_number || 'S/N'}` : `${vehicle.name} - N/S: ${vehicle.serial_number || 'S/N'}`)
-    : 'Bicicleta Eléctrica';
+    : 'Bicicleta ElÃÂ©ctrica';
 
-  let subject = customTemplate?.subject || `Confirmación de Devolución - The Fast Sheep`;
+  let subject = customTemplate?.subject || `ConfirmaciÃÂ³n de DevoluciÃÂ³n - The Fast Sheep`;
   let html = '';
 
   if (customTemplate) {
@@ -812,24 +1218,24 @@ function sendRentalReturnedEmail(rental: any, vehicle: any, customer: any, lang:
     body = body.replace(/\{\{CLIENT_NAME\}\}/g, `${customer.first_name} ${customer.last_name}`.trim());
     body = body.replace(/\{\{VEHICLE_NAME\}\}/g, vehicleStr);
     body = body.replace(/\{\{ODOMETER_END\}\}/g, String(rental.odometer_end || 0));
-    body = body.replace(/\{\{DEPOSIT_REFUNDED\}\}/g, rental.deposit_refunded !== null ? `€${rental.deposit_refunded}` : '—');
-    body = body.replace(/\{\{DAMAGE_REPORT\}\}/g, rental.damage_report || 'Sin Daños / Correcto');
+    body = body.replace(/\{\{DEPOSIT_REFUNDED\}\}/g, rental.deposit_refunded !== null ? `Ã¢ÂÂ¬${rental.deposit_refunded}` : 'Ã¢ÂÂ');
+    body = body.replace(/\{\{DAMAGE_REPORT\}\}/g, rental.damage_report || 'Sin DaÃÂ±os / Correcto');
     html = body;
   } else {
     html = `
       <div style="font-family: sans-serif; padding: 20px; color: #333;">
         <h2>${subject}</h2>
         <p>Hola ${customer.first_name},</p>
-        <p>Hemos procesado la devolución de tu bicicleta correctamente:</p>
+        <p>Hemos procesado la devoluciÃÂ³n de tu bicicleta correctamente:</p>
         <hr />
         <ul>
           <li><strong>E-Bike:</strong> ${vehicleStr}</li>
           <li><strong>KM Final:</strong> ${rental.odometer_end || 0}</li>
-          <li><strong>Depósito Devuelto:</strong> ${rental.deposit_refunded !== null ? `€${rental.deposit_refunded}` : '—'}</li>
-          <li><strong>Reporte Daños:</strong> ${rental.damage_report || 'Sin Daños / Correcto'}</li>
+          <li><strong>DepÃÂ³sito Devuelto:</strong> ${rental.deposit_refunded !== null ? `Ã¢ÂÂ¬${rental.deposit_refunded}` : 'Ã¢ÂÂ'}</li>
+          <li><strong>Reporte DaÃÂ±os:</strong> ${rental.damage_report || 'Sin DaÃÂ±os / Correcto'}</li>
         </ul>
         <hr />
-        <p style="font-size: 12px; color: #777;">Gracias por confiar en The Fast Sheep. ¡Hasta pronto!</p>
+        <p style="font-size: 12px; color: #777;">Gracias por confiar en The Fast Sheep. ÃÂ¡Hasta pronto!</p>
       </div>
     `;
   }
@@ -840,7 +1246,7 @@ function sendRentalReturnedEmail(rental: any, vehicle: any, customer: any, lang:
 function sendFinancingCompletedEmail(customer: any, lang: 'es' | 'en' | 'pt', emailTemplates?: EmailTemplate[]) {
   const customTemplate = emailTemplates?.find(t => t.template_key === 'financing_completed' && t.language === lang);
 
-  let subject = customTemplate?.subject || `¡Felicidades! Has completado tu financiación - The Fast Sheep`;
+  let subject = customTemplate?.subject || `ÃÂ¡Felicidades! Has completado tu financiaciÃÂ³n - The Fast Sheep`;
   let html = '';
 
   if (customTemplate) {
@@ -850,31 +1256,40 @@ function sendFinancingCompletedEmail(customer: any, lang: 'es' | 'en' | 'pt', em
   } else {
     const t = {
       es: {
-        subject: `¡Felicidades! Has completado tu financiación - The Fast Sheep`,
+        subject: `ÃÂ¡Felicidades! Has completado tu financiaciÃÂ³n - The Fast Sheep`,
         hello: `Hola ${customer.first_name},`,
-        body: `Queremos agradecerte y felicitarte por haber abonado exitosamente la última cuota de tu financiación.\n\n¡La bicicleta ahora es completamente tuya! Gracias por confiar en The Fast Sheep. Esperamos que la sigas disfrutando al máximo.`
+        body: `Queremos agradecerte y felicitarte por haber abonado exitosamente la ÃÂºltima cuota de tu financiaciÃÂ³n.\
+\
+ÃÂ¡La bicicleta ahora es completamente tuya! Gracias por confiar en The Fast Sheep. Esperamos que la sigas disfrutando al mÃÂ¡ximo.`
       },
       en: {
         subject: `Congratulations! You have completed your financing - The Fast Sheep`,
         hello: `Hello ${customer.first_name},`,
-        body: `We want to thank you and congratulate you on successfully paying the last installment of your financing.\n\nThe bicycle is now completely yours! Thank you for trusting The Fast Sheep. We hope you continue to enjoy it to the fullest.`
+        body: `We want to thank you and congratulate you on successfully paying the last installment of your financing.\
+\
+The bicycle is now completely yours! Thank you for trusting The Fast Sheep. We hope you continue to enjoy it to the fullest.`
       },
       pt: {
-        subject: `Parabéns! Você concluiu seu financiamento - The Fast Sheep`,
-        hello: `Olá ${customer.first_name},`,
-        body: `Queremos agradecer e parabenizar você por pagar com sucesso a última parcela do seu financiamento.\n\nA bicicleta agora é totalmente sua! Obrigado por confiar na The Fast Sheep. Esperamos que continue a desfrutar dela ao máximo.`
+        subject: `ParabÃÂ©ns! VocÃÂª concluiu seu financiamento - The Fast Sheep`,
+        hello: `OlÃÂ¡ ${customer.first_name},`,
+        body: `Queremos agradecer e parabenizar vocÃÂª por pagar com sucesso a ÃÂºltima parcela do seu financiamento.\
+\
+A bicicleta agora ÃÂ© totalmente sua! Obrigado por confiar na The Fast Sheep. Esperamos que continue a desfrutar dela ao mÃÂ¡ximo.`
       }
     }[lang] || {
-      subject: `¡Felicidades! Has completado tu financiación - The Fast Sheep`,
+      subject: `ÃÂ¡Felicidades! Has completado tu financiaciÃÂ³n - The Fast Sheep`,
       hello: `Hola ${customer.first_name},`,
-      body: `Queremos agradecerte y felicitarte por haber abonado exitosamente la última cuota de tu financiación.\n\n¡La bicicleta ahora es completamente tuya! Gracias por confiar en The Fast Sheep. Esperamos que la sigas disfrutando al máximo.`
+      body: `Queremos agradecerte y felicitarte por haber abonado exitosamente la ÃÂºltima cuota de tu financiaciÃÂ³n.\
+\
+ÃÂ¡La bicicleta ahora es completamente tuya! Gracias por confiar en The Fast Sheep. Esperamos que la sigas disfrutando al mÃÂ¡ximo.`
     };
 
     html = `
       <div style="font-family: sans-serif; padding: 20px; color: #333;">
         <h2>${t.subject}</h2>
         <p>${t.hello}</p>
-        <p>${t.body.replace(/\n/g, '<br/>')}</p>
+        <p>${t.body.replace(/\
+/g, '<br/>')}</p>
         <hr />
         <p style="font-size: 12px; color: #777;">El equipo de The Fast Sheep</p>
       </div>
@@ -892,13 +1307,13 @@ function sendFinancingCompletedEmail(customer: any, lang: 'es' | 'en' | 'pt', em
 const POPULAR_NATIONALITIES = [
   { value: "Brasil", labelEs: "Brasil", labelEn: "Brazil" },
   { value: "Irlandesa", labelEs: "Irlandesa", labelEn: "Irish" },
-  { value: "Española", labelEs: "Española", labelEn: "Spanish" },
+  { value: "EspaÃÂ±ola", labelEs: "EspaÃÂ±ola", labelEn: "Spanish" },
   { value: "Italiana", labelEs: "Italiana", labelEn: "Italian" },
   { value: "Venezolana", labelEs: "Venezolana", labelEn: "Venezuelan" },
   { value: "Colombiana", labelEs: "Colombiana", labelEn: "Colombian" },
   { value: "Argentina", labelEs: "Argentina", labelEn: "Argentina" },
   { value: "Portuguesa", labelEs: "Portuguesa", labelEn: "Portuguese" },
-  { value: "Pakistaní", labelEs: "Pakistaní", labelEn: "Pakistani" },
+  { value: "PakistanÃÂ­", labelEs: "PakistanÃÂ­", labelEn: "Pakistani" },
   { value: "India", labelEs: "India", labelEn: "Indian" },
   { value: "Rumana", labelEs: "Rumana", labelEn: "Romanian" }
 ];
@@ -908,18 +1323,18 @@ const NATIONALITIES = [
   { value: "Albanesa", labelEs: "Albanesa", labelEn: "Albanian" },
   { value: "Alemana", labelEs: "Alemana", labelEn: "German" },
   { value: "Andorrana", labelEs: "Andorrana", labelEn: "Andorran" },
-  { value: "Angoleña", labelEs: "Angoleña", labelEn: "Angolan" },
+  { value: "AngoleÃÂ±a", labelEs: "AngoleÃÂ±a", labelEn: "Angolan" },
   { value: "Argelina", labelEs: "Argelina", labelEn: "Algerian" },
   { value: "Argentina", labelEs: "Argentina", labelEn: "Argentina" },
   { value: "Armenia", labelEs: "Armenia", labelEn: "Armenian" },
   { value: "Australiana", labelEs: "Australiana", labelEn: "Australian" },
-  { value: "Austríaca", labelEs: "Austríaca", labelEn: "Austrian" },
+  { value: "AustrÃÂ­aca", labelEs: "AustrÃÂ­aca", labelEn: "Austrian" },
   { value: "Azerbaiyana", labelEs: "Azerbaiyana", labelEn: "Azerbaijani" },
-  { value: "Bahameña", labelEs: "Bahameña", labelEn: "Bahamian" },
-  { value: "Bangladesí", labelEs: "Bangladesí", labelEn: "Bangladeshi" },
+  { value: "BahameÃÂ±a", labelEs: "BahameÃÂ±a", labelEn: "Bahamian" },
+  { value: "BangladesÃÂ­", labelEs: "BangladesÃÂ­", labelEn: "Bangladeshi" },
   { value: "Barbadense", labelEs: "Barbadense", labelEn: "Barbadian" },
   { value: "Belga", labelEs: "Belga", labelEn: "Belgian" },
-  { value: "Beliceña", labelEs: "Beliceña", labelEn: "Belizean" },
+  { value: "BeliceÃÂ±a", labelEs: "BeliceÃÂ±a", labelEn: "Belizean" },
   { value: "Beninesa", labelEs: "Beninesa", labelEn: "Beninese" },
   { value: "Bielorrusa", labelEs: "Bielorrusa", labelEn: "Belarusian" },
   { value: "Birmana", labelEs: "Birmana", labelEn: "Burmese" },
@@ -927,17 +1342,17 @@ const NATIONALITIES = [
   { value: "Bosnia", labelEs: "Bosnia", labelEn: "Bosnian" },
   { value: "Botswanesa", labelEs: "Botswanesa", labelEn: "Botswanan" },
   { value: "Brasil", labelEs: "Brasil", labelEn: "Brazil" },
-  { value: "Británica", labelEs: "Británica", labelEn: "British" },
+  { value: "BritÃÂ¡nica", labelEs: "BritÃÂ¡nica", labelEn: "British" },
   { value: "Bruneana", labelEs: "Bruneana", labelEn: "Bruneian" },
-  { value: "Búlgara", labelEs: "Búlgara", labelEn: "Bulgarian" },
-  { value: "Burkinesa", labelEs: "Burkinesa", labelEn: "Burkinabé" },
+  { value: "BÃÂºlgara", labelEs: "BÃÂºlgara", labelEn: "Bulgarian" },
+  { value: "Burkinesa", labelEs: "Burkinesa", labelEn: "BurkinabÃÂ©" },
   { value: "Burundesa", labelEs: "Burundesa", labelEn: "Burundian" },
   { value: "Butanesa", labelEs: "Butanesa", labelEn: "Bhutanese" },
   { value: "Caboverdiana", labelEs: "Caboverdiana", labelEn: "Cape Verdean" },
   { value: "Camboyana", labelEs: "Camboyana", labelEn: "Cambodian" },
   { value: "Camerunesa", labelEs: "Camerunesa", labelEn: "Cameroonian" },
   { value: "Canadiense", labelEs: "Canadiense", labelEn: "Canadian" },
-  { value: "Qatarí", labelEs: "Qatarí", labelEn: "Qatari" },
+  { value: "QatarÃÂ­", labelEs: "QatarÃÂ­", labelEn: "Qatari" },
   { value: "Centroafricana", labelEs: "Centroafricana", labelEn: "Central African" },
   { value: "Chadiana", labelEs: "Chadiana", labelEn: "Chadian" },
   { value: "Checa", labelEs: "Checa", labelEn: "Czech" },
@@ -946,10 +1361,10 @@ const NATIONALITIES = [
   { value: "Chipriota", labelEs: "Chipriota", labelEn: "Cypriot" },
   { value: "Colombiana", labelEs: "Colombiana", labelEn: "Colombian" },
   { value: "Comorense", labelEs: "Comorense", labelEn: "Comorian" },
-  { value: "Congoleña", labelEs: "Congoleña", labelEn: "Congolese" },
+  { value: "CongoleÃÂ±a", labelEs: "CongoleÃÂ±a", labelEn: "Congolese" },
   { value: "Coreana", labelEs: "Coreana", labelEn: "Korean" },
   { value: "Costarricense", labelEs: "Costarricense", labelEn: "Costa Rican" },
-  { value: "Marfileña", labelEs: "Marfileña", labelEn: "Ivorian" },
+  { value: "MarfileÃÂ±a", labelEs: "MarfileÃÂ±a", labelEn: "Ivorian" },
   { value: "Croata", labelEs: "Croata", labelEn: "Croatian" },
   { value: "Cubana", labelEs: "Cubana", labelEn: "Cuban" },
   { value: "Danesa", labelEs: "Danesa", labelEn: "Danish" },
@@ -957,15 +1372,15 @@ const NATIONALITIES = [
   { value: "Dominicana", labelEs: "Dominicana", labelEn: "Dominican" },
   { value: "Ecuatoriana", labelEs: "Ecuatoriana", labelEn: "Ecuadorian" },
   { value: "Egipcia", labelEs: "Egipcia", labelEn: "Egyptian" },
-  { value: "Salvadoreña", labelEs: "Salvadoreña", labelEn: "Salvadoran" },
-  { value: "Emiratí", labelEs: "Emiratí", labelEn: "Emirati" },
+  { value: "SalvadoreÃÂ±a", labelEs: "SalvadoreÃÂ±a", labelEn: "Salvadoran" },
+  { value: "EmiratÃÂ­", labelEs: "EmiratÃÂ­", labelEn: "Emirati" },
   { value: "Eritrea", labelEs: "Eritrea", labelEn: "Eritrean" },
   { value: "Eslovaca", labelEs: "Eslovaca", labelEn: "Slovak" },
   { value: "Eslovena", labelEs: "Eslovena", labelEn: "Slovenian" },
-  { value: "Española", labelEs: "Española", labelEn: "Spanish" },
+  { value: "EspaÃÂ±ola", labelEs: "EspaÃÂ±ola", labelEn: "Spanish" },
   { value: "Estadounidense", labelEs: "Estadounidense", labelEn: "American" },
   { value: "Estonia", labelEs: "Estonia", labelEn: "Estonian" },
-  { value: "Etíope", labelEs: "Etíope", labelEn: "Ethiopian" },
+  { value: "EtÃÂ­ope", labelEs: "EtÃÂ­ope", labelEn: "Ethiopian" },
   { value: "Filipina", labelEs: "Filipina", labelEn: "Filipino" },
   { value: "Finlandesa", labelEs: "Finlandesa", labelEn: "Finnish" },
   { value: "Fiyiana", labelEs: "Fiyiana", labelEn: "Fijian" },
@@ -980,15 +1395,15 @@ const NATIONALITIES = [
   { value: "Guineana", labelEs: "Guineana", labelEn: "Guinean" },
   { value: "Guyanesa", labelEs: "Guyanesa", labelEn: "Guyanese" },
   { value: "Haitiana", labelEs: "Haitiana", labelEn: "Haitian" },
-  { value: "Hondureña", labelEs: "Hondureña", labelEn: "Honduran" },
-  { value: "Húngara", labelEs: "Húngara", labelEn: "Hungarian" },
+  { value: "HondureÃÂ±a", labelEs: "HondureÃÂ±a", labelEn: "Honduran" },
+  { value: "HÃÂºngara", labelEs: "HÃÂºngara", labelEn: "Hungarian" },
   { value: "India", labelEs: "India", labelEn: "Indian" },
   { value: "Indonesia", labelEs: "Indonesia", labelEn: "Indonesian" },
-  { value: "Iraquí", labelEs: "Iraquí", labelEn: "Iraqi" },
-  { value: "Iraní", labelEs: "Iraní", labelEn: "Iranian" },
+  { value: "IraquÃÂ­", labelEs: "IraquÃÂ­", labelEn: "Iraqi" },
+  { value: "IranÃÂ­", labelEs: "IranÃÂ­", labelEn: "Iranian" },
   { value: "Irlandesa", labelEs: "Irlandesa", labelEn: "Irish" },
   { value: "Islandesa", labelEs: "Islandesa", labelEn: "Icelandic" },
-  { value: "Israelí", labelEs: "Israelí", labelEn: "Israeli" },
+  { value: "IsraelÃÂ­", labelEs: "IsraelÃÂ­", labelEn: "Israeli" },
   { value: "Italiana", labelEs: "Italiana", labelEn: "Italian" },
   { value: "Jamaiquina", labelEs: "Jamaiquina", labelEn: "Jamaican" },
   { value: "Japonesa", labelEs: "Japonesa", labelEn: "Japanese" },
@@ -996,7 +1411,7 @@ const NATIONALITIES = [
   { value: "Kazaja", labelEs: "Kazaja", labelEn: "Kazakh" },
   { value: "Keniana", labelEs: "Keniana", labelEn: "Kenyan" },
   { value: "Kirguisa", labelEs: "Kirguisa", labelEn: "Kyrgyz" },
-  { value: "Kuwaití", labelEs: "Kuwaití", labelEn: "Kuwaiti" },
+  { value: "KuwaitÃÂ­", labelEs: "KuwaitÃÂ­", labelEn: "Kuwaiti" },
   { value: "Laosiana", labelEs: "Laosiana", labelEn: "Laotian" },
   { value: "Lesotense", labelEs: "Lesotense", labelEn: "Lesothan" },
   { value: "Letona", labelEs: "Letona", labelEn: "Latvian" },
@@ -1009,11 +1424,11 @@ const NATIONALITIES = [
   { value: "Macedonia", labelEs: "Macedonia", labelEn: "Macedonian" },
   { value: "Madagascurense", labelEs: "Madagascurense", labelEn: "Malagasy" },
   { value: "Malasia", labelEs: "Malasia", labelEn: "Malaysian" },
-  { value: "Malauí", labelEs: "Malauí", labelEn: "Malawian" },
+  { value: "MalauÃÂ­", labelEs: "MalauÃÂ­", labelEn: "Malawian" },
   { value: "Maldiva", labelEs: "Maldiva", labelEn: "Maldivian" },
   { value: "Maliense", labelEs: "Maliense", labelEn: "Malian" },
   { value: "Maltesa", labelEs: "Maltesa", labelEn: "Maltese" },
-  { value: "Marroquí", labelEs: "Marroquí", labelEn: "Moroccan" },
+  { value: "MarroquÃÂ­", labelEs: "MarroquÃÂ­", labelEn: "Moroccan" },
   { value: "Mauriciana", labelEs: "Mauriciana", labelEn: "Mauritian" },
   { value: "Mauritana", labelEs: "Mauritana", labelEn: "Mauritanian" },
   { value: "Mexicana", labelEs: "Mexicana", labelEn: "Mexican" },
@@ -1022,21 +1437,21 @@ const NATIONALITIES = [
   { value: "Monegasca", labelEs: "Monegasca", labelEn: "Monegasque" },
   { value: "Mongola", labelEs: "Mongola", labelEn: "Mongolian" },
   { value: "Montenegrina", labelEs: "Montenegrina", labelEn: "Montenegrin" },
-  { value: "Mozambiqueña", labelEs: "Mozambiqueña", labelEn: "Mozambican" },
+  { value: "MozambiqueÃÂ±a", labelEs: "MozambiqueÃÂ±a", labelEn: "Mozambican" },
   { value: "Namibia", labelEs: "Namibia", labelEn: "Namibian" },
   { value: "Nauruana", labelEs: "Nauruana", labelEn: "Nauruan" },
   { value: "Nepalesa", labelEs: "Nepalesa", labelEn: "Nepalese" },
-  { value: "Nicaragüense", labelEs: "Nicaragüense", labelEn: "Nicaraguan" },
+  { value: "NicaragÃÂ¼ense", labelEs: "NicaragÃÂ¼ense", labelEn: "Nicaraguan" },
   { value: "Nigeriana", labelEs: "Nigeriana", labelEn: "Nigerian" },
-  { value: "Nígerina", labelEs: "Nígerina", labelEn: "Nigerien" },
+  { value: "NÃÂ­gerina", labelEs: "NÃÂ­gerina", labelEn: "Nigerien" },
   { value: "Noruega", labelEs: "Noruega", labelEn: "Norwegian" },
   { value: "Neozelandesa", labelEs: "Neozelandesa", labelEn: "New Zealander" },
-  { value: "Omaní", labelEs: "Omaní", labelEn: "Omani" },
+  { value: "OmanÃÂ­", labelEs: "OmanÃÂ­", labelEn: "Omani" },
   { value: "Neerlandesa", labelEs: "Neerlandesa", labelEn: "Dutch" },
-  { value: "Pakistaní", labelEs: "Pakistaní", labelEn: "Pakistani" },
+  { value: "PakistanÃÂ­", labelEs: "PakistanÃÂ­", labelEn: "Pakistani" },
   { value: "Palauana", labelEs: "Palauana", labelEn: "Palauan" },
-  { value: "Panameña", labelEs: "Panameña", labelEn: "Panamanian" },
-  { value: "Papú", labelEs: "Papú", labelEn: "Papua New Guinean" },
+  { value: "PanameÃÂ±a", labelEs: "PanameÃÂ±a", labelEn: "Panamanian" },
+  { value: "PapÃÂº", labelEs: "PapÃÂº", labelEn: "Papua New Guinean" },
   { value: "Paraguaya", labelEs: "Paraguaya", labelEn: "Paraguayan" },
   { value: "Peruana", labelEs: "Peruana", labelEn: "Peruvian" },
   { value: "Polaca", labelEs: "Polaca", labelEn: "Polish" },
@@ -1047,15 +1462,15 @@ const NATIONALITIES = [
   { value: "Samoana", labelEs: "Samoana", labelEn: "Samoan" },
   { value: "Sanmarinense", labelEs: "Sanmarinense", labelEn: "Sammarinese" },
   { value: "Santaluciense", labelEs: "Santaluciense", labelEn: "Saint Lucian" },
-  { value: "Santotomense", labelEs: "Santotomense", labelEn: "São Toméan" },
-  { value: "Saudí", labelEs: "Saudí", labelEn: "Saudi" },
+  { value: "Santotomense", labelEs: "Santotomense", labelEn: "SÃÂ£o TomÃÂ©an" },
+  { value: "SaudÃÂ­", labelEs: "SaudÃÂ­", labelEn: "Saudi" },
   { value: "Senegalesa", labelEs: "Senegalesa", labelEn: "Senegalese" },
   { value: "Serbia", labelEs: "Serbia", labelEn: "Serbian" },
   { value: "Seychellense", labelEs: "Seychellense", labelEn: "Seychellois" },
   { value: "Sierraleonesa", labelEs: "Sierraleonesa", labelEn: "Sierra Leonean" },
   { value: "Singapurense", labelEs: "Singapurense", labelEn: "Singaporean" },
   { value: "Siria", labelEs: "Siria", labelEn: "Syrian" },
-  { value: "Somalí", labelEs: "Somalí", labelEn: "Somali" },
+  { value: "SomalÃÂ­", labelEs: "SomalÃÂ­", labelEn: "Somali" },
   { value: "Ceilanesa", labelEs: "Ceilanesa", labelEn: "Sri Lankan" },
   { value: "Sudafricana", labelEs: "Sudafricana", labelEn: "South African" },
   { value: "Sudanesa", labelEs: "Sudanesa", labelEn: "Sudanese" },
@@ -1080,7 +1495,7 @@ const NATIONALITIES = [
   { value: "Vanuatuense", labelEs: "Vanuatuense", labelEn: "Vanuatuan" },
   { value: "Venezolana", labelEs: "Venezolana", labelEn: "Venezuelan" },
   { value: "Vietnamita", labelEs: "Vietnamita", labelEn: "Vietnamese" },
-  { value: "Yemení", labelEs: "Yemení", labelEn: "Yemeni" },
+  { value: "YemenÃÂ­", labelEs: "YemenÃÂ­", labelEn: "Yemeni" },
   { value: "Yibutiana", labelEs: "Yibutiana", labelEn: "Djiboutian" },
   { value: "Zambiana", labelEs: "Zambiana", labelEn: "Zambian" },
   { value: "Zimbabuense", labelEs: "Zimbabuense", labelEn: "Zimbabwean" }
@@ -1092,7 +1507,7 @@ const NATIONALITIES = [
 const formatNationality = (nationality: string) => {
   if (!nationality) return '';
   const n = nationality.trim().toLowerCase();
-  if (n === 'brasileña' || n === 'brasileño' || n === 'brazilian') return 'Brasil';
+  if (n === 'brasileÃÂ±a' || n === 'brasileÃÂ±o' || n === 'brazilian') return 'Brasil';
   if (n === 'argentina' || n === 'argentino' || n === 'argentinian') return 'Argentina';
   return nationality;
 };
@@ -1102,55 +1517,55 @@ const formatNationality = (nationality: string) => {
 // ----------------------------------------------------
 const translations = {
   es: {
-    dashboard: "Panel de Analíticas", analytics: "Panel de Analíticas", stock: "Inventario y Stock", customers: "Expediente de Clientes",
+    dashboard: "Panel de AnalÃÂ­ticas", analytics: "Panel de AnalÃÂ­ticas", stock: "Inventario y Stock", customers: "Expediente de Clientes",
     crm: "CRM y Leads", suppliers: "Proveedores y Comparador", accounts: "Cuentas de Reparto", users: "Usuarios",
     calendar: "Calendario de Eventos", maintenance: "Taller y Mantenimiento", wizard: "Terminal de Alquiler", rental_wizard: "Terminal de Alquiler",
-    quick_replies: "Respuestas Rápidas", tasks: "Tareas",
+    quick_replies: "Respuestas RÃÂ¡pidas", tasks: "Tareas",
     welcome: "Bienvenido a The Fast Sheep", activeRentals: "Alquileres Activos",
     monthlyEarnings: "Ingresos Mensuales", availableBikes: "Bicicletas Disponibles", announcedReturns: "Devoluciones Anunciadas",
-    mechanicalHealth: "Salud de Flota", nationalities: "Distribución por Nacionalidades",
-    seasonality: "Tendencia de Alquiler Estacional", referrals: "Canales de Adquisición",
-    searchPlaceholder: "Buscar...", addPrefix: "Gestionar Prefijos", addCategory: "Nueva Categoría",
-    registerItem: "Registrar Stock", prefix: "Prefijo", code: "Código", brand: "Marca", model: "Modelo",
+    mechanicalHealth: "Salud de Flota", nationalities: "DistribuciÃÂ³n por Nacionalidades",
+    seasonality: "Tendencia de Alquiler Estacional", referrals: "Canales de AdquisiciÃÂ³n",
+    searchPlaceholder: "Buscar...", addPrefix: "Gestionar Prefijos", addCategory: "Nueva CategorÃÂ­a",
+    registerItem: "Registrar Stock", prefix: "Prefijo", code: "CÃÂ³digo", brand: "Marca", model: "Modelo",
     cost: "Costo", status: "Estado", actions: "Acciones", available: "Disponible", rented: "Rentada",
     inMaintenance: "Mantenimiento", sold: "Vendida", lost: "Perdida", roi: "Retorno (ROI)",
     save: "Guardar", cancel: "Cancelar", delete: "Eliminar", edit: "Editar",
     viewProfile: "Ver Expediente", markSold: "Marcar Vendida", salePrice: "Precio de Venta",
-    saleDate: "Fecha de Venta", keyNumber: "Nro. Llave", batterySerial: "Serial Fábrica Batería",
-    frameSerial: "Número de Cuadro (Frame)", purchaseDate: "Fecha Compra",
-    arrivalDate: "Fecha Arribo Dublín", factoryClaim: "Reclamo Fábrica", claimNotes: "Notas del Reclamo",
-    customFields: "Campos Dinámicos", fieldName: "Nombre Campo", fieldType: "Tipo de Dato",
-    addCustomField: "Agregar Campo a Categoría", nationality: "Nacionalidad",
+    saleDate: "Fecha de Venta", keyNumber: "Nro. Llave", batterySerial: "Serial FÃÂ¡brica BaterÃÂ­a",
+    frameSerial: "NÃÂºmero de Cuadro (Frame)", purchaseDate: "Fecha Compra",
+    arrivalDate: "Fecha Arribo DublÃÂ­n", factoryClaim: "Reclamo FÃÂ¡brica", claimNotes: "Notas del Reclamo",
+    customFields: "Campos DinÃÂ¡micos", fieldName: "Nombre Campo", fieldType: "Tipo de Dato",
+    addCustomField: "Agregar Campo a CategorÃÂ­a", nationality: "Nacionalidad",
     referralSource: "Origen / Referido por", newRental: "Nuevo Alquiler", step: "Paso",
-    selectBike: "Seleccionar E-Bike", selectBattery: "Asociar Batería", selectLock: "Asociar Candado y Kit",
+    selectBike: "Seleccionar E-Bike", selectBattery: "Asociar BaterÃÂ­a", selectLock: "Asociar Candado y Kit",
     customerInfo: "Datos del Rider", deliveryApp: "Plataformas Gig-Economy",
-    conditionPhotos: "Evidencia Física (Fotos)", signature: "Firma de Contrato",
+    conditionPhotos: "Evidencia FÃÂ­sica (Fotos)", signature: "Firma de Contrato",
     confirmRental: "Confirmar Renta", clear: "Limpiar", signHere: "Firme dentro de este cuadro",
     contractType: "Tipo de Contrato", digitalSignature: "Firma Digital",
     photoAttachment: "Foto de Contrato Adjunto", kitDetails: "Detalles del Kit / Accesorios",
     activeRentalsList: "Detalles del alquiler", pastRentalsList: "Historial de Alquiler",
     financialSummary: "Resumen de Cuenta (Rider)", payoutRate: "Tarifa Semanal",
-    weeklyEarnings: "Cobro Semanal", notesJournal: "Bitácora de Notas",
-    addJournalEntry: "Nueva Anotación", earningsLog: "Historial de Pagos",
-    addEarning: "Registrar Pago", eventTitle: "Título de Obligación", eventDate: "Fecha Límite",
-    eventReminder: "Recordatorios", remindWeek: "1 Semana Antes", remindDay: "1 Día Antes",
+    weeklyEarnings: "Cobro Semanal", notesJournal: "BitÃÂ¡cora de Notas",
+    addJournalEntry: "Nueva AnotaciÃÂ³n", earningsLog: "Historial de Pagos",
+    addEarning: "Registrar Pago", eventTitle: "TÃÂ­tulo de ObligaciÃÂ³n", eventDate: "Fecha LÃÂ­mite",
+    eventReminder: "Recordatorios", remindWeek: "1 Semana Antes", remindDay: "1 DÃÂ­a Antes",
     pending: "Pendiente", completed: "Realizado", addEvent: "Agendar Evento",
-    odometer: "Kilometraje (KM)", lastService: "Último Service", serviceLocation: "Lugar del Service",
-    nextService: "Próximo Service", serviceAlert: "Alerta de Taller", performedBy: "Mecánico",
-    serviceDescription: "Detalle de Trabajo", serviceCost: "Costo de Reparación",
-    addServiceRecord: "Registrar Entrada a Taller", cheapest: "El Más Barato", fastest: "El Más Rápido",
+    odometer: "Kilometraje (KM)", lastService: "ÃÂltimo Service", serviceLocation: "Lugar del Service",
+    nextService: "PrÃÂ³ximo Service", serviceAlert: "Alerta de Taller", performedBy: "MecÃÂ¡nico",
+    serviceDescription: "Detalle de Trabajo", serviceCost: "Costo de ReparaciÃÂ³n",
+    addServiceRecord: "Registrar Entrada a Taller", cheapest: "El MÃÂ¡s Barato", fastest: "El MÃÂ¡s RÃÂ¡pido",
     suppliersComparison: "Comparador de Compra de Flota",
-    cancelReturnNotice: "Cancelar Aviso", returnBike: "Registrar Devolución", odometerEnd: "Kilometraje Final (KM)", logPayment: "Registrar Pago",
-    damageReport: "Reporte de Daños", depositRefunded: "Depósito Devuelto (€)",
+    cancelReturnNotice: "Cancelar Aviso", returnBike: "Registrar DevoluciÃÂ³n", odometerEnd: "Kilometraje Final (KM)", logPayment: "Registrar Pago",
+    damageReport: "Reporte de DaÃÂ±os", depositRefunded: "DepÃÂ³sito Devuelto (Ã¢ÂÂ¬)",
     searchExistingRider: "Buscar Rider Existente por Email",
-    customerCode: "Código de Usuario (Prefijo US-)",
+    customerCode: "CÃÂ³digo de Usuario (Prefijo US-)",
     balance: "Balance Financiero", income: "Ingresos", expenses: "Egresos", netFlow: "Flujo Neto", transactions: "Transacciones",
-    maintHistory: "Historial", programService: "Programar Service", totalInvested: "Retorno Neto",
+    maintHistory: "Historial", programService: "Programar Service", totalInvested: "Total Invertido",
     currentOdometer: "Kilometraje Actual", noHistory: "No hay registros de mantenimiento para esta bicicleta.",
-    mechanic: "Mecánico", location: "Ubicación", associatedRider: "Rider Asociado",
-    serviceType: "Service Oficial", expenseType: "Reparación Extra",
-    condition: "Condición", changeCondition: "Cambiar Condición",
-    nuevo: "✨ Nuevo", bueno: "🟢 Bueno", regular: "🟡 Regular", paraVenta: "🟣 Para Venta",
+    mechanic: "MecÃÂ¡nico", location: "UbicaciÃÂ³n", associatedRider: "Rider Asociado",
+    serviceType: "Service Oficial", expenseType: "ReparaciÃÂ³n Extra",
+    condition: "CondiciÃÂ³n", changeCondition: "Cambiar CondiciÃÂ³n",
+    nuevo: "Ã¢ÂÂ¨ Nuevo", bueno: "Ã°ÂÂÂ¢ Bueno", regular: "Ã°ÂÂÂ¡ Regular", paraVenta: "Ã°ÂÂÂ£ Para Venta",
   },
   en: {
     dashboard: "Analytics Dashboard", analytics: "Analytics Dashboard", stock: "Inventory & Stock", customers: "Customer Ledger",
@@ -1192,16 +1607,16 @@ const translations = {
     addServiceRecord: "Register Workshop Service", cheapest: "Cheapest", fastest: "Fastest",
     suppliersComparison: "Fleet Purchase Matcher",
     returnBike: "Register Return", odometerEnd: "Final Odometer (KM)", logPayment: "Log Payment",
-    damageReport: "Damage Report", depositRefunded: "Deposit Refunded (€)",
+    damageReport: "Damage Report", depositRefunded: "Deposit Refunded (Ã¢ÂÂ¬)",
     searchExistingRider: "Search Existing Rider by Email",
     customerCode: "User Code (Prefix US-)",
     balance: "Financial Balance", income: "Income", expenses: "Expenses", netFlow: "Net Flow", transactions: "Transactions",
-    maintHistory: "History", programService: "Schedule Service", totalInvested: "Net Return",
+    maintHistory: "Maintenance History", programService: "Schedule Service", totalInvested: "Total Invested",
     currentOdometer: "Current Odometer", noHistory: "No maintenance records for this bicycle.",
     mechanic: "Mechanic", location: "Location", associatedRider: "Associated Rider",
     serviceType: "Official Service", expenseType: "Extra Repair",
     condition: "Condition", changeCondition: "Change Condition",
-    nuevo: "✨ New", bueno: "🟢 Good", regular: "🟡 Regular", paraVenta: "🟣 For Sale",
+    nuevo: "Ã¢ÂÂ¨ New", bueno: "Ã°ÂÂÂ¢ Good", regular: "Ã°ÂÂÂ¡ Regular", paraVenta: "Ã°ÂÂÂ£ For Sale",
   }
 };
 
@@ -1312,23 +1727,23 @@ export default function App() {
     // Quick regex validation
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(email)) {
-      showToast(language === 'es' ? 'Correo electrónico no válido' : 'Invalid email address', 'error');
+      showToast(language === 'es' ? 'Correo electrÃÂ³nico no vÃÂ¡lido' : 'Invalid email address', 'error');
       return;
     }
 
     setWhitelistLoading(true);
     try {
       await addAllowedEmail(email, whitelistRoleInput);
-      showToast(language === 'es' ? 'Correo añadido correctamente.' : 'Email added successfully.', 'success');
+      showToast(language === 'es' ? 'Correo aÃÂ±adido correctamente.' : 'Email added successfully.', 'success');
       setWhitelistEmailInput('');
       setWhitelistRoleInput('admin');
       fetchWhitelist();
     } catch (err: any) {
       console.error(err);
       if (err.message && err.message.includes('duplicate')) {
-        showToast(language === 'es' ? 'Este correo ya está registrado.' : 'This email is already registered.', 'error');
+        showToast(language === 'es' ? 'Este correo ya estÃÂ¡ registrado.' : 'This email is already registered.', 'error');
       } else {
-        showToast(language === 'es' ? 'Error al añadir el correo.' : 'Error adding email.', 'error');
+        showToast(language === 'es' ? 'Error al aÃÂ±adir el correo.' : 'Error adding email.', 'error');
       }
     } finally {
       setWhitelistLoading(false);
@@ -1339,10 +1754,14 @@ export default function App() {
     const isSelf = email.toLowerCase() === user?.email?.toLowerCase();
     const confirmMsg = isSelf 
       ? (language === 'es' 
-          ? `⚠️ ¡ATENCIÓN! Estás eliminando tu propia cuenta (${email}) de la lista de acceso. Si cierras la sesión o expira, podrías quedar fuera de la aplicación permanentemente.\n\n¿Estás seguro de que quieres continuar?` 
-          : `⚠️ WARNING! You are deleting your own email (${email}) from the access list. If you log out or your session expires, you may be permanently locked out.\n\nAre you sure you want to proceed?`)
+          ? `Ã¢ÂÂ Ã¯Â¸Â ÃÂ¡ATENCIÃÂN! EstÃÂ¡s eliminando tu propia cuenta (${email}) de la lista de acceso. Si cierras la sesiÃÂ³n o expira, podrÃÂ­as quedar fuera de la aplicaciÃÂ³n permanentemente.\
+\
+ÃÂ¿EstÃÂ¡s seguro de que quieres continuar?` 
+          : `Ã¢ÂÂ Ã¯Â¸Â WARNING! You are deleting your own email (${email}) from the access list. If you log out or your session expires, you may be permanently locked out.\
+\
+Are you sure you want to proceed?`)
       : (language === 'es'
-          ? `¿Seguro que quieres revocar el acceso a ${email}?`
+          ? `ÃÂ¿Seguro que quieres revocar el acceso a ${email}?`
           : `Are you sure you want to revoke access for ${email}?`);
 
     if (!await asyncConfirm(confirmMsg)) return;
@@ -1353,7 +1772,7 @@ export default function App() {
       fetchWhitelist();
       
       if (isSelf) {
-        showToast(language === 'es' ? 'Has eliminado tu propio acceso. Ten cuidado de no cerrar sesión.' : 'You have deleted your own access. Be careful not to log out.', 'error');
+        showToast(language === 'es' ? 'Has eliminado tu propio acceso. Ten cuidado de no cerrar sesiÃÂ³n.' : 'You have deleted your own access. Be careful not to log out.', 'error');
       }
     } catch (err) {
       console.error(err);
@@ -1371,10 +1790,10 @@ CREATE TABLE IF NOT EXISTS public.allowed_emails (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
--- Si la tabla ya existe, agregar la columna 'role' si no está presente
+-- Si la tabla ya existe, agregar la columna 'role' si no estÃÂ¡ presente
 ALTER TABLE public.allowed_emails ADD COLUMN IF NOT EXISTS role VARCHAR DEFAULT 'admin';
 
--- 2. Asegurar que los correos se guarden siempre en minúsculas para comparaciones consistentes
+-- 2. Asegurar que los correos se guarden siempre en minÃÂºsculas para comparaciones consistentes
 CREATE OR REPLACE FUNCTION public.lowercase_email_on_insert()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -1387,25 +1806,25 @@ CREATE OR REPLACE TRIGGER trigger_lowercase_email_on_allowed_emails
     BEFORE INSERT OR UPDATE ON public.allowed_emails
     FOR EACH ROW EXECUTE FUNCTION public.lowercase_email_on_insert();
 
--- 3. Crear la función de filtro y bloqueo de acceso
+-- 3. Crear la funciÃÂ³n de filtro y bloqueo de acceso
 CREATE OR REPLACE FUNCTION public.check_allowed_email()
 RETURNS TRIGGER AS $$
 BEGIN
-    -- Si la tabla está vacía, permitimos el acceso para evitar bloqueos accidentales iniciales
+    -- Si la tabla estÃÂ¡ vacÃÂ­a, permitimos el acceso para evitar bloqueos accidentales iniciales
     IF (SELECT COUNT(*) FROM public.allowed_emails) = 0 THEN
         RETURN NEW;
     END IF;
 
-    -- Comprobar si el correo del nuevo inicio de sesión está en la whitelist
+    -- Comprobar si el correo del nuevo inicio de sesiÃÂ³n estÃÂ¡ en la whitelist
     IF EXISTS (SELECT 1 FROM public.allowed_emails WHERE LOWER(email) = LOWER(NEW.email)) THEN
         RETURN NEW;
     ELSE
-        RAISE EXCEPTION 'Tu correo (%) no está autorizado para acceder a esta aplicación. Contacta al administrador.', NEW.email;
+        RAISE EXCEPTION 'Tu correo (%) no estÃÂ¡ autorizado para acceder a esta aplicaciÃÂ³n. Contacta al administrador.', NEW.email;
     END IF;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- 4. Crear el trigger en la tabla de autenticación
+-- 4. Crear el trigger en la tabla de autenticaciÃÂ³n
 DROP TRIGGER IF EXISTS validate_email_before_signup ON auth.users;
 CREATE TRIGGER validate_email_before_signup
     BEFORE INSERT ON auth.users
@@ -1439,7 +1858,7 @@ USING (true);`;
 
     navigator.clipboard.writeText(sqlText);
     setSqlCopied(true);
-    showToast(language === 'es' ? 'Código SQL copiado al portapapeles.' : 'SQL code copied to clipboard.', 'success');
+    showToast(language === 'es' ? 'CÃÂ³digo SQL copiado al portapapeles.' : 'SQL code copied to clipboard.', 'success');
     setTimeout(() => setSqlCopied(false), 3000);
   };
 
@@ -1485,6 +1904,46 @@ USING (true);`;
   const [dbVer, setDbVer] = useState(0);
   const triggerReload = useCallback(() => setDbVer(v => v + 1), []);
 
+  // Create or update an internal technical checklist row, including the inspector
+  // signature (uploaded after the row exists so it has an id for the storage path).
+  const persistInternalChecklist = async (params: {
+    existingId: string | null;
+    rentalId: string;
+    customerName: string;
+    bikeModel: string;
+    bikeSerial: string;
+    deliveryDate: string;
+    value: InternalChecklistValue;
+  }): Promise<void> => {
+    const { value } = params;
+    const allChecked = INTERNAL_CHECKLIST_ITEM_KEYS.every(k => value.items[k]);
+    const anyChecked = INTERNAL_CHECKLIST_ITEM_KEYS.some(k => value.items[k]);
+    const status: 'pending' | 'completed' = allChecked && anyChecked ? 'completed' : 'pending';
+    let id = params.existingId;
+    if (!id) {
+      const row = await createInternalChecklist({
+        rental_id: params.rentalId,
+        customer_name: params.customerName,
+        bike_model: params.bikeModel,
+        bike_serial: params.bikeSerial,
+        delivery_date: params.deliveryDate,
+        battery_level: value.battery_level,
+        items: value.items,
+        notes: value.notes,
+        status,
+      });
+      id = row.id;
+    } else {
+      await updateDeliveryChecklist(id, {
+        items: value.items, notes: value.notes, battery_level: value.battery_level, status,
+      });
+    }
+    if (value.signatureDataUrl) {
+      const url = await uploadChecklistSignature(id, value.signatureDataUrl);
+      await updateDeliveryChecklist(id, { signature_url: url });
+    }
+  };
+
   // Task Board States
   const [taskCards, setTaskCards] = useState<TaskCard[]>([]);
   const [taskItems, setTaskItems] = useState<TaskItem[]>([]);
@@ -1526,6 +1985,13 @@ USING (true);`;
   const [products,        setProducts]        = useState<Product[]>([]);
   const [customers,       setCustomers]       = useState<Customer[]>([]);
   const [rentals,         setRentals]         = useState<Rental[]>([]);
+  const [deliveryChecklists, setDeliveryChecklists] = useState<DeliveryChecklist[]>([]);
+  const [viewChecklist,   setViewChecklist]   = useState<DeliveryChecklist | null>(null);
+  const [ledgerDetail,    setLedgerDetail]    = useState<{ date: string; description: string; amount: number; type: 'cost' | 'sale' | 'payment' | 'deposit' | 'expense' } | null>(null);
+  const [txDetail,        setTxDetail]        = useState<{ id: string; date: string; type: 'income' | 'expense'; amount: number; description: string; category: string; received_via?: string; productName?: string; brand?: string; model?: string } | null>(null);
+  const [editInternalChecklist, setEditInternalChecklist] = useState<{ rentalId: string; existingId: string | null; customerName: string; bikeModel: string; bikeSerial: string; deliveryDate: string } | null>(null);
+  const [editInternalValue, setEditInternalValue] = useState<InternalChecklistValue>(emptyInternalChecklist());
+  const [editInternalSaving, setEditInternalSaving] = useState(false);
   const [rentalItems,     setRentalItems]     = useState<RentalItem[]>([]);
   const [payments,        setPayments]        = useState<RentalPayment[]>([]);
   const [expenses,        setExpenses]        = useState<MaintenanceExpense[]>([]);
@@ -1570,8 +2036,8 @@ USING (true);`;
   const [userFormRole, setUserFormRole] = useState('');
   const [userFormNotes, setUserFormNotes] = useState('');
   const [userFormCode, setUserFormCode] = useState('');
-  const [userFormNationality, setUserFormNationality] = useState('');
-  const [userFormReferral, setUserFormReferral] = useState('');
+  const [userFormNationality, setUserFormNationality] = useState('Brasil');
+  const [userFormReferral, setUserFormReferral] = useState('Instagram');
   const [userFormRefType, setUserFormRefType] = useState('Instagram');
   const [userFormRefWhatsApp, setUserFormRefWhatsApp] = useState('');
   const [userFormRefUserQuery, setUserFormRefUserQuery] = useState('');
@@ -1625,6 +2091,13 @@ USING (true);`;
       setEvents(evs); setRecords(recs); setProductModels(pms); setQuickReplies(qrs);
       setSales(sls); setSaleItems(sis); setFinancingPlans(fps); setFinancingPaymentsData(fpays);
       setEmailTemplates(emts);
+
+      // Delivery checklists (separate fetch so a missing table doesn't block the app)
+      try {
+        setDeliveryChecklists(await getDeliveryChecklists());
+      } catch (err) {
+        console.warn('[FastSheep] delivery_checklists table not found in Supabase.', err);
+      }
 
       // Check if category_id exists in serial_prefixes
       try {
@@ -1700,8 +2173,8 @@ USING (true);`;
     const leadNames = new Set(leads.map(l => l.name));
 
     const orphaned = events.filter(ev => {
-      // 💳 Cuota X/Y: CustomerName — orphaned if no matching active financing plan
-      if (ev.title.startsWith('💳 Cuota')) {
+      // Ã°ÂÂÂ³ Cuota X/Y: CustomerName Ã¢ÂÂ orphaned if no matching active financing plan
+      if (ev.title.startsWith('Ã°ÂÂÂ³ Cuota')) {
         const match = ev.title.match(/Cuota \d+\/(\d+):\s*(.+)/);
         if (!match) return true;
         const numInstallments = parseInt(match[1]);
@@ -1714,31 +2187,31 @@ USING (true);`;
           return cust ? `${cust.first_name} ${cust.last_name}` === custName : false;
         });
       }
-      // 🚲 Pago Alquiler: CustomerName — orphaned if customer no longer exists
-      if (ev.title.startsWith('🚲 Pago Alquiler:')) {
-        const custName = ev.title.replace('🚲 Pago Alquiler:', '').trim();
+      // Ã°ÂÂÂ² Pago Alquiler: CustomerName Ã¢ÂÂ orphaned if customer no longer exists
+      if (ev.title.startsWith('Ã°ÂÂÂ² Pago Alquiler:')) {
+        const custName = ev.title.replace('Ã°ÂÂÂ² Pago Alquiler:', '').trim();
         return !customerNames.has(custName);
       }
-      // [Devolución] BikeSerial - CustomerName — orphaned if rental no longer active
-      if (ev.title.startsWith('[Devolución]')) {
-        const match = ev.title.match(/\[Devolución\]\s*(.+?)\s*-\s*(.+)/);
+      // [DevoluciÃÂ³n] BikeSerial - CustomerName Ã¢ÂÂ orphaned if rental no longer active
+      if (ev.title.startsWith('[DevoluciÃÂ³n]')) {
+        const match = ev.title.match(/\[DevoluciÃÂ³n\]\s*(.+?)\s*-\s*(.+)/);
         if (!match) return false;
         const serial = match[1].trim();
         const custName = match[2].trim();
         return !rentals.some(r => {
-          if (r.status !== 'Activo' && r.status !== 'Devolución en Proceso') return false;
+          if (r.status !== 'Activo' && r.status !== 'DevoluciÃÂ³n en Proceso') return false;
           const bike = products.find(p => p.id === r.bike_id);
           if (!bike || bike.serial_number !== serial) return false;
           const cust = customers.find(c => c.id === r.customer_id);
           return cust ? `${cust.first_name} ${cust.last_name}` === custName : false;
         });
       }
-      // [Service] BikeSerial — orphaned if bike no longer exists
+      // [Service] BikeSerial Ã¢ÂÂ orphaned if bike no longer exists
       if (ev.title.startsWith('[Service]')) {
         const serial = ev.title.replace('[Service]', '').trim();
         return !productSerials.has(serial);
       }
-      // Seguimiento: LeadName — orphaned if lead no longer exists
+      // Seguimiento: LeadName Ã¢ÂÂ orphaned if lead no longer exists
       if (ev.title.startsWith('Seguimiento:')) {
         const leadName = ev.title.replace('Seguimiento:', '').trim();
         return !leadNames.has(leadName);
@@ -1779,7 +2252,7 @@ USING (true);`;
   // CATEGORY ID HELPERS (dynamic from Supabase UUIDs)
   // ----------------------------------------------------------
   const catBikeId = useMemo(() => categories.find(c => c.name_es === 'Bicicleta')?.id ?? '', [categories]);
-  const catBattId = useMemo(() => categories.find(c => c.name_es === 'Batería')?.id    ?? '', [categories]);
+  const catBattId = useMemo(() => categories.find(c => c.name_es === 'BaterÃÂ­a')?.id    ?? '', [categories]);
   const catLockId = useMemo(() => categories.find(c => c.name_es === 'Candado')?.id    ?? '', [categories]);
 
   // Single source of truth for "is this a generic/consolidated article?".
@@ -1797,7 +2270,7 @@ USING (true);`;
       const serial = ev.title.replace('[Service]', '').trim();
       const bike = products.find(p => p.serial_number === serial);
       if (bike) {
-        if (bike.maintenance_status === 'En Taller' || bike.status === 'Mantenimiento' || bike.maintenance_status === 'Al día') {
+        if (bike.maintenance_status === 'En Taller' || bike.status === 'Mantenimiento' || bike.maintenance_status === 'Al dÃÂ­a') {
           return 'Realizado';
         }
         return 'Pendiente';
@@ -1855,15 +2328,15 @@ USING (true);`;
       if (e.event_date === todayStr) {
         const isService = e.title.startsWith('[Service]');
         const msg = isService
-          ? (language === 'es' ? `¡Hoy es el service!: ${e.title}` : `Today is the service!: ${e.title}`)
-          : (language === 'es' ? `¡Hoy es el evento!: ${e.title}` : `Today is the event!: ${e.title}`);
+          ? (language === 'es' ? `ÃÂ¡Hoy es el service!: ${e.title}` : `Today is the service!: ${e.title}`)
+          : (language === 'es' ? `ÃÂ¡Hoy es el evento!: ${e.title}` : `Today is the event!: ${e.title}`);
         alerts.push({ id: `ev-today-${e.id}`, type: 'event', message: msg, priority: 'high', date: e.event_date });
       } else {
         const diff = Math.ceil((new Date(e.event_date).getTime() - today.getTime()) / 86400000);
         if (diff >= 0 && diff <= 7 && e.remind_one_week)
           alerts.push({ id: `ev-w-${e.id}`, type: 'event', message: `${language === 'es' ? 'Falta 1 semana para' : '1 week for'}: ${e.title}`, priority: 'normal', date: e.event_date });
         if (diff >= 0 && diff <= 1 && e.remind_one_day)
-          alerts.push({ id: `ev-d-${e.id}`, type: 'event', message: `¡${language === 'es' ? 'Urgente mañana' : 'Urgent tomorrow'}!: ${e.title}`, priority: 'high', date: e.event_date });
+          alerts.push({ id: `ev-d-${e.id}`, type: 'event', message: `ÃÂ¡${language === 'es' ? 'Urgente maÃÂ±ana' : 'Urgent tomorrow'}!: ${e.title}`, priority: 'high', date: e.event_date });
       }
     });
 
@@ -1875,7 +2348,7 @@ USING (true);`;
           alerts.push({
             id: `date-today-${p.id}`,
             type: 'maintenance',
-            message: language === 'es' ? `¡Hoy es el service de la e-bike ${p.serial_number}!` : `Today is the service for e-bike ${p.serial_number}!`,
+            message: language === 'es' ? `ÃÂ¡Hoy es el service de la e-bike ${p.serial_number}!` : `Today is the service for e-bike ${p.serial_number}!`,
             priority: 'high', date: p.next_service_date
           });
         } else {
@@ -1896,7 +2369,7 @@ USING (true);`;
         if (rem <= p.remind_service_odometer_threshold && rem > 0)
           alerts.push({ id: `km-${p.id}`, type: 'maintenance', message: `Service pronto: ${p.serial_number} (${rem} km)`, priority: 'normal' });
         else if (rem <= 0)
-          alerts.push({ id: `km-o-${p.id}`, type: 'maintenance', message: `¡Service excedido!: ${p.serial_number}`, priority: 'high' });
+          alerts.push({ id: `km-o-${p.id}`, type: 'maintenance', message: `ÃÂ¡Service excedido!: ${p.serial_number}`, priority: 'high' });
       }
     });
 
@@ -1930,7 +2403,7 @@ USING (true);`;
           id: `fin-today-${pay.id}`,
           type: 'financing',
           message: language === 'es' 
-            ? `¡Hoy vence la cuota ${pay.installment_number}/${plan?.num_installments || 1} de ${custName}${descSuffix}!` 
+            ? `ÃÂ¡Hoy vence la cuota ${pay.installment_number}/${plan?.num_installments || 1} de ${custName}${descSuffix}!` 
             : `Installment ${pay.installment_number}/${plan?.num_installments || 1} for ${custName}${descSuffix} is due today!`,
           priority: 'high', date: pay.due_date
         });
@@ -1939,8 +2412,8 @@ USING (true);`;
           id: `fin-overdue-${pay.id}`,
           type: 'financing',
           message: language === 'es'
-            ? `⚠️ ¡VENCIDA hace ${Math.abs(diffDays)} días!: Cuota ${pay.installment_number}/${plan?.num_installments || 1} de ${custName} (${pay.due_date})`
-            : `⚠️ OVERDUE by ${Math.abs(diffDays)} days!: Installment ${pay.installment_number}/${plan?.num_installments || 1} for ${custName} (${pay.due_date})`,
+            ? `Ã¢ÂÂ Ã¯Â¸Â ÃÂ¡VENCIDA hace ${Math.abs(diffDays)} dÃÂ­as!: Cuota ${pay.installment_number}/${plan?.num_installments || 1} de ${custName} (${pay.due_date})`
+            : `Ã¢ÂÂ Ã¯Â¸Â OVERDUE by ${Math.abs(diffDays)} days!: Installment ${pay.installment_number}/${plan?.num_installments || 1} for ${custName} (${pay.due_date})`,
           priority: 'high', date: pay.due_date
         });
       } else if (diffDays > 0 && diffDays <= 7) {
@@ -1948,7 +2421,7 @@ USING (true);`;
           id: `fin-soon-${pay.id}`,
           type: 'financing',
           message: language === 'es'
-            ? `Cuota ${pay.installment_number}/${plan?.num_installments || 1} de ${custName} vence en ${diffDays} días (${pay.due_date})`
+            ? `Cuota ${pay.installment_number}/${plan?.num_installments || 1} de ${custName} vence en ${diffDays} dÃÂ­as (${pay.due_date})`
             : `Installment ${pay.installment_number}/${plan?.num_installments || 1} for ${custName} is due in ${diffDays} days (${pay.due_date})`,
           priority: 'normal', date: pay.due_date
         });
@@ -2077,7 +2550,7 @@ USING (true);`;
         if (cat) {
           const nameEs = (cat.name_es || '').toLowerCase();
           const nameEn = (cat.name_en || '').toLowerCase();
-          const isAllowed = nameEs.includes('bici') || nameEs.includes('depó') || nameEs.includes('depo') || nameEs.includes('app') || nameEs.includes('deliver') ||
+          const isAllowed = nameEs.includes('bici') || nameEs.includes('depÃÂ³') || nameEs.includes('depo') || nameEs.includes('app') || nameEs.includes('deliver') ||
                             nameEn.includes('bike') || nameEn.includes('dept') || nameEn.includes('depo') || nameEn.includes('app') || nameEn.includes('deliver');
           if (!isAllowed) return;
         } else {
@@ -2154,7 +2627,7 @@ USING (true);`;
       if (r.deposit_amount > 0) {
         txs.push({
           id: `dep-in-${r.id}`, date: r.start_date, type: 'income', amount: r.deposit_amount,
-          description: `Depósito Recibido${bikeDesc}${custName}`, category: 'Depósito',
+          description: `DepÃÂ³sito Recibido${bikeDesc}${custName}`, category: 'DepÃÂ³sito',
           created_at: (r as any).created_at,
           productCategoryId: bike?.category_id,
           brand: bike?.brand || undefined,
@@ -2167,7 +2640,7 @@ USING (true);`;
       if (r.deposit_refunded !== null && r.deposit_refunded > 0) {
         txs.push({
           id: `dep-out-${r.id}`, date: r.end_date || r.start_date, type: 'expense', amount: r.deposit_refunded,
-          description: `Depósito Devuelto${bikeDesc}${custName}`, category: 'Depósito',
+          description: `DepÃÂ³sito Devuelto${bikeDesc}${custName}`, category: 'DepÃÂ³sito',
           created_at: (r as any).created_at ? new Date(new Date((r as any).created_at).getTime() + 1000).toISOString() : undefined,
           productCategoryId: bike?.category_id,
           brand: bike?.brand || undefined,
@@ -2421,7 +2894,7 @@ USING (true);`;
     if (balanceTxFilter === 'purchase_sale') {
       txs = txs.filter(tx => tx.category === 'Compra' || tx.category === 'Venta' || tx.category === 'Financiamiento');
     } else if (balanceTxFilter === 'rental_only') {
-      txs = txs.filter(tx => tx.category === 'Alquiler' || tx.category === 'Depósito' || tx.category === 'Delivery App');
+      txs = txs.filter(tx => tx.category === 'Alquiler' || tx.category === 'DepÃÂ³sito' || tx.category === 'Delivery App');
     } else if (balanceTxFilter === 'maintenance_only') {
       txs = txs.filter(tx => tx.category === 'Taller');
     } else if (balanceTxFilter === 'other_expenses') {
@@ -2458,16 +2931,16 @@ USING (true);`;
       return b.id.localeCompare(a.id);
     });
 
-    const totalIncome = txs.filter(t => t.type === 'income' && t.category !== 'Depósito').reduce((sum, t) => sum + t.amount, 0);
-    const totalExpense = txs.filter(t => t.type === 'expense' && t.category !== 'Depósito').reduce((sum, t) => sum + t.amount, 0);
-    const totalIncomeCash = txs.filter(t => t.type === 'income' && t.category !== 'Depósito' && t.received_via === 'efectivo').reduce((sum, t) => sum + t.amount, 0);
-    const totalIncomeTransfer = txs.filter(t => t.type === 'income' && t.category !== 'Depósito' && t.received_via === 'transferencia').reduce((sum, t) => sum + t.amount, 0);
+    const totalIncome = txs.filter(t => t.type === 'income' && t.category !== 'DepÃÂ³sito').reduce((sum, t) => sum + t.amount, 0);
+    const totalExpense = txs.filter(t => t.type === 'expense' && t.category !== 'DepÃÂ³sito').reduce((sum, t) => sum + t.amount, 0);
+    const totalIncomeCash = txs.filter(t => t.type === 'income' && t.category !== 'DepÃÂ³sito' && t.received_via === 'efectivo').reduce((sum, t) => sum + t.amount, 0);
+    const totalIncomeTransfer = txs.filter(t => t.type === 'income' && t.category !== 'DepÃÂ³sito' && t.received_via === 'transferencia').reduce((sum, t) => sum + t.amount, 0);
     
     let activeDeposits = 0;
     let activeDepositsCash = 0;
     let activeDepositsTransfer = 0;
     rentals.forEach(r => {
-      if (r.status === 'Activo' || r.status === 'Devolución en Proceso') {
+      if (r.status === 'Activo' || r.status === 'DevoluciÃÂ³n en Proceso') {
         activeDeposits += r.deposit_amount;
         if (r.deposit_received_via === 'transferencia') {
           activeDepositsTransfer += r.deposit_amount;
@@ -2485,7 +2958,7 @@ USING (true);`;
   // ----------------------------------------------------------
   const bi = useMemo(() => {
     const totalRentals = rentals.filter(r =>
-      (r.status === 'Activo' || r.status === 'Devolución en Proceso') &&
+      (r.status === 'Activo' || r.status === 'DevoluciÃÂ³n en Proceso') &&
       products.some(p => p.id === r.bike_id && p.category_id === catBikeId)
     ).length;
     
@@ -2505,7 +2978,7 @@ USING (true);`;
     const monthlyPayoutsEst = Math.round(currentMonthPayments + currentMonthAppEarnings);
     const availableBikesCount = products.filter(p => p.category_id === catBikeId && p.status === 'Disponible').length;
     const workshopCount = products.filter(p => p.status === 'Mantenimiento').length;
-    const announcedReturnsCount = rentals.filter(r => r.status === 'Devolución en Proceso').length;
+    const announcedReturnsCount = rentals.filter(r => r.status === 'DevoluciÃÂ³n en Proceso').length;
 
     // Nationality distribution
     const nationalityMap: Record<string, number> = {};
@@ -2518,6 +2991,11 @@ USING (true);`;
     // Dynamic seasonality from real rental data
     const monthCounts: Record<number, number> = {};
     rentals.forEach(r => {
+      if (!r.bike_id || !r.customer_id) return;
+      const bikeExists = products.some(p => p.id === r.bike_id);
+      const customerExists = customers.some(c => c.id === r.customer_id);
+      if (!bikeExists || !customerExists) return;
+
       const m = new Date(r.start_date).getMonth();
       monthCounts[m] = (monthCounts[m] || 0) + 1;
     });
@@ -2541,7 +3019,6 @@ USING (true);`;
   // ----------------------------------------------------------
   const [modalType,         setModalType]         = useState<string | null>(null);
   const [selectedProductId, setSelectedProductId] = useState<string | null>(null);
-  const [linkBikeSearchQuery, setLinkBikeSearchQuery] = useState('');
   const [selectedCondition, setSelectedCondition] = useState<'nuevo' | 'bueno' | 'regular' | 'para venta'>('bueno');
   const [activeStockMenuId, setActiveStockMenuId] = useState<string | null>(null);
 
@@ -2563,6 +3040,10 @@ USING (true);`;
   const [selectedEventId,   setSelectedEventId]   = useState<string | null>(null);
   const [selectedDayEventsDate, setSelectedDayEventsDate] = useState<string | null>(null);
   const [activeCustomerId,  setActiveCustomerId]  = useState<string | null>(null);
+  // When set, the customer profile shows this specific rental instead of the latest
+  // one (used when opening a profile from a bike's user history).
+  const [profileRentalId,   setProfileRentalId]   = useState<string | null>(null);
+  const [showBikeUsers,     setShowBikeUsers]      = useState(false);
   const [activeAccountId,   setActiveAccountId]   = useState<string | null>(null);
   const [showNotifications, setShowNotifications] = useState(false);
 
@@ -2576,7 +3057,7 @@ USING (true);`;
     price:         true,
     condition:     true,
     status:        true,
-    // Extra columns — hidden by default
+    // Extra columns Ã¢ÂÂ hidden by default
     cost:          false,
     frame_serial:  false,
     motor:         false,
@@ -2591,6 +3072,7 @@ USING (true);`;
   // Sold Tab filters & Column Visibility
   const [searchSold,           setSearchSold]           = useState('');
   const [balanceSearch,        setBalanceSearch]        = useState('');
+  const [backupRunning,        setBackupRunning]        = useState(false);
   const [filterSoldCategory,   setFilterSoldCategory]   = useState('all');
   const [showSoldColVisPicker, setShowSoldColVisPicker] = useState(false);
   const [soldVisibleCols,      setSoldVisibleCols]      = useState<Record<string, boolean>>({
@@ -2658,26 +3140,26 @@ USING (true);`;
     const desc = modDescriptionInput.trim();
     const date = modDateInput.trim();
     if (!desc || !date) {
-      showToast(language === 'es' ? 'Descripción y fecha obligatorias' : 'Description and date are required', 'error');
+      showToast(language === 'es' ? 'DescripciÃÂ³n y fecha obligatorias' : 'Description and date are required', 'error');
       return;
     }
 
     setModsLoading(true);
     try {
       await addBikeModification(selectedProductId, desc, date);
-      showToast(language === 'es' ? 'Modificación registrada correctamente.' : 'Modification logged successfully.', 'success');
+      showToast(language === 'es' ? 'ModificaciÃÂ³n registrada correctamente.' : 'Modification logged successfully.', 'success');
       setModDescriptionInput('');
       fetchModifications(selectedProductId);
     } catch (err) {
       console.error(err);
-      showToast(language === 'es' ? 'Error al registrar la modificación.' : 'Error logging modification.', 'error');
+      showToast(language === 'es' ? 'Error al registrar la modificaciÃÂ³n.' : 'Error logging modification.', 'error');
     } finally {
       setModsLoading(false);
     }
   };
 
   const handleDeleteModification = async (id: string) => {
-    if (!await asyncConfirm(language === 'es' ? '¿Seguro que quieres eliminar este registro?' : 'Are you sure you want to delete this record?')) return;
+    if (!await asyncConfirm(language === 'es' ? 'ÃÂ¿Seguro que quieres eliminar este registro?' : 'Are you sure you want to delete this record?')) return;
     try {
       await deleteBikeModification(id);
       showToast(language === 'es' ? 'Registro eliminado correctamente.' : 'Record deleted successfully.', 'success');
@@ -2701,7 +3183,7 @@ CREATE TABLE IF NOT EXISTS public.bike_modifications (
 -- 2. Habilitar Seguridad a Nivel de Fila (RLS)
 ALTER TABLE public.bike_modifications ENABLE ROW LEVEL SECURITY;
 
--- 3. Crear políticas para usuarios autenticados
+-- 3. Crear polÃÂ­ticas para usuarios autenticados
 DROP POLICY IF EXISTS "Allow authenticated users to read bike_modifications" ON public.bike_modifications;
 CREATE POLICY "Allow authenticated users to read bike_modifications" 
 ON public.bike_modifications FOR SELECT 
@@ -2722,14 +3204,14 @@ USING (true);`;
 
     navigator.clipboard.writeText(sqlText);
     setSqlModsCopied(true);
-    showToast(language === 'es' ? 'Código SQL de modificaciones copiado.' : 'Modifications SQL code copied.', 'success');
+    showToast(language === 'es' ? 'CÃÂ³digo SQL de modificaciones copiado.' : 'Modifications SQL code copied.', 'success');
     setTimeout(() => setSqlModsCopied(false), 3000);
   };
 
   // Initialize reportTheftItems when modal opens
   useEffect(() => {
     if (reportTheftOpen && reportTheftBikeId) {
-      const activeRental = rentals.find(r => r.bike_id === reportTheftBikeId && (r.status === 'Activo' || r.status === 'Devolución en Proceso'));
+      const activeRental = rentals.find(r => r.bike_id === reportTheftBikeId && (r.status === 'Activo' || r.status === 'DevoluciÃÂ³n en Proceso'));
       if (activeRental) {
         const associatedItems = rentalItems.filter(item => item.rental_id === activeRental.id);
         const initialSelected: Record<string, boolean> = {};
@@ -2746,7 +3228,7 @@ USING (true);`;
   // Location modal states
   const [locationsList, setLocationsList] = useState<string[]>(() => {
     const saved = localStorage.getItem('fast_sheep_locations');
-    return saved ? JSON.parse(saved) : ['Taller Dublin', 'Dublin Central Garage', 'Almacén Principal', 'Oficina'];
+    return saved ? JSON.parse(saved) : ['Taller Dublin', 'Dublin Central Garage', 'AlmacÃÂ©n Principal', 'Oficina'];
   });
   const [newLocationInput, setNewLocationInput] = useState('');
   const [selectedLocation, setSelectedLocation] = useState('');
@@ -2763,7 +3245,7 @@ USING (true);`;
   const [prodFormPrefixId,   setProdFormPrefixId]   = useState('');
 
   const [prodFormPricePaid,  setProdFormPricePaid]  = useState(1000);
-  const [prodFormAddBat,     setProdFormAddBat]     = useState(false);
+  const [prodFormAddVat,     setProdFormAddVat]     = useState(false);
   const [prodFormPriceSold,  setProdFormPriceSold]  = useState<number | null>(null);
   const [prodFormWeeklyRate, setProdFormWeeklyRate] = useState(50);
   const [prodFormDeposit,    setProdFormDeposit]    = useState(150);
@@ -3019,7 +3501,7 @@ USING (true);`;
   }, [products, filterCategory, searchStock]);
 
   const activeBikesModelCounts = useMemo(() => {
-    const activeRentals = rentals.filter(r => r.status === 'Activo' || r.status === 'Devolución en Proceso');
+    const activeRentals = rentals.filter(r => r.status === 'Activo' || r.status === 'DevoluciÃÂ³n en Proceso');
     const counts: Record<string, number> = {};
     activeRentals.forEach(r => {
       const bike = products.find(p => p.id === r.bike_id);
@@ -3047,7 +3529,7 @@ USING (true);`;
   
   const [spFormSupplierId, setSpFormSupplierId] = useState('');
   const [spFormName, setSpFormName] = useState('');
-  const [spFormCategory, setSpFormCategory] = useState<'Bicicleta' | 'Batería' | 'Repuesto' | 'Accesorio'>('Repuesto');
+  const [spFormCategory, setSpFormCategory] = useState<'Bicicleta' | 'BaterÃÂ­a' | 'Repuesto' | 'Accesorio'>('Repuesto');
   const [spFormCost, setSpFormCost] = useState<number | ''>('');
   const [spFormMoq, setSpFormMoq] = useState<number | ''>('');
   const [spFormDelivery, setSpFormDelivery] = useState<number | ''>('');
@@ -3069,91 +3551,6 @@ USING (true);`;
   // ----------------------------------------------------------
   const selectedBikeHistory = useMemo(() => {
     if (!selectedProductId) return [];
-    const bike = products.find(p => p.id === selectedProductId);
-    if (!bike) return [];
-
-    const extraEvents: any[] = [];
-
-    // Purchase event
-    if (bike.purchase_date) {
-      extraEvents.push({
-        id: `purchase-${bike.id}`,
-        date: bike.purchase_date,
-        type: 'purchase' as const,
-        description: language === 'es' ? 'Fecha de Compra de la Bicicleta' : 'Bike Purchase Date',
-        cost: bike.price_paid || undefined
-      });
-    }
-
-    // Arrival event
-    if (bike.arrival_date) {
-      extraEvents.push({
-        id: `arrival-${bike.id}`,
-        date: bike.arrival_date,
-        type: 'arrival' as const,
-        description: language === 'es' ? 'Fecha de Arribo / Llegada a la Flota' : 'Arrival Date to Fleet',
-        cost: undefined
-      });
-    }
-
-    // Assembly event
-    const assemblyDate = bike.custom_field_values?.assembly_date as string;
-    if (assemblyDate) {
-      extraEvents.push({
-        id: `assembly-${bike.id}`,
-        date: assemblyDate,
-        type: 'assembly' as const,
-        description: language === 'es' ? 'Fecha de Armado / Ensamblaje' : 'Assembly Date',
-        cost: undefined
-      });
-    }
-
-    // Sale event
-    if (bike.status === 'Vendida' && bike.sold_date) {
-      extraEvents.push({
-        id: `sale-${bike.id}`,
-        date: bike.sold_date,
-        type: 'sale' as const,
-        description: language === 'es' ? 'Fecha de Venta de la Bicicleta' : 'Bike Sale Date',
-        cost: bike.price_sold || undefined
-      });
-    }
-
-    // Bitácora Notes event
-    if (bike.notes && bike.notes.trim()) {
-      extraEvents.push({
-        id: `note-${bike.id}`,
-        date: bike.date_added ? bike.date_added.split('T')[0] : (bike.purchase_date || new Date().toISOString().split('T')[0]),
-        type: 'note' as const,
-        description: language === 'es' ? `Bitácora: ${bike.notes}` : `Log/Notes: ${bike.notes}`,
-        cost: undefined
-      });
-    }
-
-    // Current Lock Association
-    const currentLock = products.find(p => p.category_id === catLockId && p.custom_field_values?.associated_bike_id === bike.id);
-    if (currentLock) {
-      extraEvents.push({
-        id: `lock-${currentLock.id}`,
-        date: new Date().toISOString().split('T')[0],
-        type: 'lock_link' as const,
-        description: language === 'es'
-          ? `Candado Vinculado Actualmente — Código: ${currentLock.serial_number} (${currentLock.name})`
-          : `Currently Linked Lock — Code: ${currentLock.serial_number} (${currentLock.name})`,
-        cost: undefined
-      });
-    }
-
-    // Current Fleet Status
-    extraEvents.push({
-      id: `status-${bike.id}`,
-      date: new Date().toISOString().split('T')[0],
-      type: 'status_change' as const,
-      description: language === 'es'
-        ? `Estado Actual de la Bicicleta: ${bike.status} ${bike.maintenance_status === 'Requiere Service' ? '(Requiere Service)' : ''}`
-        : `Current Bike Status: ${bike.status} ${bike.maintenance_status === 'Requiere Service' ? '(Needs Service)' : ''}`,
-      cost: undefined
-    });
 
     // 1. Fetch maintenance records (services)
     const bikeRecords = records
@@ -3206,8 +3603,8 @@ USING (true);`;
           date: r.start_date,
           type: 'rental_start' as const,
           description: language === 'es' 
-            ? `Inicio de Alquiler — Kilometraje: ${r.odometer_start || 0} KM` 
-            : `Rental Started — Odometer: ${r.odometer_start || 0} KM`,
+            ? `Inicio de Alquiler Ã¢ÂÂ Kilometraje: ${r.odometer_start || 0} KM` 
+            : `Rental Started Ã¢ÂÂ Odometer: ${r.odometer_start || 0} KM`,
           customerName,
           cost: undefined
         });
@@ -3219,8 +3616,8 @@ USING (true);`;
             date: r.end_date,
             type: 'rental_end' as const,
             description: language === 'es' 
-              ? `Devolución de Alquiler — Kilometraje: ${r.odometer_end || 0} KM` 
-              : `Rental Returned — Odometer: ${r.odometer_end || 0} KM`,
+              ? `DevoluciÃÂ³n de Alquiler Ã¢ÂÂ Kilometraje: ${r.odometer_end || 0} KM` 
+              : `Rental Returned Ã¢ÂÂ Odometer: ${r.odometer_end || 0} KM`,
             customerName,
             cost: undefined
           });
@@ -3229,10 +3626,10 @@ USING (true);`;
         return events;
       });
 
-    const combined = [...extraEvents, ...bikeRecords, ...bikeExpenses, ...bikeRentals];
+    const combined = [...bikeRecords, ...bikeExpenses, ...bikeRentals];
     combined.sort((a, b) => b.date.localeCompare(a.date));
     return combined;
-  }, [selectedProductId, products, records, expenses, rentals, customers, language, catLockId]);
+  }, [selectedProductId, records, expenses, rentals, customers, language]);
 
   // ----------------------------------------------------------
   // MODAL OPENERS (initialize form state cleanly)
@@ -3245,10 +3642,10 @@ USING (true);`;
       : (prefixes.find(p => p.prefix === (catId === catBikeId ? 'B-' : catId === catBattId ? 'BAT-' : catId === catLockId ? 'L-' : ''))?.id ?? prefixes.find(p => p.prefix === 'B-')?.id ?? '');
     setProdFormCategory(catId);
     setProdFormPrefixId(prefId);
-    const batApplied = prod?.custom_field_values?.bat_applied === true;
-    setProdFormAddBat(batApplied);
-    // When BAT was applied, the input shows the base cost; price_paid already includes the tax.
-    setProdFormPricePaid(batApplied ? ((prod?.custom_field_values?.cost_base as number) ?? prod?.price_paid ?? 1000) : (prod?.price_paid ?? 1000));
+    const vatApplied = prod?.custom_field_values?.vat_applied === true;
+    setProdFormAddVat(vatApplied);
+    // When VAT was applied, the input shows the base cost; price_paid already includes the tax.
+    setProdFormPricePaid(vatApplied ? ((prod?.custom_field_values?.cost_base as number) ?? prod?.price_paid ?? 1000) : (prod?.price_paid ?? 1000));
     setProdFormPriceSold(prod?.price_sold ?? null);
     setProdFormWeeklyRate(prod?.suggested_weekly_rate ?? 50); setProdFormDeposit(prod?.suggested_deposit ?? 150);
     setProdFormNotes(prod?.notes ?? ''); setProdFormFrame(prod?.frame_serial ?? '');
@@ -3402,11 +3799,6 @@ USING (true);`;
   }, [products, records, events]);
 
   const openSoldModal = useCallback((prod: Product) => {
-    if (prod.category_id === catLockId && prod.custom_field_values?.associated_bike_id) {
-      alert(language === 'es' ? 'Desvincule primero antes de vender' : 'Please unlink before selling');
-      return;
-    }
-
     const suggestedPrice = prod.price_sold ?? (prod.price_paid ? Math.round(prod.price_paid * 1.5) : 500);
     setSoldFormPrice(suggestedPrice);
     setSoldFormDate(new Date().toISOString().split('T')[0]);
@@ -3421,43 +3813,35 @@ USING (true);`;
     setSoldCustomerPhone('');
     setSoldCustomerSearch('');
     setSoldEmailLang('es');
-    const linkedLock = products.find(p => p.category_id === catLockId && p.custom_field_values?.associated_bike_id === prod.id);
-    if (linkedLock) {
-      const lockPrice = linkedLock.price_sold ?? (linkedLock.price_paid ? Math.round(linkedLock.price_paid * 1.5) : 50);
-      setSoldProducts([prod, linkedLock]);
-      setSoldProductPrices({ [prod.id]: suggestedPrice, [linkedLock.id]: lockPrice });
-      setSoldFormPrice(suggestedPrice + lockPrice);
-    } else {
-      setSoldProducts([prod]);
-      setSoldProductPrices({ [prod.id]: suggestedPrice });
-    }
+    setSoldProducts([prod]);
+    setSoldProductPrices({ [prod.id]: suggestedPrice });
     const dist = prod.custom_field_values?.location_distribution as Record<string, number> | undefined;
-    const initialLoc = dist ? Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central' : (prod.custom_field_values?.location as string || 'Almacén Central');
+    const initialLoc = dist ? Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'AlmacÃÂ©n Central' : (prod.custom_field_values?.location as string || 'AlmacÃÂ©n Central');
     setSoldProductLocations({ [prod.id]: initialLoc });
     setSoldProductSearch('');
     setSoldSubmitting(false);
     setSoldReceivedVia('efectivo');
     setSelectedProductId(prod.id); setModalType('sold');
-  }, [products, language, catLockId, catBikeId]);
+  }, []);
 
   const handlePayInstallment = useCallback(async (prod: Product, receivedVia?: 'efectivo' | 'transferencia') => {
     try {
       // Find the sale item for this product
       const sItem = saleItems.find(si => si.product_id === prod.id);
       if (!sItem) {
-        showToast(language === 'es' ? 'No se encontró la venta para este producto.' : 'No sale found for this product.', 'error');
+        showToast(language === 'es' ? 'No se encontrÃÂ³ la venta para este producto.' : 'No sale found for this product.', 'error');
         return;
       }
       
       const sale = sales.find(sl => sl.id === sItem.sale_id);
       if (!sale) {
-        showToast(language === 'es' ? 'No se encontró la venta registrada.' : 'No registered sale found.', 'error');
+        showToast(language === 'es' ? 'No se encontrÃÂ³ la venta registrada.' : 'No registered sale found.', 'error');
         return;
       }
 
       const plan = financingPlans.find(fp => fp.sale_id === sale.id);
       if (!plan) {
-        showToast(language === 'es' ? 'No se encontró el plan de financiamiento.' : 'No financing plan found.', 'error');
+        showToast(language === 'es' ? 'No se encontrÃÂ³ el plan de financiamiento.' : 'No financing plan found.', 'error');
         return;
       }
 
@@ -3466,13 +3850,17 @@ USING (true);`;
 
       const nextPending = payments.find(p => p.status === 'Pendiente');
       if (!nextPending) {
-        showToast(language === 'es' ? 'Todas las cuotas de este plan ya están pagadas.' : 'All installments for this plan are already paid.', 'success');
+        showToast(language === 'es' ? 'Todas las cuotas de este plan ya estÃÂ¡n pagadas.' : 'All installments for this plan are already paid.', 'success');
         return;
       }
 
       let finalReceivedVia = receivedVia;
       if (!finalReceivedVia) {
-        const isCash = await asyncConfirm(language === 'es' ? '¿El pago de la cuota fue en EFECTIVO?\n\n(Aceptar = Efectivo / Cancelar = Transferencia)' : 'Was the installment paid in CASH?\n\n(OK = Cash / Cancel = Bank Transfer)');
+        const isCash = await asyncConfirm(language === 'es' ? 'ÃÂ¿El pago de la cuota fue en EFECTIVO?\
+\
+(Aceptar = Efectivo / Cancelar = Transferencia)' : 'Was the installment paid in CASH?\
+\
+(OK = Cash / Cancel = Bank Transfer)');
         finalReceivedVia = isCash ? 'efectivo' : 'transferencia';
       }
 
@@ -3482,7 +3870,7 @@ USING (true);`;
       // Find the calendar event corresponding to this cuota and mark it as 'Realizado'
       const cust = customers.find(c => c.id === sale.customer_id);
       const custName = cust ? `${cust.first_name} ${cust.last_name}` : 'Cliente';
-      const eventTitle = `💳 Cuota ${nextPending.installment_number}/${plan.num_installments}: ${custName}`;
+      const eventTitle = `Ã°ÂÂÂ³ Cuota ${nextPending.installment_number}/${plan.num_installments}: ${custName}`;
       const existingEvent = events.find(e => e.title === eventTitle || (e.title.includes(`Cuota ${nextPending.installment_number}/`) && e.title.includes(custName)));
       if (existingEvent) {
         await upsertEvent({
@@ -3516,7 +3904,7 @@ USING (true);`;
           sendFinancingCompletedEmail(cust, sale.email_language || 'es', emailTemplates);
         }
 
-        showToast(language === 'es' ? '🎉 ¡Plan de financiamiento pagado al 100%! El estado de los productos cambió a Vendido.' : '🎉 Financing plan 100% paid! Products changed to Sold.', 'success');
+        showToast(language === 'es' ? 'Ã°ÂÂÂ ÃÂ¡Plan de financiamiento pagado al 100%! El estado de los productos cambiÃÂ³ a Vendido.' : 'Ã°ÂÂÂ Financing plan 100% paid! Products changed to Sold.', 'success');
       } else {
         // Find if there is a next pending payment and create a new calendar event for it
         const remainingPending = payments.filter(p => p.id !== nextPending.id && p.status === 'Pendiente');
@@ -3531,8 +3919,8 @@ USING (true);`;
 
           const reminderEvent = {
             id: crypto.randomUUID(),
-            title: `💳 Cuota ${nextNext.installment_number}/${plan.num_installments}: ${custName}`,
-            description: `Vencimiento de la cuota ${nextNext.installment_number} del financiamiento por la compra de: ${bikeSerials}. Monto: €${nextNext.amount}.`,
+            title: `Ã°ÂÂÂ³ Cuota ${nextNext.installment_number}/${plan.num_installments}: ${custName}`,
+            description: `Vencimiento de la cuota ${nextNext.installment_number} del financiamiento por la compra de: ${bikeSerials}. Monto: Ã¢ÂÂ¬${nextNext.amount}.`,
             event_date: nextNext.due_date,
             remind_one_week: true,
             remind_one_day: true,
@@ -3541,7 +3929,7 @@ USING (true);`;
           await upsertEvent(reminderEvent);
         }
         
-        showToast(language === 'es' ? `Cuota ${nextPending.installment_number} cobrada con éxito.` : `Installment ${nextPending.installment_number} marked as paid.`, 'success');
+        showToast(language === 'es' ? `Cuota ${nextPending.installment_number} cobrada con ÃÂ©xito.` : `Installment ${nextPending.installment_number} marked as paid.`, 'success');
       }
 
       triggerReload();
@@ -3616,7 +4004,6 @@ USING (true);`;
   const [wizGigAccountId, setWizGigAccountId] = useState<string | null>(null);
   const [wizBatteryIds,  setWizBatteryIds]  = useState<string[]>([]);
   const [wizLockId,      setWizLockId]      = useState('');
-  const [wizKeepAssociated, setWizKeepAssociated] = useState(false);
   const [wizFirstName,   setWizFirstName]   = useState('');
   const [wizLastName,    setWizLastName]    = useState('');
   const [wizCustomerCode, setWizCustomerCode] = useState('');
@@ -3644,15 +4031,16 @@ USING (true);`;
   const [wizRatePaymentMethod, setWizRatePaymentMethod] = useState<'efectivo' | 'transferencia'>('efectivo');
   const [wizDepositPaymentMethod, setWizDepositPaymentMethod] = useState<'efectivo' | 'transferencia'>('efectivo');
   const [wizHasKit,      setWizHasKit]      = useState(true);
-  const [wizKitDetails,  setWizKitDetails]  = useState('Casco, Soporte móvil, Cargador rápido');
+  const [wizKitDetails,  setWizKitDetails]  = useState('Casco, Soporte mÃÂ³vil, Cargador rÃÂ¡pido');
   const [wizKitProductIds, setWizKitProductIds] = useState<string[]>([]);
   const [kitSearchModalOpen, setKitSearchModalOpen] = useState(false);
   const [kitSearchQuery, setKitSearchQuery] = useState('');
+  const [linkBikeSearch, setLinkBikeSearch] = useState('');
   // Generic Stock addition/removal states
   const [addGenStockModalOpen, setAddGenStockModalOpen] = useState(false);
   const [removeGenStockModalOpen, setRemoveGenStockModalOpen] = useState(false);
   const [genStockQty, setGenStockQty] = useState(1);
-  const [genStockLocation, setGenStockLocation] = useState('Almacén Central');
+  const [genStockLocation, setGenStockLocation] = useState('AlmacÃÂ©n Central');
   const [genStockCost, setGenStockCost] = useState(0);
   const [menuCoords, setMenuCoords] = useState<{ top: number; left: number; width: number; height: number } | null>(null);
   const activeStockMenuProduct = useMemo(() => {
@@ -3711,7 +4099,7 @@ USING (true);`;
   const [quickAddEmail, setQuickAddEmail] = useState('');
   const [quickAddNationality, setQuickAddNationality] = useState('Brasil');
   const [quickAddNotes, setQuickAddNotes] = useState('');
-  const [quickAddSource, setQuickAddSource] = useState<'wizard' | 'edit'>('wizard');
+  const [quickAddSource, setQuickAddSource] = useState<'wizard' | 'edit' | 'customers'>('wizard');
 
   // ----------------------------------------------------------
   // CONDITIONAL REFERRAL LOGIC
@@ -3858,42 +4246,7 @@ USING (true);`;
     }
   };
 
-  // Conditional Referral UI States (User Form Modal)
-  useEffect(() => {
-    const val = userFormReferral || '';
-    if (val === 'Instagram') {
-      setUserFormRefType('Instagram');
-    } else if (val === 'Web') {
-      setUserFormRefType('Web');
-    } else if (val === 'Sin referido') {
-      setUserFormRefType('Sin referido');
-    } else if (val.startsWith('WhatsApp Group:')) {
-      setUserFormRefType('WhatsApp Group');
-      setUserFormRefWhatsApp(val.slice('WhatsApp Group:'.length).trim());
-    } else if (val.startsWith('Usuario:')) {
-      setUserFormRefType('Usuario');
-      const userStr = val.slice('Usuario:'.length).trim();
-      setUserFormRefUserQuery(userStr);
-      const foundCust = customers.find(c => `${c.first_name} ${c.last_name} (${c.customer_code})`.toLowerCase() === userStr.toLowerCase() || `${c.first_name} ${c.last_name}`.toLowerCase() === userStr.toLowerCase());
-      if (foundCust) {
-        setUserFormRefUserSelected(foundCust);
-      }
-    } else if (val.startsWith('Otro:')) {
-      setUserFormRefType('Otro');
-      setUserFormRefOther(val.slice('Otro:'.length).trim());
-    } else if (val) {
-      setUserFormRefType('Otro');
-      setUserFormRefOther(val);
-    } else {
-      setUserFormRefType('');
-      setUserFormRefWhatsApp('');
-      setUserFormRefUserQuery('');
-      setUserFormRefUserSelected(null);
-      setUserFormRefOther('');
-    }
-  }, [userFormReferral, customers]);
-
-  const handleUserRefTypeChange = (type: string) => {
+  const handleUserFormRefTypeChange = (type: string) => {
     setUserFormRefType(type);
     if (type === 'Instagram') {
       setUserFormReferral('Instagram');
@@ -3912,17 +4265,17 @@ USING (true);`;
     }
   };
 
-  const handleUserRefWhatsAppChange = (val: string) => {
+  const handleUserFormRefWhatsAppChange = (val: string) => {
     setUserFormRefWhatsApp(val);
     setUserFormReferral(`WhatsApp Group: ${val}`);
   };
 
-  const handleUserRefOtherChange = (val: string) => {
+  const handleUserFormRefOtherChange = (val: string) => {
     setUserFormRefOther(val);
     setUserFormReferral(`Otro: ${val}`);
   };
 
-  const handleUserRefUserQueryChange = (val: string) => {
+  const handleUserFormRefUserQueryChange = (val: string) => {
     setUserFormRefUserQuery(val);
     setUserFormReferral(`Usuario: ${val}`);
     if (!val) {
@@ -3948,18 +4301,18 @@ USING (true);`;
         nationality: quickAddNationality,
         notes: quickAddNotes.trim(),
         id_document_url: '',
-        referral_source: 'Creado Rápido / Quick Add',
+        referral_source: 'Creado RÃÂ¡pido / Quick Add',
         created_at: new Date().toISOString()
       };
       await upsertCustomer(newRider);
-      showToast(language === 'es' ? `Usuario ${newRider.first_name} creado (Código: ${finalCode}).` : `User ${newRider.first_name} created.`);
+      showToast(language === 'es' ? `Usuario ${newRider.first_name} creado (CÃÂ³digo: ${finalCode}).` : `User ${newRider.first_name} created.`);
       
       const displayName = `${newRider.first_name}${newRider.last_name ? ' ' + newRider.last_name : ''} (${finalCode})`;
       if (quickAddSource === 'wizard') {
         setWizRefUserQuery(displayName);
         setWizRefUserSelected(newRider);
         setWizReferral(`Usuario: ${displayName}`);
-      } else {
+      } else if (quickAddSource === 'edit') {
         setEditRefUserQuery(displayName);
         setEditRefUserSelected(newRider);
         setEditReferral(`Usuario: ${displayName}`);
@@ -3987,6 +4340,9 @@ USING (true);`;
   const [wizContractMode, setWizContractMode] = useState<'digital' | 'physical' | null>(null);
   const [wizPhysicalContractFiles, setWizPhysicalContractFiles] = useState<File[]>([]);
   const [wizPhysicalContractPreviews, setWizPhysicalContractPreviews] = useState<string[]>([]);
+  const [wizSendDeliveryChecklist, setWizSendDeliveryChecklist] = useState(true);
+  const [wizInternalChecklist, setWizInternalChecklist] = useState<InternalChecklistValue>(emptyInternalChecklist());
+  const [wizShowInternalChecklist, setWizShowInternalChecklist] = useState(false);
   const [wizUploadingEvidence, setWizUploadingEvidence] = useState(false);
   const [wizInstagramFiles, setWizInstagramFiles] = useState<File[]>([]);
   const [wizInstagramPreviews, setWizInstagramPreviews] = useState<string[]>([]);
@@ -4080,7 +4436,7 @@ USING (true);`;
     if (!lastRental) return;
 
     const confirmMsg = language === 'es' 
-      ? '¿Estás seguro de que deseas eliminar esta foto de estado?' 
+      ? 'ÃÂ¿EstÃÂ¡s seguro de que deseas eliminar esta foto de estado?' 
       : 'Are you sure you want to delete this condition photo?';
     
     if (!await asyncConfirm(confirmMsg)) return;
@@ -4137,7 +4493,7 @@ USING (true);`;
     if (!lastRental) return;
 
     const confirmMsg = language === 'es' 
-      ? '¿Estás seguro de que deseas eliminar esta foto de Instagram?' 
+      ? 'ÃÂ¿EstÃÂ¡s seguro de que deseas eliminar esta foto de Instagram?' 
       : 'Are you sure you want to delete this Instagram photo?';
     
     if (!await asyncConfirm(confirmMsg)) return;
@@ -4163,8 +4519,8 @@ USING (true);`;
     const cleanPhone = phone.replace(/\D/g, '');
     const template = localStorage.getItem('default_wa_template') || 
       (language === 'es' 
-        ? 'Hola {nombre}, te contacto de The Fast Sheep 🚴' 
-        : 'Hi {nombre}, reaching out from The Fast Sheep 🚴');
+        ? 'Hola {nombre}, te contacto de The Fast Sheep Ã°ÂÂÂ´' 
+        : 'Hi {nombre}, reaching out from The Fast Sheep Ã°ÂÂÂ´');
     
     const filledMessage = template
       .replace(/{nombre}/gi, name)
@@ -4186,8 +4542,8 @@ USING (true);`;
     localStorage.setItem('default_wa_template', templateText);
     showToast(
       language === 'es' 
-        ? '💬 ¡Plantilla predeterminada guardada!' 
-        : '💬 Default template saved!', 
+        ? 'Ã°ÂÂÂ¬ ÃÂ¡Plantilla predeterminada guardada!' 
+        : 'Ã°ÂÂÂ¬ Default template saved!', 
       'success'
     );
   };
@@ -4238,12 +4594,6 @@ USING (true);`;
       setWizDeposit(bike.suggested_deposit ?? 150); 
       setWizOdometer(bike.odometer ?? '');
     }
-    const linkedLock = products.find(p => p.category_id === catLockId && p.custom_field_values?.associated_bike_id === id);
-    if (linkedLock) {
-      setWizLockId(linkedLock.id);
-    } else {
-      setWizLockId('');
-    }
   };
 
   const handleWizBatteryChange = (id: string) => {
@@ -4254,7 +4604,7 @@ USING (true);`;
 
   const handleConfirmRental = async () => {
     if (!wizBikeId || !wizFirstName || !wizLastName) {
-      showToast('Falta información requerida (Bike, Nombre).', 'error'); return;
+      showToast('Falta informaciÃÂ³n requerida (Bike, Nombre).', 'error'); return;
     }
     try {
       setWizUploadingEvidence(true);
@@ -4346,9 +4696,9 @@ USING (true);`;
         condition_photos: conditionPhotoUrls,
         instagram_photos: instagramPhotoUrls,
         has_kit: wizHasKit,
-        kit_details: wizHasKit && wizKitProductIds.length > 0
-          ? wizKitProductIds.map(id => { const p = products.find(pr => pr.id === id); return p ? `${p.serial_number} (${p.name})` : ''; }).filter(Boolean).join(', ')
-          : wizKitDetails,
+        // Kit items are tracked as rental_items and listed on the card from there; kit_details is
+        // reserved for free-text notes only, to avoid duplicating the item list.
+        kit_details: wizKitDetails,
         deposit_refunded: null, damage_report: null, created_at: new Date().toISOString(),
         deposit_received_via: wizDepositPaymentMethod,
       };
@@ -4368,8 +4718,8 @@ USING (true);`;
 
         const rentalReminderEvent = {
           id: crypto.randomUUID(),
-          title: `🚲 Pago Alquiler: ${rider.first_name} ${rider.last_name}`,
-          description: `Mensualidad del alquiler de la bicicleta: ${bikeProduct?.name || 'E-Bike'} (${bikeProduct?.serial_number || 'S/N'}). Monto: €${wizRateType === 'mensual' ? wizRate : Math.round(wizRate * 4)}.`,
+          title: `Ã°ÂÂÂ² Pago Alquiler: ${rider.first_name} ${rider.last_name}`,
+          description: `Mensualidad del alquiler de la bicicleta: ${bikeProduct?.name || 'E-Bike'} (${bikeProduct?.serial_number || 'S/N'}). Monto: Ã¢ÂÂ¬${wizRateType === 'mensual' ? wizRate : Math.round(wizRate * 4)}.`,
           event_date: formattedFirstInstallmentDate,
           remind_one_week: true,
           remind_one_day: true,
@@ -4386,44 +4736,21 @@ USING (true);`;
         if (battProduct) updates.push(upsertProduct({ ...battProduct, status: 'Rentada' }));
       });
       const lockProduct = products.find(p => p.id === wizLockId);
-      if (lockProduct) {
-        updates.push(upsertProduct({
-          ...lockProduct,
-          status: 'Rentada',
-          custom_field_values: {
-            ...lockProduct.custom_field_values,
-            associated_bike_id: wizBikeId,
-            keep_associated: wizKeepAssociated
-          }
-        }));
-      }
-      // Update kit product statuses (handle generic products by splitting 1 unit off)
+      if (lockProduct) updates.push(upsertProduct({ ...lockProduct, status: 'Rentada' }));
+      // Update kit product statuses.
+      // - Consolidated/generic items (those carrying a location_distribution) are NOT split or
+      //   decremented: a single record always represents the full stock, and each rented unit is
+      //   tracked purely via its rental_item. The record stays 'Disponible' while units remain.
+      // - Single-unit items flip to 'Rentada' as usual.
       const resolvedKitIds: string[] = [];
       for (const kitId of wizKitProductIds) {
         const kitProduct = products.find(p => p.id === kitId);
         if (!kitProduct) continue;
         const dist = kitProduct.custom_field_values?.location_distribution as Record<string, number> | undefined;
         const totalQty = dist ? Object.values(dist).reduce((a, b) => a + b, 0) : 0;
-        if (dist && totalQty > 1) {
-          const splitId = crypto.randomUUID();
-          const mainLoc = Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central';
-          updates.push(upsertProduct({
-            ...kitProduct,
-            id: splitId,
-            status: 'Rentada',
-            custom_field_values: { ...kitProduct.custom_field_values, location: mainLoc, location_distribution: undefined },
-          }));
-          const updatedDist = { ...dist };
-          const locToDecrement = Object.keys(updatedDist).find(k => updatedDist[k] > 0) || mainLoc;
-          updatedDist[locToDecrement] = (updatedDist[locToDecrement] || 1) - 1;
-          Object.keys(updatedDist).forEach(k => { if (updatedDist[k] <= 0) delete updatedDist[k]; });
-          const newTotal = Object.values(updatedDist).reduce((a, b) => a + b, 0);
-          if (newTotal <= 0) {
-            updates.push(upsertProduct({ ...kitProduct, status: 'Rentada', custom_field_values: { ...kitProduct.custom_field_values, location_distribution: undefined } }));
-          } else {
-            updates.push(upsertProduct({ ...kitProduct, custom_field_values: { ...kitProduct.custom_field_values, location_distribution: updatedDist } }));
-          }
-          resolvedKitIds.push(splitId);
+        if (dist && totalQty >= 1) {
+          // Consolidated: reference it via rental_item only; do not mutate the product.
+          resolvedKitIds.push(kitId);
         } else {
           updates.push(upsertProduct({ ...kitProduct, status: 'Rentada' }));
           resolvedKitIds.push(kitId);
@@ -4465,16 +4792,56 @@ USING (true);`;
 
           // Trigger App Account Assigned email
           const platformName = platforms.find(p => p.id === gigAcc.platform_id)?.name || 'Plataforma';
-          sendAppAccountAssignedEmail(rider, platformName, gigAcc.username || gigAcc.platform_account_number || '', gigAcc.password || '—', gigAcc.bank_details || '—', wizEmailLang, emailTemplates);
+          sendAppAccountAssignedEmail(rider, platformName, gigAcc.username || gigAcc.platform_account_number || '', gigAcc.password || 'Ã¢ÂÂ', gigAcc.bank_details || 'Ã¢ÂÂ', wizEmailLang, emailTemplates);
         }
       }
 
       // Show signing link if digital contract
       if (wizContractMode === 'digital' && wizEmail) {
         const signUrl = `${window.location.origin}${window.location.pathname}?firmar=${newRentId}`;
-        showToast(`📋 Enlace de firma: ${signUrl}`, 'success');
+        showToast(`Ã°ÂÂÂ Enlace de firma: ${signUrl}`, 'success');
         // Copy to clipboard
         try { await navigator.clipboard.writeText(signUrl); } catch { /* ignore */ }
+      }
+
+      // Create & send the customer delivery checklist (link emailed to the rider)
+      if (wizSendDeliveryChecklist && wizEmail) {
+        try {
+          const checklist = await createDeliveryChecklist({
+            rental_id: newRentId,
+            audience: 'customer',
+            customer_name: `${rider.first_name} ${rider.last_name}`.trim(),
+            customer_email: wizEmail,
+            email_lang: wizEmailLang,
+            bike_model: bikeProduct?.name ?? '',
+            bike_serial: bikeProduct?.serial_number ?? '',
+            delivery_date: new Date().toISOString().split('T')[0],
+          });
+          const checklistUrl = `${window.location.origin}${window.location.pathname}?checklist=${checklist.id}`;
+          sendDeliveryChecklistInviteEmail(checklist, checklistUrl, wizEmailLang);
+          showToast(`Ã¢ÂÂ
+ ${language === 'es' ? 'Checklist enviada' : 'Checklist sent'}: ${checklistUrl}`, 'success');
+          try { await navigator.clipboard.writeText(checklistUrl); } catch { /* ignore */ }
+        } catch (err) {
+          console.error('Failed to create/send delivery checklist:', err);
+          showToast(language === 'es' ? 'No se pudo enviar la checklist de entrega.' : 'Could not send the delivery checklist.', 'error');
+        }
+      }
+
+      // Create the internal technical inspection checklist (operator-filled).
+      // Always created so it is available in the rider profile, even if completed later.
+      try {
+        await persistInternalChecklist({
+          existingId: null,
+          rentalId: newRentId,
+          customerName: `${rider.first_name} ${rider.last_name}`.trim(),
+          bikeModel: bikeProduct?.name ?? '',
+          bikeSerial: bikeProduct?.serial_number ?? '',
+          deliveryDate: new Date().toISOString().split('T')[0],
+          value: wizInternalChecklist,
+        });
+      } catch (err) {
+        console.error('Failed to create internal checklist:', err);
       }
 
       // Reset wizard
@@ -4488,9 +4855,11 @@ USING (true);`;
       setWizInstagramFiles([]); setWizInstagramPreviews([]);
       setWizIdDocFile(null); setWizIdDocPreview('');
       setWizContractMode(null); setWizPhysicalContractFiles([]); setWizPhysicalContractPreviews([]);
+      setWizSendDeliveryChecklist(true);
+      setWizInternalChecklist(emptyInternalChecklist()); setWizShowInternalChecklist(false);
       setWizUploadingEvidence(false);
       setWizardStep(1); triggerReload(); setCurrentTab('rental_wizard'); setShowRentalWizard(false);
-      showToast('¡Alquiler registrado exitosamente!', 'success');
+      showToast('ÃÂ¡Alquiler registrado exitosamente!', 'success');
     } catch (err) {
       setWizUploadingEvidence(false);
       showToast('Error al registrar el alquiler. Intenta de nuevo.', 'error');
@@ -4668,10 +5037,233 @@ USING (true);`;
       setSignSuccess(true);
     } catch (err) {
       console.error('Signature upload failed:', err);
-      alert('Error al guardar la firma. Inténtalo de nuevo.');
+      alert('Error al guardar la firma. IntÃÂ©ntalo de nuevo.');
     }
     setSignSubmitting(false);
   };
+
+  // ============================================================
+  // PUBLIC DELIVERY CHECKLIST PAGE (detect ?checklist=CHECKLIST_ID)
+  // ============================================================
+  const checklistId = useMemo(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('checklist');
+  }, []);
+
+  const checklistCanvasRef = useRef<HTMLCanvasElement>(null);
+  const [checklistIsDrawing, setChecklistIsDrawing] = useState(false);
+  const [checklistHasSignature, setChecklistHasSignature] = useState(false);
+  const [checklistData, setChecklistData] = useState<DeliveryChecklist | null>(null);
+  const [checklistLoading, setChecklistLoading] = useState(true);
+  const [checklistSuccess, setChecklistSuccess] = useState(false);
+  const [checklistSubmitting, setChecklistSubmitting] = useState(false);
+  const [checklistItems, setChecklistItems] = useState<Record<string, boolean>>({});
+  const [checklistBattery, setChecklistBattery] = useState('');
+
+  useEffect(() => {
+    if (!checklistId) return;
+    (async () => {
+      try {
+        const cl = await getDeliveryChecklist(checklistId);
+        setChecklistData(cl);
+      } catch { /* ignore */ }
+      setChecklistLoading(false);
+    })();
+  }, [checklistId]);
+
+  const startChecklistSign = (e: React.TouchEvent<HTMLCanvasElement> | React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = checklistCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    setChecklistIsDrawing(true);
+    setChecklistHasSignature(true);
+    const { x, y } = getCanvasPoint(canvas, e);
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+  };
+
+  const drawChecklistSign = (e: React.TouchEvent<HTMLCanvasElement> | React.MouseEvent<HTMLCanvasElement>) => {
+    if (!checklistIsDrawing) return;
+    const canvas = checklistCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const { x, y } = getCanvasPoint(canvas, e);
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#10b981';
+    ctx.lineTo(x, y);
+    ctx.stroke();
+  };
+
+  const stopChecklistSign = () => setChecklistIsDrawing(false);
+
+  const clearChecklistSign = () => {
+    const canvas = checklistCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    setChecklistHasSignature(false);
+  };
+
+  const allChecklistItemsChecked = DELIVERY_CHECKLIST_CHECKBOX_KEYS.every(k => checklistItems[k]);
+
+  const submitChecklist = async () => {
+    const canvas = checklistCanvasRef.current;
+    if (!canvas || !checklistData) return;
+    if (!allChecklistItemsChecked) {
+      alert('Please tick every box to confirm your acceptance.');
+      return;
+    }
+    if (!checklistHasSignature) {
+      alert('Please sign before submitting.');
+      return;
+    }
+    setChecklistSubmitting(true);
+    try {
+      const dataUrl = canvas.toDataURL('image/png');
+      const signatureUrl = await uploadChecklistSignature(checklistData.id, dataUrl);
+      const payload = { items: checklistItems, battery_level: checklistBattery, signature_url: signatureUrl };
+      const ok = await submitDeliveryChecklist(checklistData.id, payload);
+      if (!ok) {
+        // Row was no longer 'pending' (already submitted) Ã¢ÂÂ do not re-send.
+        setChecklistData({ ...checklistData, status: 'completed' });
+        setChecklistSubmitting(false);
+        return;
+      }
+      sendDeliveryChecklistCopyEmail(checklistData, payload, checklistData.email_lang);
+      setChecklistSuccess(true);
+    } catch (err) {
+      console.error('Checklist submit failed:', err);
+      alert('Error submitting the checklist. Please try again.');
+    }
+    setChecklistSubmitting(false);
+  };
+
+  // Render delivery checklist page if ?checklist= is present (no auth required).
+  // The checklist document is always in English (matches the PDF model).
+  if (checklistId) {
+    return (
+      <div className="sign-page">
+        <div className="sign-page-card">
+          <div className="sign-logo">
+            <p style={{ fontSize: '28px', marginBottom: '4px' }}>Ã°ÂÂÂ</p>
+            <h2>The Fast Sheep</h2>
+            <p style={{ fontSize: '12px', color: 'var(--text-muted)' }}>E-Bike Delivery Checklist</p>
+            <p style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Customer Acknowledgement &amp; Liability Waiver</p>
+          </div>
+
+          {checklistLoading ? (
+            <div style={{ textAlign: 'center', padding: '40px' }}>
+              <p style={{ color: 'var(--text-muted)' }}>Ã¢ÂÂ³ Loading checklist...</p>
+            </div>
+          ) : !checklistData ? (
+            <div style={{ textAlign: 'center', padding: '40px' }}>
+              <p style={{ fontSize: '48px', marginBottom: '12px' }}>Ã¢ÂÂ</p>
+              <h3 style={{ marginBottom: '8px' }}>Checklist not found</h3>
+              <p style={{ color: 'var(--text-muted)', fontSize: '13px' }}>This link is invalid or has expired.</p>
+            </div>
+          ) : checklistSuccess || checklistData.status === 'completed' ? (
+            <div className="sign-success">
+              <span className="check-icon">Ã¢ÂÂ
+</span>
+              <h3>Checklist submitted successfully!</h3>
+              <p>Thank you, {checklistData.customer_name}. Your acceptance has been registered and a copy has been emailed to you.</p>
+              <p style={{ marginTop: '12px', fontSize: '12px', color: 'var(--text-muted)' }}>This form can no longer be submitted. You can close this window.</p>
+            </div>
+          ) : (
+            <>
+              <div className="contract-details">
+                {[
+                  ['E-Bike Model', checklistData.bike_model || 'Ã¢ÂÂ'],
+                  ['E-Bike Serial Number', checklistData.bike_serial || 'Ã¢ÂÂ'],
+                  ['Date', checklistData.delivery_date],
+                  ['Customer Name', checklistData.customer_name],
+                ].map(([label, val]) => (
+                  <div key={label} className="detail-row">
+                    <span className="detail-label">{label}</span>
+                    <span className="detail-value">{val}</span>
+                  </div>
+                ))}
+              </div>
+
+              <div className="checklist-field">
+                <label htmlFor="battery-level">Ã°ÂÂÂ Battery Charge Level</label>
+                <input
+                  id="battery-level"
+                  type="text"
+                  inputMode="numeric"
+                  placeholder="e.g. 100%"
+                  value={checklistBattery}
+                  onChange={(e) => setChecklistBattery(e.target.value)}
+                />
+              </div>
+
+              {DELIVERY_CHECKLIST_GROUPS.map(group => (
+                <div key={group.key} className="checklist-group">
+                  <p className="checklist-group-title">{group.title}</p>
+                  {group.kind === 'checkbox'
+                    ? group.items.map(item => (
+                        <label key={item.key} className={`checklist-item ${checklistItems[item.key] ? 'checked' : ''}`}>
+                          <input
+                            type="checkbox"
+                            checked={!!checklistItems[item.key]}
+                            onChange={(e) => setChecklistItems(prev => ({ ...prev, [item.key]: e.target.checked }))}
+                          />
+                          <span>{item.text}</span>
+                        </label>
+                      ))
+                    : group.items.map(item => (
+                        <p key={item.key} className="checklist-declaration">{item.text}</p>
+                      ))}
+                </div>
+              ))}
+
+              <p className="checklist-signing-note">
+                By signing below, the customer confirms acceptance of all the aforementioned conditions and declarations.
+              </p>
+
+              <div className="sign-canvas-container">
+                <label>Ã¢ÂÂÃ¯Â¸Â Sign here (use your finger or mouse):</label>
+                <canvas
+                  ref={checklistCanvasRef}
+                  width={480}
+                  height={160}
+                  onMouseDown={startChecklistSign}
+                  onMouseMove={drawChecklistSign}
+                  onMouseUp={stopChecklistSign}
+                  onMouseLeave={stopChecklistSign}
+                  onTouchStart={startChecklistSign}
+                  onTouchMove={drawChecklistSign}
+                  onTouchEnd={stopChecklistSign}
+                />
+              </div>
+
+              {!allChecklistItemsChecked && (
+                <p style={{ fontSize: '12px', color: 'var(--text-muted)', textAlign: 'center', margin: '4px 0 0' }}>
+                  Tick all boxes and sign to enable submission.
+                </p>
+              )}
+              <div className="sign-actions">
+                <button className="btn-secondary" style={{ flex: 1 }} onClick={clearChecklistSign}>Ã°ÂÂÂÃ¯Â¸Â Clear</button>
+                <button
+                  className="btn-primary"
+                  style={{ flex: 2 }}
+                  disabled={checklistSubmitting || !allChecklistItemsChecked || !checklistHasSignature}
+                  onClick={submitChecklist}
+                >
+                  {checklistSubmitting ? 'Ã¢ÂÂ³ Submitting...' : 'Ã¢ÂÂ
+ Confirm & Submit'}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   // Render signing page if ?firmar= is present (no auth required)
   if (signRentalId) {
@@ -4679,25 +5271,26 @@ USING (true);`;
       <div className="sign-page">
         <div className="sign-page-card">
           <div className="sign-logo">
-            <p style={{ fontSize: '28px', marginBottom: '4px' }}>🐏</p>
+            <p style={{ fontSize: '28px', marginBottom: '4px' }}>Ã°ÂÂÂ</p>
             <h2>The Fast Sheep</h2>
             <p style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Contrato Digital de Alquiler' : 'Digital Rental Contract'}</p>
           </div>
 
           {signLoading ? (
             <div style={{ textAlign: 'center', padding: '40px' }}>
-              <p style={{ color: 'var(--text-muted)' }}>{language === 'es' ? '⏳ Cargando contrato...' : '⏳ Loading contract...'}</p>
+              <p style={{ color: 'var(--text-muted)' }}>{language === 'es' ? 'Ã¢ÂÂ³ Cargando contrato...' : 'Ã¢ÂÂ³ Loading contract...'}</p>
             </div>
           ) : !signRentalData ? (
             <div style={{ textAlign: 'center', padding: '40px' }}>
-              <p style={{ fontSize: '48px', marginBottom: '12px' }}>❌</p>
+              <p style={{ fontSize: '48px', marginBottom: '12px' }}>Ã¢ÂÂ</p>
               <h3 style={{ marginBottom: '8px' }}>{language === 'es' ? 'Contrato no encontrado' : 'Contract not found'}</h3>
-              <p style={{ color: 'var(--text-muted)', fontSize: '13px' }}>{language === 'es' ? 'Este enlace de firma no es válido o ha expirado.' : 'This signature link is invalid or has expired.'}</p>
+              <p style={{ color: 'var(--text-muted)', fontSize: '13px' }}>{language === 'es' ? 'Este enlace de firma no es vÃÂ¡lido o ha expirado.' : 'This signature link is invalid or has expired.'}</p>
             </div>
           ) : signSuccess ? (
             <div className="sign-success">
-              <span className="check-icon">✅</span>
-              <h3>{language === 'es' ? '¡Contrato firmado correctamente!' : 'Contract signed successfully!'}</h3>
+              <span className="check-icon">Ã¢ÂÂ
+</span>
+              <h3>{language === 'es' ? 'ÃÂ¡Contrato firmado correctamente!' : 'Contract signed successfully!'}</h3>
               <p>{language === 'es' ? `Gracias, ${signRentalData.customer.first_name}. Tu firma ha sido registrada exitosamente.` : `Thank you, ${signRentalData.customer.first_name}. Your signature has been registered successfully.`}</p>
               <p style={{ marginTop: '12px', fontSize: '12px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Puedes cerrar esta ventana.' : 'You can close this window.'}</p>
             </div>
@@ -4707,9 +5300,9 @@ USING (true);`;
                 {[
                   [language === 'es' ? 'Rider' : 'Rider', `${signRentalData.customer.first_name} ${signRentalData.customer.last_name}`],
                   [language === 'es' ? 'E-Bike' : 'E-Bike', `${signRentalData.bike.name} (${signRentalData.bike.serial_number ?? ''})`],
-                  [language === 'es' ? 'Tarifa' : 'Rate', `€${signRentalData.rental.rental_rate}/${signRentalData.rental.rate_type === 'diario' ? (language === 'es' ? 'diario' : 'daily') : signRentalData.rental.rate_type === 'semanal' ? (language === 'es' ? 'semanal' : 'weekly') : (language === 'es' ? 'mensual' : 'monthly')}`],
-                  [language === 'es' ? 'Depósito' : 'Deposit', `€${signRentalData.rental.deposit_amount}`],
-                  [language === 'es' ? 'Seguro' : 'Insurance', signRentalData.rental.has_insurance ? (language === 'es' ? 'Sí' : 'Yes') : (language === 'es' ? 'No' : 'No')],
+                  [language === 'es' ? 'Tarifa' : 'Rate', `Ã¢ÂÂ¬${signRentalData.rental.rental_rate}/${signRentalData.rental.rate_type === 'diario' ? (language === 'es' ? 'diario' : 'daily') : signRentalData.rental.rate_type === 'semanal' ? (language === 'es' ? 'semanal' : 'weekly') : (language === 'es' ? 'mensual' : 'monthly')}`],
+                  [language === 'es' ? 'DepÃÂ³sito' : 'Deposit', `Ã¢ÂÂ¬${signRentalData.rental.deposit_amount}`],
+                  [language === 'es' ? 'Seguro' : 'Insurance', signRentalData.rental.has_insurance ? (language === 'es' ? 'SÃÂ­' : 'Yes') : (language === 'es' ? 'No' : 'No')],
                   [language === 'es' ? 'Fecha de inicio' : 'Start Date', signRentalData.rental.start_date],
                 ].map(([label, val]) => (
                   <div key={label} className="detail-row">
@@ -4719,16 +5312,16 @@ USING (true);`;
                 ))}
               </div>
               <div className="terms-box">
-                <p><strong>{language === 'es' ? 'Términos y Condiciones del Alquiler:' : 'Rental Terms & Conditions:'}</strong></p>
+                <p><strong>{language === 'es' ? 'TÃÂ©rminos y Condiciones del Alquiler:' : 'Rental Terms & Conditions:'}</strong></p>
                 <p>{language === 'es' ? '1. El rider se compromete a devolver la bicicleta en las mismas condiciones en que fue entregada, salvo desgaste normal por uso.' : '1. The rider agrees to return the bicycle in the same condition as delivered, except for normal wear and tear.'}</p>
-                <p>{language === 'es' ? `2. El depósito de seguridad (€${signRentalData.rental.deposit_amount}) será reembolsado al momento de la devolución, una vez verificado el estado de la bicicleta.` : `2. The security deposit (€${signRentalData.rental.deposit_amount}) will be refunded upon return, once the condition of the bicycle is verified.`}</p>
-                <p>{language === 'es' ? '3. El rider es responsable por cualquier daño, pérdida o robo de la bicicleta y accesorios durante el período de alquiler.' : '3. The rider is responsible for any damage, loss, or theft of the bicycle and accessories during the rental period.'}</p>
-                <p>{language === 'es' ? '4. El rider debe respetar todas las leyes de tránsito vigentes y utilizar la bicicleta de manera responsable.' : '4. The rider must respect all traffic laws in force and use the bicycle in a responsible manner.'}</p>
-                <p>{language === 'es' ? '5. The Fast Sheep se reserva el derecho de retener parte o la totalidad del depósito en caso de daños comprobados.' : '5. The Fast Sheep reserves the right to retain part or all of the deposit in case of proven damage.'}</p>
-                <p>{language === 'es' ? '6. Al firmar este contrato, el rider acepta todos los términos y condiciones aquí descritos.' : '6. By signing this contract, the rider accepts all terms and conditions described herein.'}</p>
+                <p>{language === 'es' ? `2. El depÃÂ³sito de seguridad (Ã¢ÂÂ¬${signRentalData.rental.deposit_amount}) serÃÂ¡ reembolsado al momento de la devoluciÃÂ³n, una vez verificado el estado de la bicicleta.` : `2. The security deposit (Ã¢ÂÂ¬${signRentalData.rental.deposit_amount}) will be refunded upon return, once the condition of the bicycle is verified.`}</p>
+                <p>{language === 'es' ? '3. El rider es responsable por cualquier daÃÂ±o, pÃÂ©rdida o robo de la bicicleta y accesorios durante el perÃÂ­odo de alquiler.' : '3. The rider is responsible for any damage, loss, or theft of the bicycle and accessories during the rental period.'}</p>
+                <p>{language === 'es' ? '4. El rider debe respetar todas las leyes de trÃÂ¡nsito vigentes y utilizar la bicicleta de manera responsable.' : '4. The rider must respect all traffic laws in force and use the bicycle in a responsible manner.'}</p>
+                <p>{language === 'es' ? '5. The Fast Sheep se reserva el derecho de retener parte o la totalidad del depÃÂ³sito en caso de daÃÂ±os comprobados.' : '5. The Fast Sheep reserves the right to retain part or all of the deposit in case of proven damage.'}</p>
+                <p>{language === 'es' ? '6. Al firmar este contrato, el rider acepta todos los tÃÂ©rminos y condiciones aquÃÂ­ descritos.' : '6. By signing this contract, the rider accepts all terms and conditions described herein.'}</p>
               </div>
               <div className="sign-canvas-container">
-                <label>{language === 'es' ? '✍️ Firma aquí (use su dedo o ratón):' : '✍️ Sign here (use your finger or mouse):'}</label>
+                <label>{language === 'es' ? 'Ã¢ÂÂÃ¯Â¸Â Firma aquÃÂ­ (use su dedo o ratÃÂ³n):' : 'Ã¢ÂÂÃ¯Â¸Â Sign here (use your finger or mouse):'}</label>
                 <canvas
                   ref={signCanvasRef}
                   width={480}
@@ -4743,9 +5336,11 @@ USING (true);`;
                 />
               </div>
               <div className="sign-actions">
-                <button className="btn-secondary" style={{ flex: 1 }} onClick={clearSign}>🗑️ {language === 'es' ? 'Limpiar' : 'Clear'}</button>
+                <button className="btn-secondary" style={{ flex: 1 }} onClick={clearSign}>Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? 'Limpiar' : 'Clear'}</button>
                 <button className="btn-primary" style={{ flex: 2 }} disabled={signSubmitting} onClick={submitSignature}>
-                  {signSubmitting ? (language === 'es' ? '⏳ Guardando...' : '⏳ Saving...') : (language === 'es' ? '✅ Firmar y Aceptar' : '✅ Sign & Accept')}
+                  {signSubmitting ? (language === 'es' ? 'Ã¢ÂÂ³ Guardando...' : 'Ã¢ÂÂ³ Saving...') : (language === 'es' ? 'Ã¢ÂÂ
+ Firmar y Aceptar' : 'Ã¢ÂÂ
+ Sign & Accept')}
                 </button>
               </div>
             </>
@@ -4765,7 +5360,7 @@ USING (true);`;
     <div className="loading-screen">
       <div className="loading-spinner-ring" />
       <h2>The Fast Sheep</h2>
-      <p>{language === 'es' ? 'Verificando sesión...' : 'Verifying session...'}</p>
+      <p>{language === 'es' ? 'Verificando sesiÃÂ³n...' : 'Verifying session...'}</p>
     </div>
   );
 
@@ -4778,11 +5373,11 @@ USING (true);`;
         <div className="login-logo" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px' }}>
           <img src="/logo.png" alt="The Fast Sheep Logo" style={{ height: '64px', width: 'auto', borderRadius: '12px', objectFit: 'contain', marginBottom: '8px' }} />
           <h1 style={{ marginTop: '0' }}>The Fast Sheep</h1>
-          <p className="login-subtitle">Fleet Master · Dublin ERP</p>
+          <p className="login-subtitle">Fleet Master ÃÂ· Dublin ERP</p>
         </div>
         <p className="login-desc">
           {language === 'es'
-            ? 'Gestión inteligente de flota de e-bikes para delivery en Dublín.'
+            ? 'GestiÃÂ³n inteligente de flota de e-bikes para delivery en DublÃÂ­n.'
             : 'Smart e-bike fleet management for Dublin delivery riders.'}
         </p>
 
@@ -4801,7 +5396,7 @@ USING (true);`;
             gap: '6px',
             alignItems: 'center'
           }}>
-            <span style={{ fontSize: '18px' }}>⚠️</span>
+            <span style={{ fontSize: '18px' }}>Ã¢ÂÂ Ã¯Â¸Â</span>
             <span>{authError}</span>
             <button 
               onClick={() => setAuthError(null)} 
@@ -4828,13 +5423,13 @@ USING (true);`;
             <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
             <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
           </svg>
-          {language === 'es' ? 'Iniciar sesión con Google' : 'Sign in with Google'}
+          {language === 'es' ? 'Iniciar sesiÃÂ³n con Google' : 'Sign in with Google'}
         </button>
         <div className="login-lang">
-          <button className={language === 'es' ? 'active' : ''} onClick={() => setLanguage('es')}>🇪🇸 Español</button>
-          <button className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')}>🇬🇧 English</button>
+          <button className={language === 'es' ? 'active' : ''} onClick={() => setLanguage('es')}>Ã°ÂÂÂªÃ°ÂÂÂ¸ EspaÃÂ±ol</button>
+          <button className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')}>Ã°ÂÂÂ¬Ã°ÂÂÂ§ English</button>
         </div>
-        <p className="login-footer">Powered by Supabase · Dublin, Ireland</p>
+        <p className="login-footer">Powered by Supabase ÃÂ· Dublin, Ireland</p>
       </div>
     </div>
   );
@@ -4856,14 +5451,14 @@ USING (true);`;
   // ============================================================
   if (connectionError) return (
     <div className="error-screen">
-      <div className="error-icon">🔴</div>
-      <h2>{language === 'es' ? 'Error de Conexión con Supabase' : 'Supabase Connection Error'}</h2>
+      <div className="error-icon">Ã°ÂÂÂ´</div>
+      <h2>{language === 'es' ? 'Error de ConexiÃÂ³n con Supabase' : 'Supabase Connection Error'}</h2>
       <p className="error-detail">{connectionError}</p>
       <p style={{ fontSize: '13px', color: 'var(--text-muted)', marginTop: '8px' }}>
         {language === 'es' ? 'Verifica que tu archivo .env tiene las variables VITE_SUPABASE_URL y VITE_SUPABASE_ANON_KEY correctas.' : 'Verify that your .env file has the correct VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY variables.'}
       </p>
       <button className="btn-primary" style={{ marginTop: '24px' }} onClick={() => triggerReload()}>
-        🔄 {language === 'es' ? 'Reintentar Conexión' : 'Retry Connection'}
+        Ã°ÂÂÂ {language === 'es' ? 'Reintentar ConexiÃÂ³n' : 'Retry Connection'}
       </button>
     </div>
   );
@@ -5040,7 +5635,8 @@ USING (true);`;
       <div className="toast-container">
         {toasts.map(toast => (
           <div key={toast.id} className={`toast toast-${toast.type}`}>
-            {toast.type === 'success' ? '✅' : '❌'} {toast.message}
+            {toast.type === 'success' ? 'Ã¢ÂÂ
+' : 'Ã¢ÂÂ'} {toast.message}
           </div>
         ))}
       </div>
@@ -5057,20 +5653,21 @@ USING (true);`;
 
         <nav className="sidebar-menu">
           {[
-            { key: 'analytics',     icon: '📊', label: t.dashboard },
-            { key: 'balance',       icon: '💰', label: t.balance },
-            { key: 'stock',         icon: '📦', label: t.stock },
-            { key: 'rental_wizard', icon: '⚡', label: t.wizard },
-            { key: 'accounts',      icon: '🛵', label: t.accounts },
-            { key: 'users',         icon: '👥', label: t.users },
-            // { key: 'customers',     icon: '👥', label: t.customers },
-            { key: 'maintenance',   icon: '⚙️', label: t.maintenance },
-            { key: 'crm',           icon: '🎯', label: t.crm },
-            { key: 'calendar',      icon: '📅', label: t.calendar },
-            { key: 'suppliers',     icon: '🏬', label: t.suppliers },
-            { key: 'quick_replies', icon: '💬', label: t.quick_replies },
-            { key: 'emails',        icon: '📧', label: language === 'es' ? 'Plantillas de Emails' : 'Email Templates' },
-            { key: 'tasks',         icon: '📋', label: t.tasks },
+            { key: 'analytics',     icon: 'Ã°ÂÂÂ', label: t.dashboard },
+            { key: 'balance',       icon: 'Ã°ÂÂÂ°', label: t.balance },
+            { key: 'stock',         icon: 'Ã°ÂÂÂ¦', label: t.stock },
+            { key: 'rental_wizard', icon: 'Ã¢ÂÂ¡', label: t.wizard },
+            { key: 'accounts',      icon: 'Ã°ÂÂÂµ', label: t.accounts },
+            { key: 'users',         icon: 'Ã°ÂÂÂ¥', label: t.users },
+            // { key: 'customers',     icon: 'Ã°ÂÂÂ¥', label: t.customers },
+            { key: 'maintenance',   icon: 'Ã¢ÂÂÃ¯Â¸Â', label: t.maintenance },
+            { key: 'crm',           icon: 'Ã°ÂÂÂ¯', label: t.crm },
+            { key: 'calendar',      icon: 'Ã°ÂÂÂ
+', label: t.calendar },
+            { key: 'suppliers',     icon: 'Ã°ÂÂÂ¬', label: t.suppliers },
+            { key: 'quick_replies', icon: 'Ã°ÂÂÂ¬', label: t.quick_replies },
+            { key: 'emails',        icon: 'Ã°ÂÂÂ§', label: language === 'es' ? 'Plantillas de Emails' : 'Email Templates' },
+            { key: 'tasks',         icon: 'Ã°ÂÂÂ', label: t.tasks },
           ].filter(({ key }) => !(key === 'balance' && isManager)).map(({ key, icon, label }) => (
             <a key={key} className={`menu-item ${currentTab === key ? 'active' : ''}`}
               onClick={() => {
@@ -5103,7 +5700,7 @@ USING (true);`;
               <span className="sidebar-user-name">{user.user_metadata?.full_name || user.email?.split('@')[0]}</span>
               <span className="sidebar-user-email">{user.email}</span>
             </div>
-            <button className="btn-secondary btn-xs" onClick={signOut} title={language === 'es' ? 'Cerrar sesión' : 'Sign out'} style={{ padding: '4px 8px', fontSize: '14px' }}>🚪</button>
+            <button className="btn-secondary btn-xs" onClick={signOut} title={language === 'es' ? 'Cerrar sesiÃÂ³n' : 'Sign out'} style={{ padding: '4px 8px', fontSize: '14px' }}>Ã°ÂÂÂª</button>
           </div>
         )}
       </aside>
@@ -5118,15 +5715,15 @@ USING (true);`;
             onClick={() => setMobileDrawerOpen(true)}
             aria-label="Open menu"
           >
-            ☰
+            Ã¢ÂÂ°
           </button>
           <h1 className="topbar-title">{t[currentTab as keyof typeof t] || currentTab}</h1>
           <div className="topbar-actions">
             <select className="lang-selector" value={language} onChange={e => setLanguage(e.target.value as 'es' | 'en')}>
-              <option value="es">ES 🇪🇸</option>
-              <option value="en">EN 🇬🇧</option>
+              <option value="es">ES Ã°ÂÂÂªÃ°ÂÂÂ¸</option>
+              <option value="en">EN Ã°ÂÂÂ¬Ã°ÂÂÂ§</option>
             </select>
-            <button className="theme-toggle" onClick={() => setDarkMode(!darkMode)}>{darkMode ? '☀️' : '🌙'}</button>
+            <button className="theme-toggle" onClick={() => setDarkMode(!darkMode)}>{darkMode ? 'Ã¢ÂÂÃ¯Â¸Â' : 'Ã°ÂÂÂ'}</button>
             
             {/* Settings gear dropdown */}
             {isAdmin && (
@@ -5134,7 +5731,7 @@ USING (true);`;
                 <button 
                   className="theme-toggle" 
                   onClick={() => setShowSettingsDropdown(!showSettingsDropdown)} 
-                  title={language === 'es' ? 'Configuración' : 'Settings'}
+                  title={language === 'es' ? 'ConfiguraciÃÂ³n' : 'Settings'}
                   style={{
                     display: 'flex',
                     alignItems: 'center',
@@ -5149,7 +5746,7 @@ USING (true);`;
                     transition: 'all 0.2s'
                   }}
                 >
-                  ⚙️
+                  Ã¢ÂÂÃ¯Â¸Â
                 </button>
                 {showSettingsDropdown && (
                   <div 
@@ -5195,7 +5792,52 @@ USING (true);`;
                       onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(99, 102, 241, 0.15)'}
                       onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
                     >
-                      🔒 {language === 'es' ? 'Editar Accesos' : 'Edit Access'}
+                      Ã°ÂÂÂ {language === 'es' ? 'Editar Accesos' : 'Edit Access'}
+                    </button>
+                    <button
+                      disabled={backupRunning}
+                      onClick={async () => {
+                        setShowSettingsDropdown(false);
+                        setBackupRunning(true);
+                        showToast(language === 'es' ? 'Ã¢ÂÂ³ Generando backup...' : 'Ã¢ÂÂ³ Generating backup...');
+                        try {
+                          const bikeMods = await getAllBikeModifications();
+                          const filename = downloadBackupXlsx({
+                            categories, products, productModels, customers, rentals, rentalItems,
+                            payments, sales, saleItems, financingPlans, financingPayments: financingPaymentsData,
+                            expenses, records, bikeModifications: bikeMods, leads, leadCategories: leadCats,
+                            suppliers, supplierProducts, appAccounts, accountNotes, accountEarnings,
+                            platforms, vehicles, transactions: balanceData.txs,
+                          });
+                          showToast((language === 'es' ? 'Ã¢ÂÂ
+ Backup descargado: ' : 'Ã¢ÂÂ
+ Backup downloaded: ') + filename, 'success');
+                        } catch (err) {
+                          console.error('Backup failed:', err);
+                          showToast(language === 'es' ? 'Error al generar el backup.' : 'Backup failed.', 'error');
+                        }
+                        setBackupRunning(false);
+                      }}
+                      style={{
+                        width: '100%',
+                        background: 'transparent',
+                        border: 'none',
+                        color: 'var(--text-bright)',
+                        padding: '10px 12px',
+                        textAlign: 'left',
+                        cursor: backupRunning ? 'wait' : 'pointer',
+                        fontSize: '13px',
+                        fontWeight: 500,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px',
+                        borderRadius: '6px',
+                        transition: 'background 0.2s'
+                      }}
+                      onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(99, 102, 241, 0.15)'}
+                      onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+                    >
+                      {backupRunning ? 'Ã¢ÂÂ³' : 'Ã°ÂÂÂ¥'} {language === 'es' ? 'Backup a Excel' : 'Backup to Excel'}
                     </button>
                   </div>
                 )}
@@ -5205,14 +5847,14 @@ USING (true);`;
             <div style={{ position: 'relative' }}>
 
               <button className="bell-btn" onClick={() => setShowNotifications(!showNotifications)}>
-                🔔
+                Ã°ÂÂÂ
                 {activeAlerts.length > 0 && <span className="bell-badge">{activeAlerts.length}</span>}
               </button>
               {showNotifications && (
                 <div className="notification-menu">
                   <div className="notification-header">
                     <h4>{language === 'es' ? 'Alertas de Operaciones' : 'Operations Alerts'}</h4>
-                    <button className="btn-secondary btn-xs" onClick={() => setShowNotifications(false)}>✕</button>
+                    <button className="btn-secondary btn-xs" onClick={() => setShowNotifications(false)}>Ã¢ÂÂ</button>
                   </div>
                   <div className="notification-list">
                     {activeAlerts.length === 0
@@ -5220,11 +5862,12 @@ USING (true);`;
                       : activeAlerts.map(a => (
                         <div key={a.id} className={`notification-item ${a.priority}`}>
                           <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-bright)' }}>
-                            {a.type === 'event' ? '📅' : '⚙️'} {a.message}
+                            {a.type === 'event' ? 'Ã°ÂÂÂ
+' : 'Ã¢ÂÂÃ¯Â¸Â'} {a.message}
                           </span>
                           {a.date && (
                             <span style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '2px', display: 'block' }}>
-                              📆 {fmtAlertDate(a.date)}
+                              Ã°ÂÂÂ {fmtAlertDate(a.date)}
                             </span>
                           )}
                         </div>
@@ -5247,7 +5890,7 @@ USING (true);`;
             <>
               <div className="kpis-grid">
                 <div className="glass-card kpi-card">
-                  <div className="kpi-header"><span className="kpi-title">{t.activeRentals}</span><span className="kpi-icon">⚡</span></div>
+                  <div className="kpi-header"><span className="kpi-title">{t.activeRentals}</span><span className="kpi-icon">Ã¢ÂÂ¡</span></div>
                   <div className="kpi-value">{bi.totalRentals} Riders</div>
                   
                   {activeBikesModelCounts.length > 0 && (
@@ -5273,7 +5916,7 @@ USING (true);`;
                 </div>
 
                 <div className="glass-card kpi-card">
-                  <div className="kpi-header"><span className="kpi-title">{t.availableBikes}</span><span className="kpi-icon">🚲</span></div>
+                  <div className="kpi-header"><span className="kpi-title">{t.availableBikes}</span><span className="kpi-icon">Ã°ÂÂÂ²</span></div>
                   <div className="kpi-value">{bi.availableBikesCount} E-Bikes</div>
                   {(() => {
                     const counts: Record<string, number> = {};
@@ -5312,9 +5955,9 @@ USING (true);`;
                   })()}
                 </div>
                 <div className="glass-card kpi-card">
-                  <div className="kpi-header"><span className="kpi-title">{t.announcedReturns}</span><span className="kpi-icon">⏳</span></div>
+                  <div className="kpi-header"><span className="kpi-title">{t.announcedReturns}</span><span className="kpi-icon">Ã¢ÂÂ³</span></div>
                   <div className="kpi-value">{bi.announcedReturnsCount} E-Bikes</div>
-                  {rentals.filter(r => r.status === 'Devolución en Proceso').length > 0 && (
+                  {rentals.filter(r => r.status === 'DevoluciÃÂ³n en Proceso').length > 0 && (
                     <div className="custom-scroll" style={{ 
                       marginTop: '12px', 
                       paddingTop: '12px', 
@@ -5325,7 +5968,7 @@ USING (true);`;
                       maxHeight: '130px',
                       overflowY: 'auto'
                     }}>
-                      {rentals.filter(r => r.status === 'Devolución en Proceso').map(r => {
+                      {rentals.filter(r => r.status === 'DevoluciÃÂ³n en Proceso').map(r => {
                         const bike = products.find(p => p.id === r.bike_id);
                         const cust = customers.find(c => c.id === r.customer_id);
                         return (
@@ -5344,11 +5987,11 @@ USING (true);`;
                   )}
                 </div>
                 <div className="glass-card kpi-card">
-                  <div className="kpi-header"><span className="kpi-title">{t.mechanicalHealth}</span><span className="kpi-icon">🔧</span></div>
+                  <div className="kpi-header"><span className="kpi-title">{t.mechanicalHealth}</span><span className="kpi-icon">Ã°ÂÂÂ§</span></div>
                   <div className="kpi-value">{bi.workshopCount} {language === 'es' ? 'En Taller' : 'In Garage'}</div>
                   <div className="kpi-trend" style={{ color: bi.workshopCount > 0 ? '#ef4444' : '#10b981' }}>
-                    🛠️ {bi.workshopCount > 0 
-                      ? (language === 'es' ? 'Reparación pendiente' : 'Repair pending') 
+                    Ã°ÂÂÂ Ã¯Â¸Â {bi.workshopCount > 0 
+                      ? (language === 'es' ? 'ReparaciÃÂ³n pendiente' : 'Repair pending') 
                       : (language === 'es' ? 'Sin novedades' : 'All systems clear')}
                   </div>
                 </div>
@@ -5357,7 +6000,7 @@ USING (true);`;
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '24px' }}>
                 {/* Nationalities */}
                 <div className="glass-card">
-                  <h3 style={{ marginBottom: '16px' }}>🇮🇪 {t.nationalities}</h3>
+                  <h3 style={{ marginBottom: '16px' }}>Ã°ÂÂÂ®Ã°ÂÂÂª {t.nationalities}</h3>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                     {bi.nationalityList.length === 0
                       ? <p style={{ color: 'var(--text-muted)', fontSize: '13px' }}>No riders registered yet.</p>
@@ -5374,9 +6017,9 @@ USING (true);`;
                   </div>
                 </div>
 
-                {/* Seasonality – dynamic from real data */}
+                {/* Seasonality Ã¢ÂÂ dynamic from real data */}
                 <div className="glass-card">
-                  <h3 style={{ marginBottom: '16px' }}>📈 {t.seasonality}</h3>
+                  <h3 style={{ marginBottom: '16px' }}>Ã°ÂÂÂ {t.seasonality}</h3>
                   <div className="chart-container" style={bi.seasonalityData.every(d => d.count === 0) ? { display: 'flex', justifyContent: 'center', alignItems: 'center' } : undefined}>
                     {bi.seasonalityData.every(d => d.count === 0) ? (
                       <p style={{ color: 'var(--text-muted)', fontSize: '13px' }}>
@@ -5399,7 +6042,7 @@ USING (true);`;
 
                 {/* Referral sources */}
                 <div className="glass-card">
-                  <h3 style={{ marginBottom: '16px' }}>🔗 {t.referrals}</h3>
+                  <h3 style={{ marginBottom: '16px' }}>Ã°ÂÂÂ {t.referrals}</h3>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
                     {bi.sourceList.length === 0
                       ? <p style={{ color: 'var(--text-muted)', fontSize: '13px' }}>No data yet.</p>
@@ -5435,7 +6078,7 @@ USING (true);`;
                     <option value="day">Hoy</option>
                     <option value="week">Esta semana</option>
                     <option value="month">Este mes</option>
-                    <option value="year">Este año</option>
+                    <option value="year">Este aÃÂ±o</option>
                     <option value="custom">Personalizado...</option>
                   </select>
                   {balanceFilterType === 'custom' && (
@@ -5475,7 +6118,7 @@ USING (true);`;
                     }}
                     style={{ width: 'auto', background: 'rgba(0, 0, 0, 0.5)', color: 'var(--text-color)', border: '1px solid rgba(255, 255, 255, 0.1)', padding: '6px 12px', borderRadius: '8px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit', fontSize: '13px' }}
                   >
-                    <option value="all">🌍 {language === 'es' ? 'Todas las categorías' : 'All categories'}</option>
+                    <option value="all">Ã°ÂÂÂ {language === 'es' ? 'Todas las categorÃÂ­as' : 'All categories'}</option>
                     {balanceTxFilter === 'other_expenses' ? (
                       expenseCategories.map(cat => (
                         <option key={cat.id} value={cat.id}>
@@ -5494,7 +6137,7 @@ USING (true);`;
                             if (balanceTxFilter === 'rental_only') {
                               const nameEs = (cat.name_es || '').toLowerCase();
                               const nameEn = (cat.name_en || '').toLowerCase();
-                              return nameEs.includes('bici') || nameEs.includes('depó') || nameEs.includes('depo') || nameEs.includes('app') || nameEs.includes('deliver') ||
+                              return nameEs.includes('bici') || nameEs.includes('depÃÂ³') || nameEs.includes('depo') || nameEs.includes('app') || nameEs.includes('deliver') ||
                                      nameEn.includes('bike') || nameEn.includes('dept') || nameEn.includes('depo') || nameEn.includes('app') || nameEn.includes('deliver');
                             }
                             return true;
@@ -5506,7 +6149,7 @@ USING (true);`;
                           ))}
                         {balanceTxFilter === 'rental_only' && (
                           <>
-                            <option value="Depósito">{language === 'es' ? 'Depósito' : 'Deposit'}</option>
+                            <option value="DepÃÂ³sito">{language === 'es' ? 'DepÃÂ³sito' : 'Deposit'}</option>
                             <option value="Delivery App">{language === 'es' ? 'Delivery App' : 'Delivery App'}</option>
                           </>
                         )}
@@ -5521,7 +6164,7 @@ USING (true);`;
                       onChange={e => setBalanceProductFilter(e.target.value)}
                       style={{ width: 'auto', background: 'rgba(0, 0, 0, 0.5)', color: 'var(--text-color)', border: '1px solid rgba(255, 255, 255, 0.1)', padding: '6px 12px', borderRadius: '8px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit', fontSize: '13px' }}
                     >
-                      <option value="all">🚲 {language === 'es' ? 'Todos los productos' : 'All products'}</option>
+                      <option value="all">Ã°ÂÂÂ² {language === 'es' ? 'Todos los productos' : 'All products'}</option>
                       {uniqueProductList.map(prod => (
                         <option key={prod.name} value={prod.name}>
                           {prod.name}
@@ -5542,14 +6185,14 @@ USING (true);`;
                   }}
                   style={{ display: 'flex', alignItems: 'center', gap: '8px', height: '38px', borderRadius: '8px', padding: '0 16px', fontWeight: 600 }}
                 >
-                  💸 {language === 'es' ? 'Agregar Gasto' : 'Add Expense'}
+                  Ã°ÂÂÂ¸ {language === 'es' ? 'Agregar Gasto' : 'Add Expense'}
                 </button>
                 </div>
                 <div style={{ width: '100%' }}>
                   <input
                     className="form-control"
                     style={{ width: '100%', maxWidth: '100%', padding: '10px 16px', fontSize: '14px' }}
-                    placeholder={language === 'es' ? '🔍 Buscar por descripción, producto, categoría...' : '🔍 Search by description, product, category...'}
+                    placeholder={language === 'es' ? 'Ã°ÂÂÂ Buscar por descripciÃÂ³n, producto, categorÃÂ­a...' : 'Ã°ÂÂÂ Search by description, product, category...'}
                     value={balanceSearch}
                     onChange={e => setBalanceSearch(e.target.value)}
                   />
@@ -5559,8 +6202,8 @@ USING (true);`;
               <div className="kpis-grid">
                 {balanceTxFilter !== 'maintenance_only' && (
                   <div className="glass-card kpi-card">
-                    <div className="kpi-header"><span className="kpi-title">{t.income}</span><span className="kpi-icon">📈</span></div>
-                    <div className="kpi-value" style={{ color: '#10b981' }}>€{Math.round(balanceData.totalIncome * 10) / 10}</div>
+                    <div className="kpi-header"><span className="kpi-title">{t.income}</span><span className="kpi-icon">Ã°ÂÂÂ</span></div>
+                    <div className="kpi-value" style={{ color: '#10b981' }}>Ã¢ÂÂ¬{Math.round(balanceData.totalIncome * 10) / 10}</div>
                     <div className="kpi-trend trend-up">
                       {balanceTxFilter === 'purchase_sale' 
                         ? (language === 'es' ? 'Ventas' : 'Sales') 
@@ -5570,34 +6213,34 @@ USING (true);`;
                     </div>
                     {/* Payment method breakdown */}
                     <div style={{ fontSize: '11.5px', color: 'var(--text-muted)', marginTop: '6px', display: 'flex', gap: '12px', borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '6px' }}>
-                      <span>💵 {language === 'es' ? 'Efectivo:' : 'Cash:'} €{Math.round(balanceData.totalIncomeCash * 10) / 10}</span>
-                      <span>🏦 {language === 'es' ? 'Transf.:' : 'Transfer:'} €{Math.round(balanceData.totalIncomeTransfer * 10) / 10}</span>
+                      <span>Ã°ÂÂÂµ {language === 'es' ? 'Efectivo:' : 'Cash:'} Ã¢ÂÂ¬{Math.round(balanceData.totalIncomeCash * 10) / 10}</span>
+                      <span>Ã°ÂÂÂ¦ {language === 'es' ? 'Transf.:' : 'Transfer:'} Ã¢ÂÂ¬{Math.round(balanceData.totalIncomeTransfer * 10) / 10}</span>
                     </div>
                   </div>
                 )}
                 {balanceTxFilter === 'rental_only' && (
                   <>
                     <div className="glass-card kpi-card">
-                       <div className="kpi-header"><span className="kpi-title">{language === 'es' ? 'Depósitos' : 'Deposits'}</span><span className="kpi-icon">🔒</span></div>
-                       <div className="kpi-value" style={{ color: '#f59e0b' }}>€{Math.round(balanceData.activeDeposits * 10) / 10}</div>
-                       <div className="kpi-trend trend-neutral">{language === 'es' ? 'Garantía Retenida' : 'Held Guarantee'}</div>
+                       <div className="kpi-header"><span className="kpi-title">{language === 'es' ? 'DepÃÂ³sitos' : 'Deposits'}</span><span className="kpi-icon">Ã°ÂÂÂ</span></div>
+                       <div className="kpi-value" style={{ color: '#f59e0b' }}>Ã¢ÂÂ¬{Math.round(balanceData.activeDeposits * 10) / 10}</div>
+                       <div className="kpi-trend trend-neutral">{language === 'es' ? 'GarantÃÂ­a Retenida' : 'Held Guarantee'}</div>
                        {/* Deposit method breakdown */}
                        <div style={{ fontSize: '11.5px', color: 'var(--text-muted)', marginTop: '6px', display: 'flex', gap: '12px', borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '6px' }}>
-                         <span>💵 {language === 'es' ? 'Efectivo:' : 'Cash:'} €{Math.round(balanceData.activeDepositsCash * 10) / 10}</span>
-                         <span>🏦 {language === 'es' ? 'Transf.:' : 'Transfer:'} €{Math.round(balanceData.activeDepositsTransfer * 10) / 10}</span>
+                         <span>Ã°ÂÂÂµ {language === 'es' ? 'Efectivo:' : 'Cash:'} Ã¢ÂÂ¬{Math.round(balanceData.activeDepositsCash * 10) / 10}</span>
+                         <span>Ã°ÂÂÂ¦ {language === 'es' ? 'Transf.:' : 'Transfer:'} Ã¢ÂÂ¬{Math.round(balanceData.activeDepositsTransfer * 10) / 10}</span>
                        </div>
                     </div>
                     <div className="glass-card kpi-card">
-                       <div className="kpi-header"><span className="kpi-title">{language === 'es' ? 'Total Alquiler' : 'Total Rental'}</span><span className="kpi-icon">💶</span></div>
-                       <div className="kpi-value" style={{ color: '#10b981' }}>€{Math.round((balanceData.totalIncome + balanceData.activeDeposits) * 10) / 10}</div>
-                       <div className="kpi-trend trend-up">{language === 'es' ? 'Ingresos + Depósitos' : 'Income + Deposits'}</div>
+                       <div className="kpi-header"><span className="kpi-title">{language === 'es' ? 'Total Alquiler' : 'Total Rental'}</span><span className="kpi-icon">Ã°ÂÂÂ¶</span></div>
+                       <div className="kpi-value" style={{ color: '#10b981' }}>Ã¢ÂÂ¬{Math.round((balanceData.totalIncome + balanceData.activeDeposits) * 10) / 10}</div>
+                       <div className="kpi-trend trend-up">{language === 'es' ? 'Ingresos + DepÃÂ³sitos' : 'Income + Deposits'}</div>
                     </div>
                   </>
                 )}
                 {balanceTxFilter !== 'rental_only' && (
                   <div className="glass-card kpi-card">
-                    <div className="kpi-header"><span className="kpi-title">{t.expenses}</span><span className="kpi-icon">📉</span></div>
-                    <div className="kpi-value" style={{ color: '#ef4444' }}>€{Math.round(balanceData.totalExpense * 10) / 10}</div>
+                    <div className="kpi-header"><span className="kpi-title">{t.expenses}</span><span className="kpi-icon">Ã°ÂÂÂ</span></div>
+                    <div className="kpi-value" style={{ color: '#ef4444' }}>Ã¢ÂÂ¬{Math.round(balanceData.totalExpense * 10) / 10}</div>
                     <div className="kpi-trend trend-down">
                       {balanceTxFilter === 'purchase_sale' 
                         ? (language === 'es' ? 'Compras' : 'Purchases') 
@@ -5609,32 +6252,32 @@ USING (true);`;
                 )}
                 {balanceTxFilter !== 'rental_only' && balanceTxFilter !== 'maintenance_only' && (
                   <div className="glass-card kpi-card">
-                    <div className="kpi-header"><span className="kpi-title">{t.netFlow}</span><span className="kpi-icon">💶</span></div>
+                    <div className="kpi-header"><span className="kpi-title">{t.netFlow}</span><span className="kpi-icon">Ã°ÂÂÂ¶</span></div>
                     <div className="kpi-value" style={{ color: balanceData.totalIncome - balanceData.totalExpense >= 0 ? '#10b981' : '#ef4444' }}>
-                      €{Math.round((balanceData.totalIncome - balanceData.totalExpense) * 10) / 10}
+                      Ã¢ÂÂ¬{Math.round((balanceData.totalIncome - balanceData.totalExpense) * 10) / 10}
                     </div>
                     <div className="kpi-trend trend-neutral">Beneficio Operativo</div>
                   </div>
                 )}
                 {balanceTxFilter === 'all' && (
                   <div className="glass-card kpi-card">
-                    <div className="kpi-header"><span className="kpi-title">Depósitos Activos</span><span className="kpi-icon">🔒</span></div>
-                    <div className="kpi-value" style={{ color: '#f59e0b' }}>€{Math.round(balanceData.activeDeposits * 10) / 10}</div>
-                    <div className="kpi-trend trend-neutral">Garantía Retenida</div>
+                    <div className="kpi-header"><span className="kpi-title">DepÃÂ³sitos Activos</span><span className="kpi-icon">Ã°ÂÂÂ</span></div>
+                    <div className="kpi-value" style={{ color: '#f59e0b' }}>Ã¢ÂÂ¬{Math.round(balanceData.activeDeposits * 10) / 10}</div>
+                    <div className="kpi-trend trend-neutral">GarantÃÂ­a Retenida</div>
                   </div>
                 )}
               </div>
 
               <div className="glass-card" style={{ marginTop: '24px' }}>
-                <h3 style={{ marginBottom: '16px' }}>📝 {t.transactions}</h3>
+                <h3 style={{ marginBottom: '16px' }}>Ã°ÂÂÂ {t.transactions}</h3>
                 <div className="table-container">
                   <table className="custom-table">
                     <thead>
                       <tr>
                         <th>Fecha</th>
-                        <th>Categoría</th>
-                        <th>Descripción</th>
-                        <th>{language === 'es' ? 'Método de Pago' : 'Payment Method'}</th>
+                        <th>CategorÃÂ­a</th>
+                        <th>DescripciÃÂ³n</th>
+                        <th>{language === 'es' ? 'MÃÂ©todo de Pago' : 'Payment Method'}</th>
                         <th style={{ textAlign: 'right' }}>Monto</th>
                       </tr>
                     </thead>
@@ -5679,13 +6322,13 @@ USING (true);`;
                                   className={`badge ${
                                     tx.category === 'Compra' ? 'status-lost' : 
                                     tx.category === 'Financiamiento' ? 'status-financed' : 
-                                    tx.category === 'Depósito' ? '' : 
+                                    tx.category === 'DepÃÂ³sito' ? '' : 
                                     tx.type === 'income' ? 'status-available' : 'status-maintenance'
                                   }`}
                                   style={
                                     customColor 
                                       ? { backgroundColor: `${customColor}26`, color: customColor, border: `1px solid ${customColor}40` } 
-                                      : tx.category === 'Depósito' 
+                                      : tx.category === 'DepÃÂ³sito' 
                                       ? { backgroundColor: 'rgba(245, 158, 11, 0.15)', color: '#f59e0b' } 
                                       : undefined
                                   }
@@ -5693,29 +6336,33 @@ USING (true);`;
                                   {tx.category}
                                 </span>
                               </td>
-                              <td>
-                                {tx.description}
+                              <td
+                                onClick={() => setTxDetail(tx)}
+                                title={language === 'es' ? 'Ver detalle completo' : 'View full detail'}
+                                style={{ cursor: 'pointer' }}
+                              >
+                                {tx.description.length > 60 ? `${tx.description.slice(0, 60)}...` : tx.description}
                               </td>
                               <td>
                                 {tx.received_via ? (
                                   tx.received_via === 'efectivo' ? (
                                     <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                                      💵 {language === 'es' ? 'Efectivo' : 'Cash'}
+                                      Ã°ÂÂÂµ {language === 'es' ? 'Efectivo' : 'Cash'}
                                     </span>
                                   ) : (
                                     <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                                      🏦 {language === 'es' ? 'Transferencia' : 'Transfer'}
+                                      Ã°ÂÂÂ¦ {language === 'es' ? 'Transferencia' : 'Transfer'}
                                     </span>
                                   )
                                 ) : (
-                                  <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>—</span>
+                                  <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>Ã¢ÂÂ</span>
                                 )}
                               </td>
                               <td style={{ textAlign: 'right', fontWeight: 'bold', color: tx.type === 'income' ? '#10b981' : '#ef4444' }}>
-                                {tx.type === 'income' ? '+' : '-'}€{tx.amount}
+                                {tx.type === 'income' ? '+' : '-'}Ã¢ÂÂ¬{tx.amount}
                                 <button
                                   onClick={async () => {
-                                    if (await asyncConfirm(language === 'es' ? '¿Seguro que deseas eliminar esta transacción? Esta acción revertirá los efectos originales de la misma en la base de datos.' : 'Are you sure you want to delete this transaction? This will revert its original effects in the database.')) {
+                                    if (await asyncConfirm(language === 'es' ? 'ÃÂ¿Seguro que deseas eliminar esta transacciÃÂ³n? Esta acciÃÂ³n revertirÃÂ¡ los efectos originales de la misma en la base de datos.' : 'Are you sure you want to delete this transaction? This will revert its original effects in the database.')) {
                                       try {
                                         const rawId = tx.id;
                                         if (rawId.startsWith('other-')) {
@@ -5752,7 +6399,7 @@ USING (true);`;
                                             const cust = sale ? customers.find(c => c.id === sale.customer_id) : null;
                                             const custName = cust ? `${cust.first_name} ${cust.last_name}` : null;
                                             const linkedEvents = events.filter(e =>
-                                              e.title.includes('💳 Cuota') &&
+                                              e.title.includes('Ã°ÂÂÂ³ Cuota') &&
                                               (custName ? e.title.includes(custName) : false)
                                             );
                                             for (const ev of linkedEvents) {
@@ -5774,18 +6421,18 @@ USING (true);`;
                                           }
                                         }
                                         
-                                        showToast(language === 'es' ? 'Transacción eliminada y efectos revertidos.' : 'Transaction deleted and effects reverted.', 'success');
+                                        showToast(language === 'es' ? 'TransacciÃÂ³n eliminada y efectos revertidos.' : 'Transaction deleted and effects reverted.', 'success');
                                         triggerReload();
                                       } catch (e) {
                                         console.error(e);
-                                        showToast(language === 'es' ? 'Error al eliminar transacción. Es posible que esté en uso.' : 'Error deleting transaction. It might be in use.', 'error');
+                                        showToast(language === 'es' ? 'Error al eliminar transacciÃÂ³n. Es posible que estÃÂ© en uso.' : 'Error deleting transaction. It might be in use.', 'error');
                                       }
                                     }
                                   }}
                                   style={{ background: 'none', border: 'none', color: '#ff4d4d', cursor: 'pointer', marginLeft: '12px', fontSize: '14px', padding: '2px', opacity: 0.7 }}
-                                  title={language === 'es' ? 'Eliminar Transacción' : 'Delete Transaction'}
+                                  title={language === 'es' ? 'Eliminar TransacciÃÂ³n' : 'Delete Transaction'}
                                 >
-                                  🗑️
+                                  Ã°ÂÂÂÃ¯Â¸Â
                                 </button>
                               </td>
                             </tr>
@@ -5801,7 +6448,7 @@ USING (true);`;
           )}
           {currentTab === 'balance' && isManager && (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '300px', padding: '40px' }}>
-              <div style={{ fontSize: '48px', marginBottom: '16px' }}>🔒</div>
+              <div style={{ fontSize: '48px', marginBottom: '16px' }}>Ã°ÂÂÂ</div>
               <h2 style={{ color: 'var(--text-bright)', margin: '0 0 10px 0' }}>{language === 'es' ? 'Acceso Restringido' : 'Restricted Access'}</h2>
               <p style={{ color: 'var(--text-muted)', margin: 0, textAlign: 'center', maxWidth: '400px' }}>
                 {language === 'es' 
@@ -5817,9 +6464,9 @@ USING (true);`;
           {currentTab === 'rental_wizard' && showRentalWizard && (
             <div className="glass-card">
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px', flexWrap: 'wrap', gap: '12px' }}>
-                <h2 style={{ margin: 0 }}>⚡ {t.newRental}</h2>
+                <h2 style={{ margin: 0 }}>Ã¢ÂÂ¡ {t.newRental}</h2>
                 <button className="btn-secondary" onClick={() => setShowRentalWizard(false)} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  ← {language === 'es' ? 'Volver a Clientes' : 'Back to Customers'}
+                  Ã¢ÂÂ {language === 'es' ? 'Volver a Clientes' : 'Back to Customers'}
                 </button>
               </div>
 
@@ -5827,7 +6474,7 @@ USING (true);`;
               <div className="wizard-steps">
                 {[1,2,3,4,5,6,7,8,9].map(s => (
                   <div key={s} className={`wizard-step ${wizardStep === s ? 'active' : wizardStep > s ? 'completed' : ''}`}>
-                    {wizardStep > s ? '✓' : s}
+                    {wizardStep > s ? 'Ã¢ÂÂ' : s}
                   </div>
                 ))}
               </div>
@@ -5835,13 +6482,13 @@ USING (true);`;
               {/* STEP 1: Select Bike */}
               {wizardStep === 1 && (
                 <div>
-                  <h3 style={{ marginBottom: '16px' }}>{t.step} 1 — {t.selectBike}</h3>
+                  <h3 style={{ marginBottom: '16px' }}>{t.step} 1 Ã¢ÂÂ {t.selectBike}</h3>
                   <div className="table-container" style={{ marginTop: '12px' }}>
                     <table className="custom-table" style={{ cursor: 'pointer' }}>
                       <thead>
                         <tr>
                           <th style={{ width: '60px', textAlign: 'center' }}>Sel.</th>
-                          <th>{language === 'es' ? 'Código' : 'Code'}</th>
+                          <th>{language === 'es' ? 'CÃÂ³digo' : 'Code'}</th>
                           <th>{language === 'es' ? 'Marca / Modelo' : 'Brand / Model'}</th>
                           <th>{language === 'es' ? 'Tarifa Semanal' : 'Weekly Rate'}</th>
                           <th>{language === 'es' ? 'Kilometraje' : 'Odometer'}</th>
@@ -5867,7 +6514,7 @@ USING (true);`;
                               </td>
                               <td style={{ verticalAlign: 'middle' }}><strong>{bike.serial_number}</strong></td>
                               <td style={{ verticalAlign: 'middle' }}>{bike.name}</td>
-                              <td style={{ verticalAlign: 'middle' }}><span style={{ color: 'var(--color-primary)', fontWeight: 600 }}>€{bike.suggested_weekly_rate}/wk</span></td>
+                              <td style={{ verticalAlign: 'middle' }}><span style={{ color: 'var(--color-primary)', fontWeight: 600 }}>Ã¢ÂÂ¬{bike.suggested_weekly_rate}/wk</span></td>
                               <td style={{ verticalAlign: 'middle' }}>{bike.odometer} km</td>
                             </tr>
                           );
@@ -5883,7 +6530,7 @@ USING (true);`;
                     </table>
                   </div>
                   <button className="btn-primary" style={{ marginTop: '24px' }} disabled={!wizBikeId} onClick={() => setWizardStep(2)}>
-                    Siguiente →
+                    Siguiente Ã¢ÂÂ
                   </button>
                 </div>
               )}
@@ -5892,10 +6539,10 @@ USING (true);`;
               {wizardStep === 2 && (
                 <div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', flexWrap: 'wrap', gap: '10px' }}>
-                    <h3 style={{ margin: 0 }}>{t.step} 2 — {t.selectBattery}</h3>
+                    <h3 style={{ margin: 0 }}>{t.step} 2 Ã¢ÂÂ {t.selectBattery}</h3>
                     <span className="badge status-rented" style={{ padding: '6px 12px', borderRadius: '20px', fontWeight: 600 }}>
                       {language === 'es' 
-                        ? `${wizBatteryIds.length} ${wizBatteryIds.length === 1 ? 'Batería seleccionada' : 'Baterías seleccionadas'}`
+                        ? `${wizBatteryIds.length} ${wizBatteryIds.length === 1 ? 'BaterÃÂ­a seleccionada' : 'BaterÃÂ­as seleccionadas'}`
                         : `${wizBatteryIds.length} ${wizBatteryIds.length === 1 ? 'Battery selected' : 'Batteries selected'}`}
                     </span>
                   </div>
@@ -5905,7 +6552,7 @@ USING (true);`;
                       <thead>
                         <tr>
                           <th style={{ width: '60px', textAlign: 'center' }}>Sel.</th>
-                          <th>{language === 'es' ? 'Código (Serial)' : 'Code (Serial)'}</th>
+                          <th>{language === 'es' ? 'CÃÂ³digo (Serial)' : 'Code (Serial)'}</th>
                           <th>{language === 'es' ? 'Marca / Modelo' : 'Brand / Model'}</th>
                           <th>{language === 'es' ? 'Estado' : 'Status'}</th>
                         </tr>
@@ -5944,7 +6591,7 @@ USING (true);`;
                         {products.filter(p => p.category_id === catBattId && p.status === 'Disponible').length === 0 && (
                           <tr>
                             <td colSpan={4} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '24px' }}>
-                              {language === 'es' ? 'No hay baterías disponibles.' : 'No available batteries.'}
+                              {language === 'es' ? 'No hay baterÃÂ­as disponibles.' : 'No available batteries.'}
                             </td>
                           </tr>
                         )}
@@ -5953,124 +6600,22 @@ USING (true);`;
                   </div>
 
                   <div style={{ display: 'flex', gap: '12px', marginTop: '24px' }}>
-                    <button className="btn-secondary" onClick={() => setWizardStep(1)}>← Atrás</button>
-                    <button className="btn-primary" onClick={() => setWizardStep(3)}>Siguiente →</button>
+                    <button className="btn-secondary" onClick={() => setWizardStep(1)}>Ã¢ÂÂ AtrÃÂ¡s</button>
+                    <button className="btn-primary" onClick={() => setWizardStep(3)}>Siguiente Ã¢ÂÂ</button>
                   </div>
                 </div>
               )}
 
-              {/* STEP 3: Lock (Redesigned – List with Radio Buttons) */}
+              {/* STEP 3: Lock (Redesigned Ã¢ÂÂ List with Radio Buttons) */}
               {wizardStep === 3 && (
                 <div>
-                  <h3 style={{ marginBottom: '16px' }}>{t.step} 3 — {language === 'es' ? 'Asociar Candado' : 'Associate Lock'}</h3>
-
-                  {(() => {
-                    const linkedLock = products.find(p => p.category_id === catLockId && p.custom_field_values?.associated_bike_id === wizBikeId);
-                    return (
-                      <>
-                        {linkedLock && (
-                          <div style={{
-                            background: 'rgba(99, 102, 241, 0.1)',
-                            border: '1px solid rgba(99, 102, 241, 0.25)',
-                            borderRadius: '10px',
-                            padding: '14px 16px',
-                            marginBottom: '16px',
-                            display: 'flex',
-                            flexDirection: 'column',
-                            gap: '8px'
-                          }}>
-                            <div style={{
-                              display: 'flex',
-                              justifyContent: 'space-between',
-                              alignItems: 'center',
-                              width: '100%'
-                            }}>
-                              <div>
-                                <span style={{ fontSize: '11px', color: 'var(--text-bright)', fontWeight: 600, display: 'block', marginBottom: '2px', letterSpacing: '0.5px' }}>
-                                  🔗 {language === 'es' ? 'CANDADO PRE-VINCULADO' : 'PRE-LINKED LOCK'}
-                                </span>
-                                <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>{linkedLock.name}</strong>
-                                <span style={{ color: 'var(--text-muted)', fontSize: '13px', marginLeft: '8px' }}>({linkedLock.serial_number})</span>
-                              </div>
-                              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                                {wizLockId !== linkedLock.id ? (
-                                  <button 
-                                    className="btn-primary btn-xs" 
-                                    onClick={() => setWizLockId(linkedLock.id)}
-                                    style={{ background: 'var(--color-primary)', borderColor: 'var(--color-primary)' }}
-                                  >
-                                    {language === 'es' ? 'Seleccionar' : 'Select'}
-                                  </button>
-                                ) : (
-                                  <span style={{ color: 'var(--color-primary)', fontSize: '13px', fontWeight: 600, marginRight: '8px' }}>
-                                    ✓ {language === 'es' ? 'Seleccionado' : 'Selected'}
-                                  </span>
-                                )}
-                                <button 
-                                  className="btn-secondary btn-xs" 
-                                  style={{ color: '#ef4444' }} 
-                                  onClick={async () => {
-                                    if (window.confirm(language === 'es' ? '¿Estás seguro de que deseas desvincular este candado permanentemente de esta bicicleta?' : 'Are you sure you want to unlink this lock permanently from this bike?')) {
-                                      try {
-                                        const updatedLock = {
-                                          ...linkedLock,
-                                          custom_field_values: {
-                                            ...linkedLock.custom_field_values,
-                                            associated_bike_id: undefined
-                                          }
-                                        };
-                                        await upsertProduct(updatedLock);
-                                        triggerReload();
-                                        if (wizLockId === linkedLock.id) {
-                                          setWizLockId('');
-                                        }
-                                        showToast(language === 'es' ? 'Candado desvinculado.' : 'Lock unlinked.', 'success');
-                                      } catch (err) {
-                                        showToast(language === 'es' ? 'Error al desvincular.' : 'Error unlinking.', 'error');
-                                      }
-                                    }
-                                  }}
-                                >
-                                  {language === 'es' ? 'Desvincular' : 'Unlink'}
-                                </button>
-                              </div>
-                            </div>
-                            {wizLockId === linkedLock.id && (
-                              <div style={{
-                                display: 'flex',
-                                alignItems: 'center',
-                                gap: '8px',
-                                marginTop: '4px',
-                                borderTop: '1px solid rgba(255, 255, 255, 0.08)',
-                                paddingTop: '8px'
-                              }}>
-                                <input
-                                  type="checkbox"
-                                  id="wizKeepAssociatedPre"
-                                  checked={wizKeepAssociated}
-                                  onChange={e => setWizKeepAssociated(e.target.checked)}
-                                  style={{ width: '15px', height: '15px', cursor: 'pointer', margin: 0 }}
-                                />
-                                <label htmlFor="wizKeepAssociatedPre" style={{ margin: 0, fontSize: '12px', color: 'var(--text-bright)', cursor: 'pointer', userSelect: 'none' }}>
-                                  {language === 'es'
-                                    ? 'Mantener candado vinculado permanentemente (no desvincular al devolver)'
-                                    : 'Keep lock permanently associated (do not unlink on return)'
-                                  }
-                                </label>
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </>
-                    );
-                  })()}
-
+                  <h3 style={{ marginBottom: '16px' }}>{t.step} 3 Ã¢ÂÂ {language === 'es' ? 'Asociar Candado' : 'Associate Lock'}</h3>
                   <div className="table-container" style={{ marginTop: '12px' }}>
                     <table className="custom-table" style={{ cursor: 'pointer' }}>
                       <thead>
                         <tr>
                           <th style={{ width: '60px', textAlign: 'center' }}>Sel.</th>
-                          <th>{language === 'es' ? 'Código' : 'Code'}</th>
+                          <th>{language === 'es' ? 'CÃÂ³digo' : 'Code'}</th>
                           <th>{language === 'es' ? 'Marca / Modelo' : 'Brand / Model'}</th>
                           <th>{language === 'es' ? 'Estado' : 'Status'}</th>
                         </tr>
@@ -6092,9 +6637,9 @@ USING (true);`;
                               style={{ accentColor: 'var(--color-primary)', transform: 'scale(1.15)', cursor: 'pointer' }}
                             />
                           </td>
-                          <td style={{ verticalAlign: 'middle' }}><strong>⛔ {language === 'es' ? 'Sin Candado' : 'No Lock'}</strong></td>
+                          <td style={{ verticalAlign: 'middle' }}><strong>Ã¢ÂÂ {language === 'es' ? 'Sin Candado' : 'No Lock'}</strong></td>
                           <td style={{ verticalAlign: 'middle', color: 'var(--text-muted)', fontStyle: 'italic' }}>{language === 'es' ? 'No asociar candado' : 'No lock associated'}</td>
-                          <td style={{ verticalAlign: 'middle' }}>—</td>
+                          <td style={{ verticalAlign: 'middle' }}>Ã¢ÂÂ</td>
                         </tr>
                         {/* Available locks */}
                         {products.filter(p => p.category_id === catLockId && p.status === 'Disponible').map(lock => {
@@ -6115,36 +6660,7 @@ USING (true);`;
                                   style={{ accentColor: 'var(--color-primary)', transform: 'scale(1.15)', cursor: 'pointer' }}
                                 />
                               </td>
-                              <td style={{ verticalAlign: 'middle' }}>
-                                <strong>🔒 {lock.serial_number}</strong>
-                                {isSelected && (
-                                  <div style={{
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    gap: '6px',
-                                    marginTop: '6px',
-                                    background: 'rgba(255, 255, 255, 0.04)',
-                                    padding: '4px 8px',
-                                    borderRadius: '4px',
-                                    border: '1px solid rgba(255, 255, 255, 0.05)',
-                                    width: 'max-content'
-                                  }} onClick={e => e.stopPropagation()}>
-                                    <input
-                                      type="checkbox"
-                                      id={`keep-associated-${lock.id}`}
-                                      checked={wizKeepAssociated}
-                                      onChange={e => setWizKeepAssociated(e.target.checked)}
-                                      style={{ width: '13px', height: '13px', cursor: 'pointer', margin: 0 }}
-                                    />
-                                    <label htmlFor={`keep-associated-${lock.id}`} style={{ margin: 0, fontSize: '11px', color: 'var(--text-bright)', cursor: 'pointer', userSelect: 'none' }}>
-                                      {language === 'es'
-                                        ? 'Mantener candado vinculado permanentemente (no desvincular al devolver)'
-                                        : 'Keep lock permanently associated (do not unlink on return)'
-                                      }
-                                    </label>
-                                  </div>
-                                )}
-                              </td>
+                              <td style={{ verticalAlign: 'middle' }}><strong>Ã°ÂÂÂ {lock.serial_number}</strong></td>
                               <td style={{ verticalAlign: 'middle' }}>{lock.name}</td>
                               <td style={{ verticalAlign: 'middle' }}>
                                 <span className={`badge ${lock.maintenance_status === 'Requiere Service' ? 'status-lost' : 'status-active'}`} style={{ fontSize: '11px' }}>
@@ -6165,8 +6681,8 @@ USING (true);`;
                     </table>
                   </div>
                   <div style={{ display: 'flex', gap: '12px', marginTop: '24px' }}>
-                    <button className="btn-secondary" onClick={() => setWizardStep(2)}>← Atrás</button>
-                    <button className="btn-primary" onClick={() => setWizardStep(4)}>Siguiente →</button>
+                    <button className="btn-secondary" onClick={() => setWizardStep(2)}>Ã¢ÂÂ AtrÃÂ¡s</button>
+                    <button className="btn-primary" onClick={() => setWizardStep(4)}>Siguiente Ã¢ÂÂ</button>
                   </div>
                 </div>
               )}
@@ -6174,11 +6690,11 @@ USING (true);`;
               {/* STEP 4: Kit de Accesorios (NEW) */}
               {wizardStep === 4 && (
                 <div>
-                  <h3 style={{ marginBottom: '16px' }}>{t.step} 4 — {language === 'es' ? 'Kit de Accesorios' : 'Accessories Kit'}</h3>
+                  <h3 style={{ marginBottom: '16px' }}>{t.step} 4 Ã¢ÂÂ {language === 'es' ? 'Kit de Accesorios' : 'Accessories Kit'}</h3>
 
                   {/* Yes / No selector */}
                   <p style={{ fontSize: '14px', color: 'var(--text-muted)', marginBottom: '16px' }}>
-                    {language === 'es' ? '¿El alquiler incluye un kit de accesorios?' : 'Does the rental include an accessories kit?'}
+                    {language === 'es' ? 'ÃÂ¿El alquiler incluye un kit de accesorios?' : 'Does the rental include an accessories kit?'}
                   </p>
                   <div style={{ display: 'flex', gap: '16px', marginBottom: '24px' }}>
                     {/* YES card */}
@@ -6190,7 +6706,8 @@ USING (true);`;
                         background: wizHasKit ? 'rgba(16,185,129,0.08)' : 'rgba(0,0,0,0.1)',
                         textAlign: 'center', transition: 'all 0.2s ease',
                       }}>
-                      <div style={{ fontSize: '28px', marginBottom: '6px' }}>✅</div>
+                      <div style={{ fontSize: '28px', marginBottom: '6px' }}>Ã¢ÂÂ
+</div>
                       <strong style={{ fontSize: '15px', color: wizHasKit ? 'var(--color-primary)' : 'var(--text-bright)' }}>
                         {language === 'es' ? 'Con Kit' : 'With Kit'}
                       </strong>
@@ -6204,7 +6721,7 @@ USING (true);`;
                         background: !wizHasKit ? 'rgba(132,204,22,0.08)' : 'rgba(0,0,0,0.1)',
                         textAlign: 'center', transition: 'all 0.2s ease',
                       }}>
-                      <div style={{ fontSize: '28px', marginBottom: '6px' }}>⛔</div>
+                      <div style={{ fontSize: '28px', marginBottom: '6px' }}>Ã¢ÂÂ</div>
                       <strong style={{ fontSize: '15px', color: !wizHasKit ? 'var(--color-accent)' : 'var(--text-bright)' }}>
                         {language === 'es' ? 'Sin Kit' : 'Without Kit'}
                       </strong>
@@ -6216,26 +6733,26 @@ USING (true);`;
                     <div style={{ background: 'rgba(16,185,129,0.04)', border: '1px solid rgba(16,185,129,0.15)', borderRadius: '12px', padding: '16px' }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
                         <h4 style={{ margin: 0, color: 'var(--color-primary)', fontSize: '14px' }}>
-                          🎒 {language === 'es' ? 'Artículos del Kit' : 'Kit Items'} ({wizKitProductIds.length})
+                          Ã°ÂÂÂ {language === 'es' ? 'ArtÃÂ­culos del Kit' : 'Kit Items'} ({wizKitProductIds.length})
                         </h4>
                         <button className="btn-primary btn-xs" style={{ padding: '6px 14px', fontSize: '13px' }}
                           onClick={() => { setKitSearchModalOpen(true); setKitSearchQuery(''); }}>
-                          ➕ {language === 'es' ? 'Agregar Artículo' : 'Add Item'}
+                          Ã¢ÂÂ {language === 'es' ? 'Agregar ArtÃÂ­culo' : 'Add Item'}
                         </button>
                       </div>
 
                       {wizKitProductIds.length === 0 ? (
                         <p style={{ fontSize: '13px', color: 'var(--text-muted)', textAlign: 'center', padding: '16px 0' }}>
-                          {language === 'es' ? 'No hay artículos en el kit. Haz clic en "Agregar Artículo" para buscar en el stock.' : 'No kit items yet. Click "Add Item" to search stock.'}
+                          {language === 'es' ? 'No hay artÃÂ­culos en el kit. Haz clic en "Agregar ArtÃÂ­culo" para buscar en el stock.' : 'No kit items yet. Click "Add Item" to search stock.'}
                         </p>
                       ) : (
                         <div className="table-container" style={{ marginTop: '8px' }}>
                           <table className="custom-table">
                             <thead>
                               <tr>
-                                <th>{language === 'es' ? 'Código' : 'Code'}</th>
+                                <th>{language === 'es' ? 'CÃÂ³digo' : 'Code'}</th>
                                 <th>{language === 'es' ? 'Nombre' : 'Name'}</th>
-                                <th>{language === 'es' ? 'Categoría' : 'Category'}</th>
+                                <th>{language === 'es' ? 'CategorÃÂ­a' : 'Category'}</th>
                                 <th style={{ width: '60px', textAlign: 'center' }}></th>
                               </tr>
                             </thead>
@@ -6252,7 +6769,7 @@ USING (true);`;
                                     <td style={{ textAlign: 'center' }}>
                                       <button className="btn-danger btn-xs" style={{ padding: '4px 8px', fontSize: '12px' }}
                                         onClick={() => setWizKitProductIds(prev => prev.filter(x => x !== pid))}>
-                                        🗑️
+                                        Ã°ÂÂÂÃ¯Â¸Â
                                       </button>
                                     </td>
                                   </tr>
@@ -6266,8 +6783,8 @@ USING (true);`;
                   )}
 
                   <div style={{ display: 'flex', gap: '12px', marginTop: '24px' }}>
-                    <button className="btn-secondary" onClick={() => setWizardStep(3)}>← Atrás</button>
-                    <button className="btn-primary" onClick={() => setWizardStep(5)}>Siguiente →</button>
+                    <button className="btn-secondary" onClick={() => setWizardStep(3)}>Ã¢ÂÂ AtrÃÂ¡s</button>
+                    <button className="btn-primary" onClick={() => setWizardStep(5)}>Siguiente Ã¢ÂÂ</button>
                   </div>
                 </div>
               )}
@@ -6275,11 +6792,11 @@ USING (true);`;
               {/* STEP 5: Customer / Rider info */}
               {wizardStep === 5 && (
                 <div>
-                  <h3 style={{ marginBottom: '16px' }}>{t.step} 5 — {t.customerInfo}</h3>
+                  <h3 style={{ marginBottom: '16px' }}>{t.step} 5 Ã¢ÂÂ {t.customerInfo}</h3>
 
                   {/* Rider autocomplete search */}
                   <div className="form-group" style={{ marginBottom: '16px', background: 'rgba(16,185,129,0.06)', padding: '12px', borderRadius: '10px', border: '1px solid rgba(16,185,129,0.2)', position: 'relative' }}>
-                    <label className="form-label">🔍 {language === 'es' ? 'Buscar Rider Registrado' : 'Search Registered Rider'}</label>
+                    <label className="form-label">Ã°ÂÂÂ {language === 'es' ? 'Buscar Rider Registrado' : 'Search Registered Rider'}</label>
                     <input type="text" className="form-control" placeholder={language === 'es' ? 'Buscar por nombre o email...' : 'Search by name or email...'}
                       value={wizRiderEmail}
                       onChange={e => setWizRiderEmail(e.target.value)} />
@@ -6306,11 +6823,12 @@ USING (true);`;
                                 setWizReferral(c.referral_source);
                                 setWizCustomerCode(c.customer_code ? c.customer_code.replace(/^US-?/i, '') : '');
                                 setWizRiderEmail(`${c.first_name} ${c.last_name} (${c.email})`);
-                                showToast(`✅ Rider seleccionado: ${c.first_name} ${c.last_name}`, 'success');
+                                showToast(`Ã¢ÂÂ
+ Rider seleccionado: ${c.first_name} ${c.last_name}`, 'success');
                               }}
                             >
                               <strong>{c.first_name} {c.last_name}</strong>
-                              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>✉️ {c.email} | 📞 {c.phone}</span>
+                              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Ã¢ÂÂÃ¯Â¸Â {c.email} | Ã°ÂÂÂ {c.phone}</span>
                             </div>
                           ))}
                         </div>
@@ -6366,7 +6884,7 @@ USING (true);`;
                       <input type="email" className="form-control" value={wizEmail} onChange={e => setWizEmail(e.target.value)} />
                     </div>
                     <div className="form-group">
-                      <label className="form-label">{language === 'es' ? 'Teléfono' : 'Phone'}</label>
+                      <label className="form-label">{language === 'es' ? 'TelÃÂ©fono' : 'Phone'}</label>
                       <input type="text" className="form-control" placeholder="+353..." value={wizPhone} onChange={e => setWizPhone(e.target.value)} />
                     </div>
                     <div className="form-group">
@@ -6404,9 +6922,9 @@ USING (true);`;
                       <label className="form-label">{language === 'es' ? 'Idioma para Correos / Comunicaciones' : 'Language for Emails / Communications'}</label>
                       <div style={{ display: 'flex', gap: '8px' }}>
                         {[
-                          { key: 'es', flag: '🇪🇸', label: 'Español' },
-                          { key: 'en', flag: '🇬🇧', label: 'English' },
-                          { key: 'pt', flag: '🇵🇹', label: 'Português' },
+                          { key: 'es', flag: 'Ã°ÂÂÂªÃ°ÂÂÂ¸', label: 'EspaÃÂ±ol' },
+                          { key: 'en', flag: 'Ã°ÂÂÂ¬Ã°ÂÂÂ§', label: 'English' },
+                          { key: 'pt', flag: 'Ã°ÂÂÂµÃ°ÂÂÂ¹', label: 'PortuguÃÂªs' },
                         ].map(lang => (
                           <button
                             key={lang.key}
@@ -6455,7 +6973,7 @@ USING (true);`;
                               className="form-control" 
                               value={wizRefWhatsApp} 
                               onChange={e => handleWizRefWhatsAppChange(e.target.value)} 
-                              placeholder={language === 'es' ? 'Ej: Repartidores Dublín' : 'E.g.: Dublin Delivery Group'}
+                              placeholder={language === 'es' ? 'Ej: Repartidores DublÃÂ­n' : 'E.g.: Dublin Delivery Group'}
                               style={{ height: '38px', flex: 1 }}
                             />
                             <label className="form-label" style={{ margin: 0, whiteSpace: 'nowrap', fontSize: '12px', color: 'var(--text-muted)' }}>
@@ -6472,7 +6990,7 @@ USING (true);`;
                                 className="form-control" 
                                 value={wizRefUserQuery} 
                                 onChange={e => handleWizRefUserQueryChange(e.target.value)} 
-                                placeholder={language === 'es' ? '🔍 Escribe 3 letras para buscar...' : '🔍 Type 3 letters to search...'}
+                                placeholder={language === 'es' ? 'Ã°ÂÂÂ Escribe 3 letras para buscar...' : 'Ã°ÂÂÂ Type 3 letters to search...'}
                                 style={{ height: '38px', width: '100%' }}
                               />
                               {wizRefUserQuery.trim().length >= 3 && (
@@ -6540,7 +7058,7 @@ USING (true);`;
                                     setQuickAddRiderModalOpen(true);
                                   }}
                                 >
-                                  ➕ {language === 'es' ? 'Nuevo' : 'New'}
+                                  Ã¢ÂÂ {language === 'es' ? 'Nuevo' : 'New'}
                                 </button>
                               )}
                             </label>
@@ -6554,11 +7072,11 @@ USING (true);`;
                               className="form-control" 
                               value={wizRefOther} 
                               onChange={e => handleWizRefOtherChange(e.target.value)} 
-                              placeholder={language === 'es' ? 'Ej: Recomendación de un amigo, cartel publicitario' : 'E.g.: Friend recommendation, billboard'}
+                              placeholder={language === 'es' ? 'Ej: RecomendaciÃÂ³n de un amigo, cartel publicitario' : 'E.g.: Friend recommendation, billboard'}
                               style={{ height: '38px', flex: 1 }}
                             />
                             <label className="form-label" style={{ margin: 0, whiteSpace: 'nowrap', fontSize: '12px', color: 'var(--text-muted)' }}>
-                              {language === 'es' ? 'Especificar origen / información extra' : 'Specify source / extra info'}
+                              {language === 'es' ? 'Especificar origen / informaciÃÂ³n extra' : 'Specify source / extra info'}
                             </label>
                           </div>
                         )}
@@ -6566,8 +7084,8 @@ USING (true);`;
                     )}
                   </div>
                   <div style={{ display: 'flex', gap: '12px', marginTop: '20px' }}>
-                    <button className="btn-secondary" onClick={() => setWizardStep(4)}>← Atrás</button>
-                    <button className="btn-primary" disabled={!wizFirstName || !wizLastName} onClick={() => setWizardStep(6)}>Siguiente →</button>
+                    <button className="btn-secondary" onClick={() => setWizardStep(4)}>Ã¢ÂÂ AtrÃÂ¡s</button>
+                    <button className="btn-primary" disabled={!wizFirstName || !wizLastName} onClick={() => setWizardStep(6)}>Siguiente Ã¢ÂÂ</button>
                   </div>
                 </div>
               )}
@@ -6575,10 +7093,10 @@ USING (true);`;
               {/* STEP 6: Rates & Terms */}
               {wizardStep === 6 && (
                 <div>
-                  <h3 style={{ marginBottom: '16px' }}>{t.step} 6 — {language === 'es' ? 'Condiciones y Tarifas' : 'Rates & Terms'}</h3>
+                  <h3 style={{ marginBottom: '16px' }}>{t.step} 6 Ã¢ÂÂ {language === 'es' ? 'Condiciones y Tarifas' : 'Rates & Terms'}</h3>
                   <div className="form-grid" style={{ marginBottom: '16px' }}>
                     <div className="form-group">
-                      <label className="form-label">{language === 'es' ? 'Tarifa (€)' : 'Rate (€)'}</label>
+                      <label className="form-label">{language === 'es' ? 'Tarifa (Ã¢ÂÂ¬)' : 'Rate (Ã¢ÂÂ¬)'}</label>
                       <input type="number" className="form-control" value={wizRate} onChange={e => setWizRate(Number(e.target.value))} />
                     </div>
                     <div className="form-group">
@@ -6590,21 +7108,21 @@ USING (true);`;
                       </select>
                     </div>
                     <div className="form-group">
-                      <label className="form-label">{language === 'es' ? 'Cobro Alquiler vía' : 'Rental Payment via'}</label>
+                      <label className="form-label">{language === 'es' ? 'Cobro Alquiler vÃÂ­a' : 'Rental Payment via'}</label>
                       <select className="form-control" value={wizRatePaymentMethod} onChange={e => setWizRatePaymentMethod(e.target.value as 'efectivo' | 'transferencia')}>
-                        <option value="efectivo">💵 {language === 'es' ? 'Efectivo' : 'Cash'}</option>
-                        <option value="transferencia">🏦 {language === 'es' ? 'Transferencia' : 'Bank Transfer'}</option>
+                        <option value="efectivo">Ã°ÂÂÂµ {language === 'es' ? 'Efectivo' : 'Cash'}</option>
+                        <option value="transferencia">Ã°ÂÂÂ¦ {language === 'es' ? 'Transferencia' : 'Bank Transfer'}</option>
                       </select>
                     </div>
                     <div className="form-group">
-                      <label className="form-label">{language === 'es' ? 'Depósito (€)' : 'Deposit (€)'}</label>
+                      <label className="form-label">{language === 'es' ? 'DepÃÂ³sito (Ã¢ÂÂ¬)' : 'Deposit (Ã¢ÂÂ¬)'}</label>
                       <input type="number" className="form-control" value={wizDeposit} onChange={e => setWizDeposit(Number(e.target.value))} />
                     </div>
                     <div className="form-group">
-                      <label className="form-label">{language === 'es' ? 'Depósito recibido vía' : 'Deposit received via'}</label>
+                      <label className="form-label">{language === 'es' ? 'DepÃÂ³sito recibido vÃÂ­a' : 'Deposit received via'}</label>
                       <select className="form-control" value={wizDepositPaymentMethod} onChange={e => setWizDepositPaymentMethod(e.target.value as 'efectivo' | 'transferencia')}>
-                        <option value="efectivo">💵 {language === 'es' ? 'Efectivo' : 'Cash'}</option>
-                        <option value="transferencia">🏦 {language === 'es' ? 'Transferencia' : 'Bank Transfer'}</option>
+                        <option value="efectivo">Ã°ÂÂÂµ {language === 'es' ? 'Efectivo' : 'Cash'}</option>
+                        <option value="transferencia">Ã°ÂÂÂ¦ {language === 'es' ? 'Transferencia' : 'Bank Transfer'}</option>
                       </select>
                     </div>
                     <div className="form-group">
@@ -6614,11 +7132,11 @@ USING (true);`;
                   </div>
                   <label className="form-checkbox" style={{ marginBottom: '16px' }}>
                     <input type="checkbox" checked={wizHasInsurance} onChange={e => setWizHasInsurance(e.target.checked)} />
-                    {language === 'es' ? '¿Tiene Seguro Adicional?' : 'Has Additional Insurance?'}
+                    {language === 'es' ? 'ÃÂ¿Tiene Seguro Adicional?' : 'Has Additional Insurance?'}
                   </label>
                   <div style={{ display: 'flex', gap: '12px', marginTop: '20px' }}>
-                    <button className="btn-secondary" onClick={() => setWizardStep(5)}>← Atrás</button>
-                    <button className="btn-primary" onClick={() => setWizardStep(7)}>Siguiente →</button>
+                    <button className="btn-secondary" onClick={() => setWizardStep(5)}>Ã¢ÂÂ AtrÃÂ¡s</button>
+                    <button className="btn-primary" onClick={() => setWizardStep(7)}>Siguiente Ã¢ÂÂ</button>
                   </div>
                 </div>
               )}
@@ -6626,20 +7144,20 @@ USING (true);`;
               {/* STEP 7: Evidence & Contract */}
               {wizardStep === 7 && (
                 <div>
-                  <h3 style={{ marginBottom: '20px' }}>{t.step} 7 — {language === 'es' ? 'Evidencia y Contrato' : 'Evidence & Contract'}</h3>
+                  <h3 style={{ marginBottom: '20px' }}>{t.step} 7 Ã¢ÂÂ {language === 'es' ? 'Evidencia y Contrato' : 'Evidence & Contract'}</h3>
 
                   {/* Section 1: Bike Condition Photos */}
                   <div className="evidence-section">
                     <div className="evidence-section-title">
-                      📸 {language === 'es' ? 'Estado de la Bicicleta' : 'Bike Condition'}
+                      Ã°ÂÂÂ¸ {language === 'es' ? 'Estado de la Bicicleta' : 'Bike Condition'}
                     </div>
                     <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '12px' }}>
                       {language === 'es' ? 'Sube fotos del estado actual de la bici para dejar constancia antes del alquiler.' : 'Upload photos of the current bike condition before rental.'}
                     </p>
                     <div className="photo-upload-zone">
-                      <span className="upload-icon">📷</span>
+                      <span className="upload-icon">Ã°ÂÂÂ·</span>
                       <p className="upload-text">
-                        {language === 'es' ? <><strong>Haz clic</strong> o arrastra fotos aquí</> : <><strong>Click</strong> or drag photos here</>}
+                        {language === 'es' ? <><strong>Haz clic</strong> o arrastra fotos aquÃÂ­</> : <><strong>Click</strong> or drag photos here</>}
                       </p>
                       <input
                         type="file"
@@ -6669,7 +7187,7 @@ USING (true);`;
                                 setWizConditionPreviews(prev => prev.filter((_, i) => i !== idx));
                                 setWizConditionFiles(prev => prev.filter((_, i) => i !== idx));
                               }}
-                            >✕</button>
+                            >Ã¢ÂÂ</button>
                           </div>
                         ))}
                       </div>
@@ -6679,7 +7197,7 @@ USING (true);`;
                   {/* Section 2: Rider ID Document */}
                   <div className="evidence-section">
                     <div className="evidence-section-title">
-                      🪪 {language === 'es' ? 'Documento de Identidad del Rider' : 'Rider ID Document'}
+                      Ã°ÂÂªÂª {language === 'es' ? 'Documento de Identidad del Rider' : 'Rider ID Document'}
                     </div>
                     <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '12px' }}>
                       {language === 'es' ? 'Sube una foto del pasaporte, DNI o ID del rider.' : 'Upload a photo of the rider\'s passport or ID.'}
@@ -6700,12 +7218,12 @@ USING (true);`;
                           };
                           input.click();
                         }}>
-                          <span>🔄 {language === 'es' ? 'Reemplazar' : 'Replace'}</span>
+                          <span>Ã°ÂÂÂ {language === 'es' ? 'Reemplazar' : 'Replace'}</span>
                         </div>
                       </div>
                     ) : (
                       <div className="photo-upload-zone">
-                        <span className="upload-icon">🪪</span>
+                        <span className="upload-icon">Ã°ÂÂªÂª</span>
                         <p className="upload-text">
                           {language === 'es' ? <><strong>Subir</strong> Pasaporte / ID</> : <><strong>Upload</strong> Passport / ID</>}
                         </p>
@@ -6728,25 +7246,25 @@ USING (true);`;
                   {/* Section 3: Contract Mode */}
                   <div className="evidence-section">
                     <div className="evidence-section-title">
-                      📄 {language === 'es' ? 'Contrato de Alquiler' : 'Rental Contract'}
+                      Ã°ÂÂÂ {language === 'es' ? 'Contrato de Alquiler' : 'Rental Contract'}
                     </div>
                     <div className="contract-mode-container">
                       <div
                         className={`contract-mode-card ${wizContractMode === 'digital' ? 'selected' : ''}`}
                         onClick={() => { setWizContractMode('digital'); setWizPhysicalContractFiles([]); setWizPhysicalContractPreviews([]); }}
                       >
-                        <span className="card-icon">📱</span>
+                        <span className="card-icon">Ã°ÂÂÂ±</span>
                         <div className="card-title">{language === 'es' ? 'Contrato Digital' : 'Digital Contract'}</div>
                         <p className="card-desc">
-                          {language === 'es' ? 'Se generará un enlace de firma que podrás enviar al rider por email o WhatsApp.' : 'A signing link will be generated to send to the rider via email or WhatsApp.'}
+                          {language === 'es' ? 'Se generarÃÂ¡ un enlace de firma que podrÃÂ¡s enviar al rider por email o WhatsApp.' : 'A signing link will be generated to send to the rider via email or WhatsApp.'}
                         </p>
                       </div>
                       <div
                         className={`contract-mode-card ${wizContractMode === 'physical' ? 'selected' : ''}`}
                         onClick={() => setWizContractMode('physical')}
                       >
-                        <span className="card-icon">📄</span>
-                        <div className="card-title">{language === 'es' ? 'Contrato Físico' : 'Physical Contract'}</div>
+                        <span className="card-icon">Ã°ÂÂÂ</span>
+                        <div className="card-title">{language === 'es' ? 'Contrato FÃÂ­sico' : 'Physical Contract'}</div>
                         <p className="card-desc">
                           {language === 'es' ? 'Sube una foto del contrato firmado a mano por el rider.' : 'Upload a photo of the hand-signed contract.'}
                         </p>
@@ -6757,11 +7275,12 @@ USING (true);`;
                     {wizContractMode === 'digital' && (
                       <div style={{ marginTop: '16px', padding: '14px', background: 'rgba(16,185,129,0.08)', borderRadius: '10px', border: '1px solid rgba(16,185,129,0.2)' }}>
                         <p style={{ fontSize: '13px', color: 'var(--color-primary)', fontWeight: 600, marginBottom: '4px' }}>
-                          ✅ {language === 'es' ? 'Se generará un enlace de firma al confirmar' : 'A signing link will be generated on confirm'}
+                          Ã¢ÂÂ
+ {language === 'es' ? 'Se generarÃÂ¡ un enlace de firma al confirmar' : 'A signing link will be generated on confirm'}
                         </p>
                         <p style={{ fontSize: '12px', color: 'var(--text-muted)', margin: 0 }}>
                           {language === 'es'
-                            ? `El enlace se copiará al portapapeles automáticamente. Envíalo a ${wizEmail || 'el rider'} por email o WhatsApp.`
+                            ? `El enlace se copiarÃÂ¡ al portapapeles automÃÂ¡ticamente. EnvÃÂ­alo a ${wizEmail || 'el rider'} por email o WhatsApp.`
                             : `The link will be copied to your clipboard. Send it to ${wizEmail || 'the rider'} via email or WhatsApp.`}
                         </p>
                       </div>
@@ -6774,9 +7293,9 @@ USING (true);`;
                           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))', gap: '10px', marginBottom: '12px' }}>
                             {wizPhysicalContractPreviews.map((preview, idx) => (
                               <div key={idx} style={{ position: 'relative', borderRadius: '8px', overflow: 'hidden', border: '1px solid var(--border-color)' }}>
-                                <img src={preview} alt={`Pág. ${idx + 1}`} style={{ width: '100%', height: '100px', objectFit: 'cover', display: 'block' }} />
+                                <img src={preview} alt={`PÃÂ¡g. ${idx + 1}`} style={{ width: '100%', height: '100px', objectFit: 'cover', display: 'block' }} />
                                 <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, background: 'rgba(0,0,0,0.55)', fontSize: '11px', color: '#fff', textAlign: 'center', padding: '2px 0' }}>
-                                  Pág. {idx + 1}
+                                  PÃÂ¡g. {idx + 1}
                                 </div>
                                 <button
                                   onClick={() => {
@@ -6785,16 +7304,16 @@ USING (true);`;
                                     setWizPhysicalContractPreviews(prev => prev.filter((_, i) => i !== idx));
                                   }}
                                   style={{ position: 'absolute', top: '4px', right: '4px', background: 'rgba(239,68,68,0.85)', border: 'none', borderRadius: '50%', width: '22px', height: '22px', cursor: 'pointer', color: '#fff', fontSize: '12px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-                                >✕</button>
+                                >Ã¢ÂÂ</button>
                               </div>
                             ))}
                           </div>
                         )}
                         <div className="photo-upload-zone">
-                          <span className="upload-icon">📄</span>
+                          <span className="upload-icon">Ã°ÂÂÂ</span>
                           <p className="upload-text">
                             {language === 'es'
-                              ? <><strong>{wizPhysicalContractPreviews.length > 0 ? 'Añadir más páginas' : 'Subir'}</strong> foto(s) del contrato firmado</>
+                              ? <><strong>{wizPhysicalContractPreviews.length > 0 ? 'AÃÂ±adir mÃÂ¡s pÃÂ¡ginas' : 'Subir'}</strong> foto(s) del contrato firmado</>
                               : <><strong>{wizPhysicalContractPreviews.length > 0 ? 'Add more pages' : 'Upload'}</strong> signed contract photo(s)</>}
                           </p>
                           <input
@@ -6816,18 +7335,87 @@ USING (true);`;
                     )}
                   </div>
 
+                  {/* Section 3b: Delivery Checklist (customer) */}
+                  <div className="evidence-section">
+                    <div className="evidence-section-title">
+                      Ã¢ÂÂ
+ {language === 'es' ? 'Checklist de Entrega (Cliente)' : 'Delivery Checklist (Customer)'}
+                    </div>
+                    <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '12px' }}>
+                      {language === 'es'
+                        ? 'Se enviarÃÂ¡ al rider un correo con un enlace para revisar el estado de la e-bike, marcar su conformidad y firmar digitalmente. Al enviarlo recibirÃÂ¡ una copia del documento aceptado.'
+                        : 'The rider will receive an email with a link to review the e-bike condition, confirm acceptance and sign digitally. On submission they receive a copy of the accepted document.'}
+                    </p>
+                    <label
+                      style={{
+                        display: 'flex', alignItems: 'flex-start', gap: '10px', cursor: wizEmail ? 'pointer' : 'not-allowed',
+                        padding: '12px', borderRadius: '10px', border: '1px solid var(--border-color)',
+                        background: wizSendDeliveryChecklist && wizEmail ? 'rgba(16,185,129,0.08)' : 'transparent',
+                        opacity: wizEmail ? 1 : 0.6,
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={wizSendDeliveryChecklist && !!wizEmail}
+                        disabled={!wizEmail}
+                        onChange={(e) => setWizSendDeliveryChecklist(e.target.checked)}
+                        style={{ marginTop: '2px', width: '18px', height: '18px', accentColor: 'var(--color-primary)' }}
+                      />
+                      <span style={{ fontSize: '13px' }}>
+                        <strong>{language === 'es' ? 'Enviar checklist de entrega al cliente por email' : 'Email the delivery checklist to the customer'}</strong>
+                        <br />
+                        <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                          {wizEmail
+                            ? (language === 'es' ? `Se enviarÃÂ¡ a ${wizEmail} al confirmar el alquiler.` : `Will be sent to ${wizEmail} when the rental is confirmed.`)
+                            : (language === 'es' ? 'Ã¢ÂÂ Ã¯Â¸Â Agrega el email del rider para habilitar el envÃÂ­o.' : 'Ã¢ÂÂ Ã¯Â¸Â Add the rider email to enable sending.')}
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+
+                  {/* Section 3c: Internal Technical Inspection Checklist */}
+                  <div className="evidence-section">
+                    <div className="evidence-section-title">
+                      Ã°ÂÂÂ§ {language === 'es' ? 'Checklist TÃÂ©cnica (Interno)' : 'Technical Checklist (Internal)'}
+                    </div>
+                    <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '12px' }}>
+                      {language === 'es'
+                        ? 'InspecciÃÂ³n tÃÂ©cnica previa a la entrega (uso interno). PodÃÂ©s completarla ahora o mÃÂ¡s tarde desde el expediente del rider.'
+                        : 'Pre-delivery technical inspection (internal use). You can complete it now or later from the rider profile.'}
+                    </p>
+                    {(() => {
+                      const done = INTERNAL_CHECKLIST_ITEM_KEYS.filter(k => wizInternalChecklist.items[k]).length;
+                      const total = INTERNAL_CHECKLIST_ITEM_KEYS.length;
+                      return (
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                          <span style={{
+                            fontSize: '12px', padding: '3px 10px', borderRadius: '6px',
+                            background: done > 0 ? 'rgba(16,185,129,0.12)' : 'rgba(255,255,255,0.05)',
+                            color: done > 0 ? 'var(--color-primary)' : 'var(--text-muted)',
+                            border: '1px solid rgba(255,255,255,0.08)'
+                          }}>
+                            {done}/{total} {language === 'es' ? 'marcados' : 'checked'}
+                          </span>
+                          <button type="button" className="btn-secondary" onClick={() => setWizShowInternalChecklist(true)}>
+                            Ã°ÂÂÂ {language === 'es' ? 'Completar checklist' : 'Fill in checklist'}
+                          </button>
+                        </div>
+                      );
+                    })()}
+                  </div>
+
                   {/* Section 4: Instagram Photos */}
                   <div className="evidence-section">
                     <div className="evidence-section-title">
-                      📸 {language === 'es' ? 'Fotos de Instagram' : 'Instagram Photos'}
+                      Ã°ÂÂÂ¸ {language === 'es' ? 'Fotos de Instagram' : 'Instagram Photos'}
                     </div>
                     <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '12px' }}>
                       {language === 'es' ? 'Sube fotos del rider con la e-bike para luego compartirlas en redes sociales.' : 'Upload photos of the rider with the e-bike to share on social media later.'}
                     </p>
                     <div className="photo-upload-zone">
-                      <span className="upload-icon">📸</span>
+                      <span className="upload-icon">Ã°ÂÂÂ¸</span>
                       <p className="upload-text">
-                        {language === 'es' ? <><strong>Haz clic</strong> o arrastra fotos aquí</> : <><strong>Click</strong> or drag photos here</>}
+                        {language === 'es' ? <><strong>Haz clic</strong> o arrastra fotos aquÃÂ­</> : <><strong>Click</strong> or drag photos here</>}
                       </p>
                       <input
                         type="file"
@@ -6857,7 +7445,7 @@ USING (true);`;
                                 setWizInstagramPreviews(prev => prev.filter((_, i) => i !== idx));
                                 setWizInstagramFiles(prev => prev.filter((_, i) => i !== idx));
                               }}
-                            >✕</button>
+                            >Ã¢ÂÂ</button>
                           </div>
                         ))}
                       </div>
@@ -6865,8 +7453,8 @@ USING (true);`;
                   </div>
 
                   <div style={{ display: 'flex', gap: '12px', marginTop: '20px' }}>
-                    <button className="btn-secondary" onClick={() => setWizardStep(6)}>← Atrás</button>
-                    <button className="btn-primary" disabled={!wizContractMode} onClick={() => setWizardStep(8)}>Siguiente →</button>
+                    <button className="btn-secondary" onClick={() => setWizardStep(6)}>Ã¢ÂÂ AtrÃÂ¡s</button>
+                    <button className="btn-primary" disabled={!wizContractMode} onClick={() => setWizardStep(8)}>Siguiente Ã¢ÂÂ</button>
                   </div>
                 </div>
               )}
@@ -6874,7 +7462,7 @@ USING (true);`;
               {/* STEP 8: Link Gig Account */}
               {wizardStep === 8 && (
                 <div>
-                  <h3 style={{ marginBottom: '16px' }}>{t.step} 8 — {language === 'es' ? 'Vincular Cuenta de Plataforma (Opcional)' : 'Link Platform Account (Optional)'}</h3>
+                  <h3 style={{ marginBottom: '16px' }}>{t.step} 8 Ã¢ÂÂ {language === 'es' ? 'Vincular Cuenta de Plataforma (Opcional)' : 'Link Platform Account (Optional)'}</h3>
                   <div className="form-group" style={{ marginBottom: '24px' }}>
                     <label className="form-label">{language === 'es' ? 'Seleccionar Cuenta Disponible' : 'Select Available Account'}</label>
                     <select className="form-control" value={wizGigAccountId || ''} onChange={e => setWizGigAccountId(e.target.value || null)}>
@@ -6888,8 +7476,8 @@ USING (true);`;
                     </select>
                   </div>
                   <div style={{ display: 'flex', gap: '12px' }}>
-                    <button className="btn-secondary" onClick={() => setWizardStep(7)}>← Atrás</button>
-                    <button className="btn-primary" onClick={() => setWizardStep(9)}>Siguiente →</button>
+                    <button className="btn-secondary" onClick={() => setWizardStep(7)}>Ã¢ÂÂ AtrÃÂ¡s</button>
+                    <button className="btn-primary" onClick={() => setWizardStep(9)}>Siguiente Ã¢ÂÂ</button>
                   </div>
                 </div>
               )}
@@ -6897,25 +7485,28 @@ USING (true);`;
               {/* STEP 9: Confirm */}
               {wizardStep === 9 && (
                 <div>
-                  <h3 style={{ marginBottom: '20px' }}>✅ {t.step} 9 — {t.confirmRental}</h3>
+                  <h3 style={{ marginBottom: '20px' }}>Ã¢ÂÂ
+ {t.step} 9 Ã¢ÂÂ {t.confirmRental}</h3>
                   <div className="wizard-confirm-grid">
                     {[
-                      ['🚲 E-Bike', products.find(p => p.id === wizBikeId)?.serial_number ?? '—'],
-                      ['🔋 Battery', wizBatteryIds.length > 0 ? wizBatteryIds.map(id => products.find(p => p.id === id)?.serial_number).filter(Boolean).join(', ') : 'None'],
-                      ['🔒 Lock', wizLockId ? products.find(p => p.id === wizLockId)?.serial_number : 'None'],
-                      ['🎒 Kit', wizHasKit ? (wizKitProductIds.length > 0 ? wizKitProductIds.map(id => products.find(p => p.id === id)?.serial_number).filter(Boolean).join(', ') : (language === 'es' ? 'Sí (sin artículos)' : 'Yes (no items)')) : 'No'],
-                      ['👤 Rider', `${wizFirstName} ${wizLastName}`],
-                      ['🪪 Código / Code', wizCustomerCode ? 'US-' + wizCustomerCode.replace(/^US-?/i, '') : '—'],
-                      ['📧 Email', wizEmail],
-                      ['📱 Phone', wizPhone],
-                      ['📅 Fecha Inicio / Start Date', wizStartDate],
-                      ['💶 Rate', `€${wizRate}/${wizRateType} (${wizRatePaymentMethod === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})`],
-                      ['🏦 Deposit', `€${wizDeposit} (${wizDepositPaymentMethod === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})`],
-                      ['📱 App Account', wizGigAccountId ? (appAccounts.find(a => a.id === wizGigAccountId)?.platform_account_number || 'Linked') : '—'],
-                      ['📸 Fotos', `${wizConditionFiles.length} ${language === 'es' ? 'foto(s)' : 'photo(s)'}`],
-                      ['📸 Fotos Instagram', `${wizInstagramFiles.length} ${language === 'es' ? 'foto(s)' : 'photo(s)'}`],
-                      ['🪪 ID', wizIdDocFile ? '✅' : '—'],
-                      ['📄 Contrato', wizContractMode === 'digital' ? (language === 'es' ? 'Digital' : 'Digital') : wizContractMode === 'physical' ? (language === 'es' ? 'Físico' : 'Physical') : '—'],
+                      ['Ã°ÂÂÂ² E-Bike', products.find(p => p.id === wizBikeId)?.serial_number ?? 'Ã¢ÂÂ'],
+                      ['Ã°ÂÂÂ Battery', wizBatteryIds.length > 0 ? wizBatteryIds.map(id => products.find(p => p.id === id)?.serial_number).filter(Boolean).join(', ') : 'None'],
+                      ['Ã°ÂÂÂ Lock', wizLockId ? products.find(p => p.id === wizLockId)?.serial_number : 'None'],
+                      ['Ã°ÂÂÂ Kit', wizHasKit ? (wizKitProductIds.length > 0 ? wizKitProductIds.map(id => products.find(p => p.id === id)?.serial_number).filter(Boolean).join(', ') : (language === 'es' ? 'SÃÂ­ (sin artÃÂ­culos)' : 'Yes (no items)')) : 'No'],
+                      ['Ã°ÂÂÂ¤ Rider', `${wizFirstName} ${wizLastName}`],
+                      ['Ã°ÂÂªÂª CÃÂ³digo / Code', wizCustomerCode ? 'US-' + wizCustomerCode.replace(/^US-?/i, '') : 'Ã¢ÂÂ'],
+                      ['Ã°ÂÂÂ§ Email', wizEmail],
+                      ['Ã°ÂÂÂ± Phone', wizPhone],
+                      ['Ã°ÂÂÂ
+ Fecha Inicio / Start Date', wizStartDate],
+                      ['Ã°ÂÂÂ¶ Rate', `Ã¢ÂÂ¬${wizRate}/${wizRateType} (${wizRatePaymentMethod === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})`],
+                      ['Ã°ÂÂÂ¦ Deposit', `Ã¢ÂÂ¬${wizDeposit} (${wizDepositPaymentMethod === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})`],
+                      ['Ã°ÂÂÂ± App Account', wizGigAccountId ? (appAccounts.find(a => a.id === wizGigAccountId)?.platform_account_number || 'Linked') : 'Ã¢ÂÂ'],
+                      ['Ã°ÂÂÂ¸ Fotos', `${wizConditionFiles.length} ${language === 'es' ? 'foto(s)' : 'photo(s)'}`],
+                      ['Ã°ÂÂÂ¸ Fotos Instagram', `${wizInstagramFiles.length} ${language === 'es' ? 'foto(s)' : 'photo(s)'}`],
+                      ['Ã°ÂÂªÂª ID', wizIdDocFile ? 'Ã¢ÂÂ
+' : 'Ã¢ÂÂ'],
+                      ['Ã°ÂÂÂ Contrato', wizContractMode === 'digital' ? (language === 'es' ? 'Digital' : 'Digital') : wizContractMode === 'physical' ? (language === 'es' ? 'FÃÂ­sico' : 'Physical') : 'Ã¢ÂÂ'],
                     ].map(([label, val]) => (
                       <div key={label as string} style={{ background: 'rgba(0,0,0,0.1)', padding: '12px', borderRadius: '10px' }}>
                         <p style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{label}</p>
@@ -6926,7 +7517,7 @@ USING (true);`;
                   {/* Condition photo thumbnails preview */}
                   {wizConditionPreviews.length > 0 && (
                     <div style={{ marginBottom: '16px' }}>
-                      <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '8px' }}>📸 {language === 'es' ? 'Fotos de condición' : 'Condition photos'}</p>
+                      <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '8px' }}>Ã°ÂÂÂ¸ {language === 'es' ? 'Fotos de condiciÃÂ³n' : 'Condition photos'}</p>
                       <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                         {wizConditionPreviews.map((url, idx) => (
                           <img key={idx} src={url} alt={`Preview ${idx + 1}`} style={{ width: '64px', height: '64px', objectFit: 'cover', borderRadius: '8px', border: '1px solid var(--border-color)' }} />
@@ -6936,7 +7527,7 @@ USING (true);`;
                   )}
                   {wizInstagramPreviews.length > 0 && (
                     <div style={{ marginBottom: '16px' }}>
-                      <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '8px' }}>📸 {language === 'es' ? 'Fotos para Instagram' : 'Instagram photos'}</p>
+                      <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '8px' }}>Ã°ÂÂÂ¸ {language === 'es' ? 'Fotos para Instagram' : 'Instagram photos'}</p>
                       <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                         {wizInstagramPreviews.map((url, idx) => (
                           <img key={idx} src={url} alt={`Instagram Preview ${idx + 1}`} style={{ width: '64px', height: '64px', objectFit: 'cover', borderRadius: '8px', border: '1px solid var(--border-color)' }} />
@@ -6945,9 +7536,9 @@ USING (true);`;
                     </div>
                   )}
                   <div style={{ display: 'flex', gap: '12px' }}>
-                    <button className="btn-secondary" onClick={() => setWizardStep(8)}>← Atrás</button>
+                    <button className="btn-secondary" onClick={() => setWizardStep(8)}>Ã¢ÂÂ AtrÃÂ¡s</button>
                     <button className="btn-primary" disabled={wizUploadingEvidence} onClick={handleConfirmRental}>
-                      {wizUploadingEvidence ? (language === 'es' ? '⏳ Subiendo...' : '⏳ Uploading...') : `⚡ ${t.confirmRental}`}
+                      {wizUploadingEvidence ? (language === 'es' ? 'Ã¢ÂÂ³ Subiendo...' : 'Ã¢ÂÂ³ Uploading...') : `Ã¢ÂÂ¡ ${t.confirmRental}`}
                     </button>
                   </div>
                 </div>
@@ -6966,31 +7557,31 @@ USING (true);`;
                   className={`subtab-button ${stockSubTab === 'items' ? 'active' : ''}`}
                   onClick={() => setStockSubTab('items')}
                 >
-                  📦 {language === 'es' ? 'Inventario Activo' : 'Active Stock'}
+                  Ã°ÂÂÂ¦ {language === 'es' ? 'Inventario Activo' : 'Active Stock'}
                 </button>
                 <button
                   className={`subtab-button ${stockSubTab === 'sold' ? 'active' : ''}`}
                   onClick={() => setStockSubTab('sold')}
                 >
-                  💶 {language === 'es' ? 'Artículos Vendidos' : 'Sold Items'}
+                  Ã°ÂÂÂ¶ {language === 'es' ? 'ArtÃÂ­culos Vendidos' : 'Sold Items'}
                 </button>
                 <button
                   className={`subtab-button ${stockSubTab === 'all_items' ? 'active' : ''}`}
                   onClick={() => setStockSubTab('all_items')}
                 >
-                  🌐 {language === 'es' ? 'Todos los Artículos' : 'All Items'}
+                  Ã°ÂÂÂ {language === 'es' ? 'Todos los ArtÃÂ­culos' : 'All Items'}
                 </button>
                 <button
                   className={`subtab-button ${stockSubTab === 'lost' ? 'active' : ''}`}
                   onClick={() => setStockSubTab('lost')}
                 >
-                  🚨 {language === 'es' ? 'Robados/Perdidos' : 'Stolen/Lost'}
+                  Ã°ÂÂÂ¨ {language === 'es' ? 'Robados/Perdidos' : 'Stolen/Lost'}
                 </button>
                 <button
                   className={`subtab-button ${stockSubTab === 'templates' ? 'active' : ''}`}
                   onClick={() => setStockSubTab('templates')}
                 >
-                  📋 {language === 'es' ? 'Modelos y Plantillas' : 'Models & Templates'}
+                  Ã°ÂÂÂ {language === 'es' ? 'Modelos y Plantillas' : 'Models & Templates'}
                 </button>
               </div>
 
@@ -6999,7 +7590,7 @@ USING (true);`;
                   {/* Filter row */}
                   <div className="filter-row" style={{ flexWrap: 'wrap', gap: '12px', alignItems: 'flex-start' }}>
                     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
-                      <button className="btn-primary" onClick={() => openProductModal()}>➕ {t.registerItem}</button>
+                      <button className="btn-primary" onClick={() => openProductModal()}>Ã¢ÂÂ {t.registerItem}</button>
                       {searchStock.trim() !== '' && (
                         <span style={{ 
                           fontSize: '13px', 
@@ -7010,20 +7601,20 @@ USING (true);`;
                           alignItems: 'center',
                           gap: '4px'
                         }}>
-                          🔍 {language === 'es' 
+                          Ã°ÂÂÂ {language === 'es' 
                             ? `${allProductsFilteredCount} encontrados` 
                             : `${allProductsFilteredCount} found`}
                         </span>
                       )}
                     </div>
                     <div className="filter-row-group">
-                      <button className="btn-secondary" onClick={() => setModalType('prefix')}>🏷️ {t.addPrefix}</button>
-                      <button className="btn-secondary" onClick={() => { setCatFormNameEs(''); setCatFormNameEn(''); setModalType('category'); }}>📁 {t.addCategory}</button>
+                      <button className="btn-secondary" onClick={() => setModalType('prefix')}>Ã°ÂÂÂ·Ã¯Â¸Â {t.addPrefix}</button>
+                      <button className="btn-secondary" onClick={() => { setCatFormNameEs(''); setCatFormNameEn(''); setModalType('category'); }}>Ã°ÂÂÂ {t.addCategory}</button>
                     </div>
                     <input className="form-control filter-input" placeholder={t.searchPlaceholder} value={searchStock} onChange={e => setSearchStock(e.target.value)} />
                     <div className="filter-row-group" style={{ marginLeft: 'auto' }}>
                       <select className="form-control" style={{ width: 'auto' }} value={filterCategory} onChange={e => setFilterCategory(e.target.value)}>
-                        <option value="all">{language === 'es' ? 'Todas Categorías' : 'All Categories'}</option>
+                        <option value="all">{language === 'es' ? 'Todas CategorÃÂ­as' : 'All Categories'}</option>
                         {(categories || [])
                           .filter(c => c && c.id)
                           .map(c => <option key={c.id} value={c.id}>{language === 'es' ? (c.name_es || c.name_en || '') : (c.name_en || c.name_es || '')}</option>)}
@@ -7036,7 +7627,7 @@ USING (true);`;
                           onClick={() => setShowColVisPicker(v => !v)}
                           title={language === 'es' ? 'Columnas visibles' : 'Visible columns'}
                         >
-                          ⊞ {language === 'es' ? 'Columnas' : 'Columns'}
+                          Ã¢ÂÂ {language === 'es' ? 'Columnas' : 'Columns'}
                         </button>
                       {showColVisPicker && (
                         <>
@@ -7050,30 +7641,30 @@ USING (true);`;
                             </div>
                             {/* Always-locked columns */}
                             {[
-                              { key: '_code',  label: language === 'es' ? '🔒 Código' : '🔒 Code' },
-                              { key: '_brand', label: language === 'es' ? '🔒 Marca / Modelo' : '🔒 Brand / Model' },
-                              { key: '_actions', label: language === 'es' ? '🔒 Acciones' : '🔒 Actions' },
+                              { key: '_code',  label: language === 'es' ? 'Ã°ÂÂÂ CÃÂ³digo' : 'Ã°ÂÂÂ Code' },
+                              { key: '_brand', label: language === 'es' ? 'Ã°ÂÂÂ Marca / Modelo' : 'Ã°ÂÂÂ Brand / Model' },
+                              { key: '_actions', label: language === 'es' ? 'Ã°ÂÂÂ Acciones' : 'Ã°ÂÂÂ Actions' },
                             ].map(col => (
                               <div key={col.key} className="col-vis-item locked checked">
-                                <div className="col-vis-check">✓</div>
+                                <div className="col-vis-check">Ã¢ÂÂ</div>
                                 <span>{col.label}</span>
                               </div>
                             ))}
                             {/* Toggleable columns */}
                             {[
-                              { key: 'location',      label: language === 'es' ? '📍 Ubicación'       : '📍 Location' },
-                              { key: 'price',         label: language === 'es' ? '💶 Precio Venta'      : '💶 Sale Price' },
-                              { key: 'cost',          label: language === 'es' ? '💰 Costo'             : '💰 Cost' },
-                              { key: 'condition',     label: language === 'es' ? '🔧 Condición'        : '🔧 Condition' },
-                              { key: 'status',        label: language === 'es' ? '📌 Estado'            : '📌 Status' },
-                              { key: 'frame_serial',  label: language === 'es' ? '🔢 Número de Cuadro' : '🔢 Frame Serial' },
-                              { key: 'motor',         label: language === 'es' ? '⚙️ Número de Motor'  : '⚙️ Motor Serial' },
-                              { key: 'odometer',      label: language === 'es' ? '📏 Kilometraje'       : '📏 Odometer' },
-                              { key: 'purchase_date', label: language === 'es' ? '🗓️ Fecha Compra'      : '🗓️ Purchase Date' },
-                              { key: 'arrival_date',  label: language === 'es' ? '🛬 Fecha Arribo'      : '🛬 Arrival Date' },
-                              { key: 'assembly_date', label: language === 'es' ? '🔩 Fecha Armado'      : '🔩 Assembly Date' },
-                              { key: 'modifications', label: language === 'es' ? '🛠️ Modificaciones'   : '🛠️ Modifications' },
-                              { key: 'roi',           label: '📊 ROI' },
+                              { key: 'location',      label: language === 'es' ? 'Ã°ÂÂÂ UbicaciÃÂ³n'       : 'Ã°ÂÂÂ Location' },
+                              { key: 'price',         label: language === 'es' ? 'Ã°ÂÂÂ¶ Precio Venta'      : 'Ã°ÂÂÂ¶ Sale Price' },
+                              { key: 'cost',          label: language === 'es' ? 'Ã°ÂÂÂ° Costo'             : 'Ã°ÂÂÂ° Cost' },
+                              { key: 'condition',     label: language === 'es' ? 'Ã°ÂÂÂ§ CondiciÃÂ³n'        : 'Ã°ÂÂÂ§ Condition' },
+                              { key: 'status',        label: language === 'es' ? 'Ã°ÂÂÂ Estado'            : 'Ã°ÂÂÂ Status' },
+                              { key: 'frame_serial',  label: language === 'es' ? 'Ã°ÂÂÂ¢ NÃÂºmero de Cuadro' : 'Ã°ÂÂÂ¢ Frame Serial' },
+                              { key: 'motor',         label: language === 'es' ? 'Ã¢ÂÂÃ¯Â¸Â NÃÂºmero de Motor'  : 'Ã¢ÂÂÃ¯Â¸Â Motor Serial' },
+                              { key: 'odometer',      label: language === 'es' ? 'Ã°ÂÂÂ Kilometraje'       : 'Ã°ÂÂÂ Odometer' },
+                              { key: 'purchase_date', label: language === 'es' ? 'Ã°ÂÂÂÃ¯Â¸Â Fecha Compra'      : 'Ã°ÂÂÂÃ¯Â¸Â Purchase Date' },
+                              { key: 'arrival_date',  label: language === 'es' ? 'Ã°ÂÂÂ¬ Fecha Arribo'      : 'Ã°ÂÂÂ¬ Arrival Date' },
+                              { key: 'assembly_date', label: language === 'es' ? 'Ã°ÂÂÂ© Fecha Armado'      : 'Ã°ÂÂÂ© Assembly Date' },
+                              { key: 'modifications', label: language === 'es' ? 'Ã°ÂÂÂ Ã¯Â¸Â Modificaciones'   : 'Ã°ÂÂÂ Ã¯Â¸Â Modifications' },
+                              { key: 'roi',           label: 'Ã°ÂÂÂ ROI' },
                             ].map(col => {
                               const isChecked = !!stockVisibleCols[col.key];
                               return (
@@ -7082,7 +7673,7 @@ USING (true);`;
                                   className={`col-vis-item ${isChecked ? 'checked' : ''}`}
                                   onClick={() => setStockVisibleCols(prev => ({ ...prev, [col.key]: !isChecked }))}
                                 >
-                                  <div className="col-vis-check">{isChecked ? '✓' : ''}</div>
+                                  <div className="col-vis-check">{isChecked ? 'Ã¢ÂÂ' : ''}</div>
                                   <span>{col.label}</span>
                                 </div>
                               );
@@ -7102,7 +7693,7 @@ USING (true);`;
                           <tr>
                             <th>{t.code}</th>
                             <th>{t.brand} / {t.model}</th>
-                            {stockVisibleCols.location      && <th>{language === 'es' ? 'Ubicación'       : 'Location'}</th>}
+                            {stockVisibleCols.location      && <th>{language === 'es' ? 'UbicaciÃÂ³n'       : 'Location'}</th>}
                             {stockVisibleCols.price         && <th>{language === 'es' ? 'Precio Venta'    : 'Sale Price'}</th>}
                             {stockVisibleCols.cost          && <th>{language === 'es' ? 'Costo'           : 'Cost'}</th>}
                             {stockVisibleCols.condition     && <th>{t.condition}</th>}
@@ -7146,16 +7737,14 @@ USING (true);`;
                               return (
                                 <tr>
                                   <td colSpan={3 + Object.values(stockVisibleCols).filter(Boolean).length} style={{ textAlign: 'center', color: 'var(--text-muted)', fontStyle: 'italic', padding: '24px' }}>
-                                    {language === 'es' ? 'No se encontraron artículos en stock.' : 'No stock items found.'}
+                                    {language === 'es' ? 'No se encontraron artÃÂ­culos en stock.' : 'No stock items found.'}
                                   </td>
                                 </tr>
                               );
                             }
 
-                            return groupedList.map((group, index) => {
+                            return groupedList.map((group) => {
                               const prod = group[0];
-                              const isLastFew = index > 0 && index >= groupedList.length - 2;
-                              const hasRentals = group.some(p => (rentals || []).some(r => r && r.bike_id === p.id && r.status === 'Activo'));
                               const activeProd = group.find(p => p.status !== 'Vendida' && p.status !== 'Financiada' && p.status !== 'Robada' && p.status !== 'Perdida' && p.status !== 'Perdida/Garda') || prod;
                               const isConsolidated = group.some(p => p.custom_field_values?.location_distribution);
                               
@@ -7196,8 +7785,17 @@ USING (true);`;
                               // Counts per status
                               const countDisp = group.filter(p => p.status === 'Disponible').length;
                               const countReqService = group.filter(p => p.status === 'Disponible' && p.maintenance_status === 'Requiere Service').length;
-                              const countReviewed = group.filter(p => p.status === 'Disponible' && p.maintenance_status === 'Al día' && isWithinLast30Days(p.last_service_date)).length;
-                              const countRent = group.filter(p => p.status === 'Rentada').length;
+                              const countReviewed = group.filter(p => p.status === 'Disponible' && p.maintenance_status === 'Al dÃÂ­a' && isWithinLast30Days(p.last_service_date)).length;
+                              const groupProductIds = new Set(group.map(p => p.id));
+                              // For consolidated products, count rented units via active rental_items
+                              // (split products may not always reflect correct status after returns/re-rentals)
+                              const countRentFromItems = isConsolidated
+                                ? (rentalItems || []).filter(ri =>
+                                    groupProductIds.has(ri.product_id) &&
+                                    (rentals || []).some(r => r.id === ri.rental_id && r.status === 'Activo')
+                                  ).length
+                                : 0;
+                              const countRent = isConsolidated ? countRentFromItems : group.filter(p => p.status === 'Rentada').length;
                               const countShop = group.filter(p => p.status === 'Mantenimiento').length;
                               const countLost = group.filter(p => p.status === 'Robada' || p.status === 'Perdida' || p.status === 'Perdida/Garda').length;
                               const countSold = group.filter(p => p.status === 'Vendida' || p.status === 'Financiada').length;
@@ -7221,21 +7819,21 @@ USING (true);`;
 {stockVisibleCols.location !== false && (
                                   <td>
                                     {group.every(p => p.status === 'Vendida' || p.status === 'Financiada' || p.status === 'Robada' || p.status === 'Perdida' || p.status === 'Perdida/Garda') ? (
-                                      <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                      <span style={{ color: 'var(--text-muted)' }}>Ã¢ÂÂ</span>
                                     ) : isConsolidated ? (
                                       <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                                         {Object.entries(consolidatedLocDist)
                                           .filter(([_, qty]) => qty > 0)
                                           .map(([locName, qty]) => (
                                             <div key={locName} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                              <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-bright)' }}>📍 {locName}</span>
+                                              <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-bright)' }}>Ã°ÂÂÂ {locName}</span>
                                               <span style={{ fontSize: '10px', background: 'rgba(99, 102, 241, 0.15)', color: '#818cf8', padding: '1px 6px', borderRadius: '4px', fontWeight: 'bold' }}>{qty}</span>
                                             </div>
                                           ))}
                                       </div>
                                     ) : activeProd.custom_field_values?.location ? (
                                       <div>
-                                        <strong>📍 {activeProd.custom_field_values.location as string}</strong>
+                                        <strong>Ã°ÂÂÂ {activeProd.custom_field_values.location as string}</strong>
                                         {!!activeProd.custom_field_values.location_date && (
                                           <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: '2px' }}>
                                             {(() => {
@@ -7252,26 +7850,26 @@ USING (true);`;
                                   </td>
                                   )}
 {stockVisibleCols.price !== false && (
-                                  <td>{prod.price_sold ? <strong>€{prod.price_sold}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td>{prod.price_sold ? <strong>Ã¢ÂÂ¬{prod.price_sold}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
                                   {stockVisibleCols.cost && (
-                                  <td>{prod.price_paid ? <strong>€{prod.price_paid}{isConsolidated ? <span style={{ fontWeight: 400, color: 'var(--text-muted)', fontSize: '11px' }}> /u</span> : null}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td>{prod.price_paid ? <strong>Ã¢ÂÂ¬{prod.price_paid}{isConsolidated ? <span style={{ fontWeight: 400, color: 'var(--text-muted)', fontSize: '11px' }}> /u</span> : null}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
 {stockVisibleCols.condition !== false && (
                                   <td>
                                     {(prod.status === 'Vendida' || prod.status === 'Financiada' || prod.status === 'Robada' || prod.status === 'Perdida' || prod.status === 'Perdida/Garda') ? (
-                                      <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                      <span style={{ color: 'var(--text-muted)' }}>Ã¢ÂÂ</span>
                                     ) : (prod.category_id === catBikeId || prod.category_id === catBattId) ? (
                                       (() => {
                                         const cond = prod.condition || 'bueno';
                                         const condLabels: Record<string, { es: string; en: string; class: string }> = {
-                                          nuevo: { es: '✨ Nuevo', en: '✨ New', class: 'status-rented' },
-                                          bueno: { es: '🟢 Bueno', en: '🟢 Good', class: 'status-available' },
-                                          regular: { es: '🟡 Regular', en: '🟡 Regular', class: 'status-maintenance' },
-                                          'para venta': { es: '🟣 Para Venta', en: '🟣 For Sale', class: 'status-sold' },
-                                          'no funciona': { es: '❌ No funciona', en: '❌ Broken', class: 'status-lost' },
-                                          'funciona mal': { es: '⚠️ Funciona Mal', en: '⚠️ Malfunctioning', class: 'status-maintenance' },
-                                          reclamada: { es: '🛡️ Reclamada', en: '🛡️ Claimed', class: 'status-rented' }
+                                          nuevo: { es: 'Ã¢ÂÂ¨ Nuevo', en: 'Ã¢ÂÂ¨ New', class: 'status-rented' },
+                                          bueno: { es: 'Ã°ÂÂÂ¢ Bueno', en: 'Ã°ÂÂÂ¢ Good', class: 'status-available' },
+                                          regular: { es: 'Ã°ÂÂÂ¡ Regular', en: 'Ã°ÂÂÂ¡ Regular', class: 'status-maintenance' },
+                                          'para venta': { es: 'Ã°ÂÂÂ£ Para Venta', en: 'Ã°ÂÂÂ£ For Sale', class: 'status-sold' },
+                                          'no funciona': { es: 'Ã¢ÂÂ No funciona', en: 'Ã¢ÂÂ Broken', class: 'status-lost' },
+                                          'funciona mal': { es: 'Ã¢ÂÂ Ã¯Â¸Â Funciona Mal', en: 'Ã¢ÂÂ Ã¯Â¸Â Malfunctioning', class: 'status-maintenance' },
+                                          reclamada: { es: 'Ã°ÂÂÂ¡Ã¯Â¸Â Reclamada', en: 'Ã°ÂÂÂ¡Ã¯Â¸Â Claimed', class: 'status-rented' }
                                         };
                                         const label = condLabels[cond] || condLabels['bueno'];
                                         return (
@@ -7288,17 +7886,17 @@ USING (true);`;
 {stockVisibleCols.status !== false && (
                                   <td>
                                     {totalCount === 1 ? (() => {
-                                      const hasAnnouncedReturn = prod.category_id === catBikeId && rentals.some(r => r.bike_id === prod.id && r.status === 'Devolución en Proceso');
+                                      const hasAnnouncedReturn = prod.category_id === catBikeId && rentals.some(r => r.bike_id === prod.id && r.status === 'DevoluciÃÂ³n en Proceso');
                                        const displayStatus = hasAnnouncedReturn
-                                         ? 'Devolución en Proceso'
+                                         ? 'DevoluciÃÂ³n en Proceso'
                                          : (prod.status === 'Disponible' && prod.maintenance_status === 'Requiere Service')
                                            ? 'Requiere Service'
-                                           : (prod.status === 'Disponible' && prod.maintenance_status === 'Al día' && isWithinLast30Days(prod.last_service_date))
-                                             ? 'Recién Revisada'
+                                           : (prod.status === 'Disponible' && prod.maintenance_status === 'Al dÃÂ­a' && isWithinLast30Days(prod.last_service_date))
+                                             ? 'ReciÃÂ©n Revisada'
                                              : prod.status;
                                       return (
                                         <span 
-                                          className={`badge ${displayStatus === 'Disponible' ? 'status-available' : displayStatus === 'Recién Revisada' ? 'status-reviewed' : (displayStatus === 'Requiere Service' || displayStatus === 'Robada' || displayStatus === 'Perdida/Garda' || displayStatus === 'Perdida') ? 'status-lost' : displayStatus === 'Rentada' ? 'status-rented' : (displayStatus === 'Mantenimiento' || displayStatus === 'Devolución en Proceso') ? 'status-maintenance' : displayStatus === 'Financiada' ? 'status-financed' : 'status-sold'}`}
+                                          className={`badge ${displayStatus === 'Disponible' ? 'status-available' : displayStatus === 'ReciÃÂ©n Revisada' ? 'status-reviewed' : (displayStatus === 'Requiere Service' || displayStatus === 'Robada' || displayStatus === 'Perdida/Garda' || displayStatus === 'Perdida') ? 'status-lost' : displayStatus === 'Rentada' ? 'status-rented' : (displayStatus === 'Mantenimiento' || displayStatus === 'DevoluciÃÂ³n en Proceso') ? 'status-maintenance' : displayStatus === 'Financiada' ? 'status-financed' : 'status-sold'}`}
                                           style={displayStatus === 'Financiada' ? { cursor: 'pointer' } : {}}
                                           onClick={() => {
                                             if (displayStatus === 'Financiada') {
@@ -7317,8 +7915,8 @@ USING (true);`;
                                               const totalPayments = payments.length;
                                               return `${language === 'es' ? 'Financiada' : 'Financed'} (${paidPayments}/${totalPayments})`;
                                             }
-                                            if (displayStatus === 'Devolución en Proceso') {
-                                               return language === 'es' ? 'Devolución en Proceso' : 'Return in Process';
+                                            if (displayStatus === 'DevoluciÃÂ³n en Proceso') {
+                                               return language === 'es' ? 'DevoluciÃÂ³n en Proceso' : 'Return in Process';
                                              }
                                              if (displayStatus === 'Mantenimiento') {
                                                return language === 'es' ? 'En Taller' : 'In Shop';
@@ -7326,17 +7924,15 @@ USING (true);`;
                                              if (displayStatus === 'Requiere Service') {
                                                return language === 'es' ? 'Requiere Service' : 'Needs Service';
                                              }
-                                            if (displayStatus === 'Recién Revisada') {
-                                              return language === 'es' ? 'Recién Revisada' : 'Recently Serviced';
+                                            if (displayStatus === 'ReciÃÂ©n Revisada') {
+                                              return language === 'es' ? 'ReciÃÂ©n Revisada' : 'Recently Serviced';
                                             }
                                             return displayStatus;
                                           })()}
                                         </span>
                                       );
                                     })() : (() => {
-                                      const displayRent = isConsolidated
-                                        ? (rentals || []).filter(r => group.some(p => p.id === r.bike_id) && r.status === 'Activo').length
-                                        : countRent;
+                                      const displayRent = countRent;
                                       const displayShop = isConsolidated ? countShop : countShop;
                                       const displayLost = isConsolidated ? countLost : countLost;
                                       const displaySold = isConsolidated ? countSold : countSold;
@@ -7356,7 +7952,7 @@ USING (true);`;
                                             {!isConsolidated && countReqService > 0 && <span className="badge status-lost" style={{ fontSize: '9px', padding: '2px 5px' }}>{countReqService} Req. Serv.</span>}
                                             {displayRent > 0 && <span className="badge status-rented" style={{ fontSize: '9px', padding: '2px 5px' }}>{displayRent} Rent</span>}
                                             {displayShop > 0 && <span className="badge status-maintenance" style={{ fontSize: '9px', padding: '2px 5px' }}>{displayShop} {language === 'es' ? 'Taller' : 'Shop'}</span>}
-                                            {displayLost > 0 && <span className="badge status-lost" style={{ fontSize: '9px', padding: '2px 5px' }}>{displayLost} {language === 'es' ? 'Robo/Pérd.' : 'Stolen/Lost'}</span>}
+                                            {displayLost > 0 && <span className="badge status-lost" style={{ fontSize: '9px', padding: '2px 5px' }}>{displayLost} {language === 'es' ? 'Robo/PÃÂ©rd.' : 'Stolen/Lost'}</span>}
                                             {displaySold > 0 && <span className="badge status-sold" style={{ fontSize: '9px', padding: '2px 5px' }}>{displaySold} {language === 'es' ? 'Vend.' : 'Sold'}</span>}
                                           </div>
                                         </div>
@@ -7386,7 +7982,7 @@ USING (true);`;
                                   <td>
                                     {bikeModifications.filter(m => m.bike_id === prod.id).length > 0
                                       ? <span className="badge status-rented" style={{ fontSize: '11px', cursor: 'pointer' }} onClick={() => { setSelectedProductId(prod.id); fetchModifications(prod.id); setModalType('bikeModifications'); }}>
-                                          🛠️ {bikeModifications.filter(m => m.bike_id === prod.id).length}
+                                          Ã°ÂÂÂ Ã¯Â¸Â {bikeModifications.filter(m => m.bike_id === prod.id).length}
                                         </span>
                                       : <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>-</span>
                                     }
@@ -7402,7 +7998,7 @@ USING (true);`;
                                           // Prefer a Disponible row that still has real stock; fall back to any Disponible row
                                           const availableUnit = group.find(p => p.status === 'Disponible' && (!isConsolidated || Object.values((p.custom_field_values?.location_distribution as Record<string, number>) || {}).reduce((a, b) => a + b, 0) > 0)) || group.find(p => p.status === 'Disponible');
                                           if (availableUnit) openSoldModal(availableUnit);
-                                        }}>💶 {t.markSold}</button>
+                                        }}>Ã°ÂÂÂ¶ {t.markSold}</button>
                                       ) : (
                                         <button 
                                           className="btn-primary btn-xs" 
@@ -7414,9 +8010,9 @@ USING (true);`;
                                             boxShadow: 'none',
                                             border: '1px solid rgba(255, 255, 255, 0.08)'
                                           }}
-                                          title={language === 'es' ? 'No se puede vender un artículo rentado o en mantenimiento' : 'Cannot sell a rented or in-shop item'}
+                                          title={language === 'es' ? 'No se puede vender un artÃÂ­culo rentado o en mantenimiento' : 'Cannot sell a rented or in-shop item'}
                                         >
-                                          💶 {t.markSold}
+                                          Ã°ÂÂÂ¶ {t.markSold}
                                         </button>
                                       )}
 
@@ -7441,388 +8037,10 @@ USING (true);`;
                                             }
                                           }}
                                         >
-                                          ➕ {language === 'es' ? 'Más' : 'More'}
+                                          Ã¢ÂÂ {language === 'es' ? 'MÃÂ¡s' : 'More'}
                                         </button>
-
-                                        {activeStockMenuId === prod.id && (
-                                          <>
-                                            <div
-                                              style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 90, cursor: 'default' }}
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                setActiveStockMenuId(null);
-                                              }}
-                                            />
-                                            
-                                            <div 
-                                              style={{ 
-                                                position: 'absolute', 
-                                                ...(isLastFew ? { bottom: 'calc(100% + 4px)' } : { top: 'calc(100% + 4px)' }),
-                                                right: 0, 
-                                                background: 'rgba(23, 23, 37, 0.98)', 
-                                                backdropFilter: 'blur(12px)',
-                                                WebkitBackdropFilter: 'blur(12px)',
-                                                border: '1px solid rgba(255, 255, 255, 0.08)', 
-                                                borderRadius: '8px', 
-                                                padding: '6px', 
-                                                minWidth: '150px', 
-                                                zIndex: 100, 
-                                                boxShadow: '0 10px 25px rgba(0, 0, 0, 0.6)',
-                                                display: 'flex',
-                                                flexDirection: 'column',
-                                                gap: '4px'
-                                              }}
-                                            >
-                                              <button
-                                                className="dropdown-item"
-                                                style={{
-                                                  width: '100%',
-                                                  textAlign: 'left',
-                                                  background: 'transparent',
-                                                  border: 'none',
-                                                  borderRadius: '6px',
-                                                  padding: '8px 12px',
-                                                  fontSize: '12px',
-                                                  color: 'var(--text-muted)',
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease'
-                                                }}
-                                                onClick={() => {
-                                                  setActiveStockMenuId(null);
-                                                  openProductModal(prod);
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                  e.currentTarget.style.color = 'var(--text-bright)';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'var(--text-muted)';
-                                                }}
-                                              >
-                                                ✏️ {t.edit}
-                                              </button>
-
-                                              {prod.category_id === catLockId && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    if (prod.custom_field_values?.associated_bike_id) {
-                                                      setModalType('confirmUnlinkLock');
-                                                    } else {
-                                                      setModalType('linkLockToBike');
-                                                    }
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  {prod.custom_field_values?.associated_bike_id 
-                                                    ? (language === 'es' ? '🔗 Desvincular de Bike' : '🔗 Unlink from Bike')
-                                                    : (language === 'es' ? '🔗 Vincular a Bike' : '🔗 Link to Bike')
-                                                  }
-                                                </button>
-                                              )}
-
-                                              {prod.status !== 'Vendida' && prod.status !== 'Financiada' && (
-                                                <>
-                                                  <button
-                                                    className="dropdown-item"
-                                                    style={{ 
-                                                      width: '100%', 
-                                                      textAlign: 'left', 
-                                                      background: 'transparent', 
-                                                      border: 'none', 
-                                                      borderRadius: '6px', 
-                                                      padding: '8px 12px', 
-                                                      fontSize: '12px', 
-                                                      color: 'var(--text-muted)', 
-                                                      cursor: 'pointer',
-                                                      display: 'flex',
-                                                      alignItems: 'center',
-                                                      gap: '8px',
-                                                      transition: 'all 0.2s ease'
-                                                    }}
-                                                    onClick={() => {
-                                                      setActiveStockMenuId(null);
-                                                      setSelectedProductId(prod.id);
-                                                      setSelectedLocation((prod.custom_field_values?.location as string) || '');
-                                                      setSelectedLocationDate((prod.custom_field_values?.location_date as string) || new Date().toISOString().split('T')[0]);
-                                                      setModalType('changeLocation');
-                                                    }}
-                                                    onMouseEnter={(e) => {
-                                                      e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                      e.currentTarget.style.color = 'var(--text-bright)';
-                                                    }}
-                                                    onMouseLeave={(e) => {
-                                                      e.currentTarget.style.background = 'transparent';
-                                                      e.currentTarget.style.color = 'var(--text-muted)';
-                                                    }}
-                                                  >
-                                                    📍 {language === 'es' ? 'Ubicación' : 'Location'}
-                                                  </button>
-
-                                                  {(prod.category_id === catBikeId || prod.category_id === catBattId) && (
-                                                    <button 
-                                                      className="dropdown-item"
-                                                      style={{ 
-                                                        width: '100%', 
-                                                        textAlign: 'left', 
-                                                        background: 'transparent', 
-                                                        border: 'none', 
-                                                        borderRadius: '6px', 
-                                                        padding: '8px 12px', 
-                                                        fontSize: '12px', 
-                                                        color: 'var(--text-muted)', 
-                                                        cursor: 'pointer',
-                                                        display: 'flex',
-                                                        alignItems: 'center',
-                                                        gap: '8px',
-                                                        transition: 'all 0.2s ease'
-                                                      }}
-                                                      onClick={() => {
-                                                        setActiveStockMenuId(null);
-                                                        setSelectedProductId(prod.id);
-                                                        setSelectedCondition(prod.condition || 'bueno');
-                                                        setModalType('changeCondition');
-                                                      }}
-                                                      onMouseEnter={(e) => {
-                                                        e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                        e.currentTarget.style.color = 'var(--text-bright)';
-                                                      }}
-                                                      onMouseLeave={(e) => {
-                                                        e.currentTarget.style.background = 'transparent';
-                                                        e.currentTarget.style.color = 'var(--text-muted)';
-                                                      }}
-                                                    >
-                                                      ✨ {language === 'es' ? 'Condición' : 'Condition'}
-                                                    </button>
-                                                  )}
-                                                </>
-                                              )}
-
-                                              {(prod.category_id === catBikeId || prod.category_id === catBattId) && (prod.status || '') !== 'Vendida' && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    setModalType('bikeHistory');
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  🔧 Service
-                                                </button>
-                                              )}
-
-                                              {prod.category_id === catBikeId && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    setModalType('bikeHistory');
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  📊 {language === 'es' ? 'Ver Historial' : 'View History'}
-                                                </button>
-                                              )}
-
-                                              {prod.category_id === catBikeId && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    setModalType('bikeModifications');
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  🛠️ {language === 'es' ? 'Modificaciones' : 'Modifications'}
-                                                </button>
-                                              )}
-
-
-                                              <button 
-                                                className="dropdown-item"
-                                                style={{ 
-                                                  width: '100%', 
-                                                  textAlign: 'left', 
-                                                  background: 'transparent', 
-                                                  border: 'none', 
-                                                  borderRadius: '6px', 
-                                                  padding: '8px 12px', 
-                                                  fontSize: '12px', 
-                                                  color: 'var(--text-muted)', 
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease'
-                                                }}
-                                                onClick={() => {
-                                                  setActiveStockMenuId(null);
-                                                  setActiveNoteProduct(prod);
-                                                  setActiveNoteProductGroup(group);
-                                                  setProductNotesText(prod.notes || '');
-                                                  setModalType('productNotes');
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                  e.currentTarget.style.color = 'var(--text-bright)';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'var(--text-muted)';
-                                                }}
-                                              >
-                                                📝 {language === 'es' ? 'Notas' : 'Notes'}
-                                              </button>
-
-                                              <button 
-                                                className="dropdown-item-danger"
-                                                style={{ 
-                                                  width: '100%', 
-                                                  textAlign: 'left', 
-                                                  background: 'transparent', 
-                                                  border: 'none', 
-                                                  borderRadius: '6px', 
-                                                  padding: '8px 12px', 
-                                                  fontSize: '12px', 
-                                                  color: 'rgba(239, 68, 68, 0.85)', 
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease',
-                                                  borderTop: '1px solid rgba(255, 255, 255, 0.06)',
-                                                  marginTop: '4px',
-                                                  paddingTop: '8px'
-                                                }}
-                                                onClick={async () => {
-                                                  setActiveStockMenuId(null);
-                                                  const confirmMsg = totalCount > 1 
-                                                    ? (language === 'es' ? `⚠️ ¿Eliminar TODAS las ${totalCount} unidades de este lote?` : `⚠️ Delete ALL ${totalCount} units of this batch?`)
-                                                    : (language === 'es' ? '¿Eliminar este producto del inventario?' : 'Delete this product from inventory?');
-                                                  
-                                                  if (hasRentals) {
-                                                    if (!confirm(language === 'es' ? '⚠️ Este lote/producto tiene alquileres activos. ¿Eliminar de todos modos?' : '⚠️ This batch/product has active rentals. Delete anyway?')) return;
-                                                  } else {
-                                                    if (!confirm(confirmMsg)) return;
-                                                  }
-
-                                                  try {
-                                                    await Promise.all(group.map(p => deleteProduct(p.id)));
-                                                    showToast(language === 'es' ? 'Stock eliminado.' : 'Stock deleted.');
-                                                    triggerReload();
-                                                  } catch { showToast(language === 'es' ? 'Error al eliminar.' : 'Delete error.', 'error'); }
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(239, 68, 68, 0.12)';
-                                                  e.currentTarget.style.color = '#f87171';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'rgba(239, 68, 68, 0.85)';
-                                                }}
-                                              >
-                                                🗑️ {t.delete}
-                                              </button>
-                                            </div>
-                                          </>
-                                        )}
+                                        
+                                        
                                       </div>
                                     </div>
                                   </td>
@@ -7844,7 +8062,7 @@ USING (true);`;
                   {/* Filter row */}
                   <div className="filter-row" style={{ flexWrap: 'wrap', gap: '12px', alignItems: 'flex-start' }}>
                     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
-                      <button className="btn-primary" onClick={() => openProductModal()}>➕ {t.registerItem}</button>
+                      <button className="btn-primary" onClick={() => openProductModal()}>Ã¢ÂÂ {t.registerItem}</button>
                       {searchStock.trim() !== '' && (
                         <span style={{ 
                           fontSize: '13px', 
@@ -7855,23 +8073,88 @@ USING (true);`;
                           alignItems: 'center',
                           gap: '4px'
                         }}>
-                          🔍 {language === 'es' 
+                          Ã°ÂÂÂ {language === 'es' 
                             ? `${activeProductsFilteredCount} encontrados` 
                             : `${activeProductsFilteredCount} found`}
                         </span>
                       )}
                     </div>
                     <div className="filter-row-group">
-                      <button className="btn-secondary" onClick={() => setModalType('prefix')}>🏷️ {t.addPrefix}</button>
-                      <button className="btn-secondary" onClick={() => { setCatFormNameEs(''); setCatFormNameEn(''); setModalType('category'); }}>📁 {t.addCategory}</button>
+                      <button className="btn-secondary" onClick={() => setModalType('prefix')}>Ã°ÂÂÂ·Ã¯Â¸Â {t.addPrefix}</button>
+                      <button className="btn-secondary" onClick={() => { setCatFormNameEs(''); setCatFormNameEn(''); setModalType('category'); }}>Ã°ÂÂÂ {t.addCategory}</button>
                     </div>
                     <input className="form-control filter-input" placeholder={t.searchPlaceholder} value={searchStock} onChange={e => setSearchStock(e.target.value)} />
-                    <select className="form-control" style={{ width: 'auto' }} value={filterCategory} onChange={e => setFilterCategory(e.target.value)}>
-                      <option value="all">{language === 'es' ? 'Todas Categorías' : 'All Categories'}</option>
-                      {(categories || [])
-                        .filter(c => c && c.id)
-                        .map(c => <option key={c.id} value={c.id}>{language === 'es' ? (c.name_es || c.name_en || '') : (c.name_en || c.name_es || '')}</option>)}
-                    </select>
+                    <div className="filter-row-group" style={{ marginLeft: 'auto' }}>
+                      <select className="form-control" style={{ width: 'auto' }} value={filterCategory} onChange={e => setFilterCategory(e.target.value)}>
+                        <option value="all">{language === 'es' ? 'Todas CategorÃÂ­as' : 'All Categories'}</option>
+                        {(categories || [])
+                          .filter(c => c && c.id)
+                          .map(c => <option key={c.id} value={c.id}>{language === 'es' ? (c.name_es || c.name_en || '') : (c.name_en || c.name_es || '')}</option>)}
+                      </select>
+
+                      {/* Column Visibility Picker */}
+                      <div className="col-vis-wrapper">
+                        <button
+                          className={`col-vis-btn ${showColVisPicker ? 'active' : ''}`}
+                          onClick={() => setShowColVisPicker(v => !v)}
+                          title={language === 'es' ? 'Columnas visibles' : 'Visible columns'}
+                        >
+                          Ã¢ÂÂ {language === 'es' ? 'Columnas' : 'Columns'}
+                        </button>
+                        {showColVisPicker && (
+                          <>
+                            <div
+                              style={{ position: 'fixed', inset: 0, zIndex: 499 }}
+                              onClick={() => setShowColVisPicker(false)}
+                            />
+                            <div className="col-vis-dropdown">
+                              <div className="col-vis-dropdown-header">
+                                {language === 'es' ? 'Columnas visibles' : 'Visible columns'}
+                              </div>
+                              {/* Always-locked columns */}
+                              {[
+                                { key: '_code',  label: language === 'es' ? 'Ã°ÂÂÂ CÃÂ³digo' : 'Ã°ÂÂÂ Code' },
+                                { key: '_brand', label: language === 'es' ? 'Ã°ÂÂÂ Marca / Modelo' : 'Ã°ÂÂÂ Brand / Model' },
+                                { key: '_actions', label: language === 'es' ? 'Ã°ÂÂÂ Acciones' : 'Ã°ÂÂÂ Actions' },
+                              ].map(col => (
+                                <div key={col.key} className="col-vis-item locked checked">
+                                  <div className="col-vis-check">Ã¢ÂÂ</div>
+                                  <span>{col.label}</span>
+                                </div>
+                              ))}
+                              {/* Toggleable columns */}
+                              {[
+                                { key: 'location',      label: language === 'es' ? 'Ã°ÂÂÂ UbicaciÃÂ³n'       : 'Ã°ÂÂÂ Location' },
+                                { key: 'price',         label: language === 'es' ? 'Ã°ÂÂÂ¶ Precio Venta'      : 'Ã°ÂÂÂ¶ Sale Price' },
+                                { key: 'cost',          label: language === 'es' ? 'Ã°ÂÂÂ° Costo'             : 'Ã°ÂÂÂ° Cost' },
+                                { key: 'condition',     label: language === 'es' ? 'Ã°ÂÂÂ§ CondiciÃÂ³n'        : 'Ã°ÂÂÂ§ Condition' },
+                                { key: 'status',        label: language === 'es' ? 'Ã°ÂÂÂ Estado'            : 'Ã°ÂÂÂ Status' },
+                                { key: 'frame_serial',  label: language === 'es' ? 'Ã°ÂÂÂ¢ NÃÂºmero de Cuadro' : 'Ã°ÂÂÂ¢ Frame Serial' },
+                                { key: 'motor',         label: language === 'es' ? 'Ã¢ÂÂÃ¯Â¸Â NÃÂºmero de Motor'  : 'Ã¢ÂÂÃ¯Â¸Â Motor Serial' },
+                                { key: 'odometer',      label: language === 'es' ? 'Ã°ÂÂÂ Kilometraje'       : 'Ã°ÂÂÂ Odometer' },
+                                { key: 'purchase_date', label: language === 'es' ? 'Ã°ÂÂÂÃ¯Â¸Â Fecha Compra'      : 'Ã°ÂÂÂÃ¯Â¸Â Purchase Date' },
+                                { key: 'arrival_date',  label: language === 'es' ? 'Ã°ÂÂÂ¬ Fecha Arribo'      : 'Ã°ÂÂÂ¬ Arrival Date' },
+                                { key: 'assembly_date', label: language === 'es' ? 'Ã°ÂÂÂ© Fecha Armado'      : 'Ã°ÂÂÂ© Assembly Date' },
+                                { key: 'modifications', label: language === 'es' ? 'Ã°ÂÂÂ Ã¯Â¸Â Modificaciones'   : 'Ã°ÂÂÂ Ã¯Â¸Â Modifications' },
+                                { key: 'roi',           label: 'Ã°ÂÂÂ ROI' },
+                              ].map(col => {
+                                const isChecked = !!stockVisibleCols[col.key];
+                                return (
+                                  <div
+                                    key={col.key}
+                                    className={`col-vis-item ${isChecked ? 'checked' : ''}`}
+                                    onClick={() => setStockVisibleCols(prev => ({ ...prev, [col.key]: !isChecked }))}
+                                  >
+                                    <div className="col-vis-check">{isChecked ? 'Ã¢ÂÂ' : ''}</div>
+                                    <span>{col.label}</span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    </div>
                   </div>
 
                   {/* Stock table */}
@@ -7882,7 +8165,7 @@ USING (true);`;
                           <tr>
                             <th>{t.code}</th>
                             <th>{t.brand} / {t.model}</th>
-                            {stockVisibleCols.location      && <th>{language === 'es' ? 'Ubicación'       : 'Location'}</th>}
+                            {stockVisibleCols.location      && <th>{language === 'es' ? 'UbicaciÃÂ³n'       : 'Location'}</th>}
                             {stockVisibleCols.price         && <th>{language === 'es' ? 'Precio Venta'    : 'Sale Price'}</th>}
                             {stockVisibleCols.cost          && <th>{language === 'es' ? 'Costo'           : 'Cost'}</th>}
                             {stockVisibleCols.condition     && <th>{t.condition}</th>}
@@ -7927,16 +8210,14 @@ USING (true);`;
                               return (
                                 <tr>
                                   <td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-muted)', fontStyle: 'italic', padding: '24px' }}>
-                                    {language === 'es' ? 'No se encontraron artículos activos en stock.' : 'No active stock items found.'}
+                                    {language === 'es' ? 'No se encontraron artÃÂ­culos activos en stock.' : 'No active stock items found.'}
                                   </td>
                                 </tr>
                               );
                             }
 
-                            return groupedList.map((group, index) => {
+                            return groupedList.map((group) => {
                               const prod = group[0];
-                              const isLastFew = index > 0 && index >= groupedList.length - 2;
-                              const hasRentals = group.some(p => (rentals || []).some(r => r && r.bike_id === p.id && r.status === 'Activo'));
                               const activeProd = group.find(p => p.status !== 'Vendida' && p.status !== 'Financiada' && p.status !== 'Robada' && p.status !== 'Perdida' && p.status !== 'Perdida/Garda') || prod;
                               const isConsolidated = group.some(p => p.custom_field_values?.location_distribution);
                               
@@ -7968,8 +8249,13 @@ USING (true);`;
                               // Counts per status
                               const countDisp = isConsolidated ? totalCount : group.filter(p => p.status === 'Disponible').length;
                               const countReqService = isConsolidated ? 0 : group.filter(p => p.status === 'Disponible' && p.maintenance_status === 'Requiere Service').length;
-                              const countReviewed = isConsolidated ? 0 : group.filter(p => p.status === 'Disponible' && p.maintenance_status === 'Al día' && isWithinLast30Days(p.last_service_date)).length;
-                              const countRent = isConsolidated ? 0 : group.filter(p => p.status === 'Rentada').length;
+                              const countReviewed = isConsolidated ? 0 : group.filter(p => p.status === 'Disponible' && p.maintenance_status === 'Al dÃÂ­a' && isWithinLast30Days(p.last_service_date)).length;
+                              const groupProductIds = new Set(group.map(p => p.id));
+                              const countRentFromItems = (rentalItems || []).filter(ri =>
+                                groupProductIds.has(ri.product_id) &&
+                                (rentals || []).some(r => r.id === ri.rental_id && r.status === 'Activo')
+                              ).length;
+                              const countRent = isConsolidated ? countRentFromItems : group.filter(p => p.status === 'Rentada').length;
                               const countShop = isConsolidated ? 0 : group.filter(p => p.status === 'Mantenimiento').length;
 
                               return (
@@ -7991,21 +8277,21 @@ USING (true);`;
 {stockVisibleCols.location !== false && (
                                   <td>
                                     {group.every(p => p.status === 'Vendida' || p.status === 'Financiada' || p.status === 'Robada' || p.status === 'Perdida' || p.status === 'Perdida/Garda') ? (
-                                      <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                      <span style={{ color: 'var(--text-muted)' }}>Ã¢ÂÂ</span>
                                     ) : isConsolidated ? (
                                       <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                                         {Object.entries(consolidatedLocDist)
                                           .filter(([_, qty]) => qty > 0)
                                           .map(([locName, qty]) => (
                                             <div key={locName} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                              <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-bright)' }}>📍 {locName}</span>
+                                              <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-bright)' }}>Ã°ÂÂÂ {locName}</span>
                                               <span style={{ fontSize: '10px', background: 'rgba(99, 102, 241, 0.15)', color: '#818cf8', padding: '1px 6px', borderRadius: '4px', fontWeight: 'bold' }}>{qty}</span>
                                             </div>
                                           ))}
                                       </div>
                                     ) : activeProd.custom_field_values?.location ? (
                                       <div>
-                                        <strong>📍 {activeProd.custom_field_values.location as string}</strong>
+                                        <strong>Ã°ÂÂÂ {activeProd.custom_field_values.location as string}</strong>
                                         {!!activeProd.custom_field_values.location_date && (
                                           <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: '2px' }}>
                                             {(() => {
@@ -8022,26 +8308,26 @@ USING (true);`;
                                   </td>
                                   )}
 {stockVisibleCols.price !== false && (
-                                  <td>{prod.price_sold ? <strong>€{prod.price_sold}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td>{prod.price_sold ? <strong>Ã¢ÂÂ¬{prod.price_sold}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
                                   {stockVisibleCols.cost && (
-                                  <td>{prod.price_paid ? <strong>€{prod.price_paid}{isConsolidated ? <span style={{ fontWeight: 400, color: 'var(--text-muted)', fontSize: '11px' }}> /u</span> : null}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td>{prod.price_paid ? <strong>Ã¢ÂÂ¬{prod.price_paid}{isConsolidated ? <span style={{ fontWeight: 400, color: 'var(--text-muted)', fontSize: '11px' }}> /u</span> : null}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
 {stockVisibleCols.condition !== false && (
                                   <td>
                                     {(prod.status === 'Vendida' || prod.status === 'Financiada' || prod.status === 'Robada' || prod.status === 'Perdida' || prod.status === 'Perdida/Garda') ? (
-                                      <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                      <span style={{ color: 'var(--text-muted)' }}>Ã¢ÂÂ</span>
                                     ) : (prod.category_id === catBikeId || prod.category_id === catBattId) ? (
                                       (() => {
                                         const cond = prod.condition || 'bueno';
                                         const condLabels: Record<string, { es: string; en: string; class: string }> = {
-                                          nuevo: { es: '✨ Nuevo', en: '✨ New', class: 'status-rented' },
-                                          bueno: { es: '🟢 Bueno', en: '🟢 Good', class: 'status-available' },
-                                          regular: { es: '🟡 Regular', en: '🟡 Regular', class: 'status-maintenance' },
-                                          'para venta': { es: '🟣 Para Venta', en: '🟣 For Sale', class: 'status-sold' },
-                                          'no funciona': { es: '❌ No funciona', en: '❌ Broken', class: 'status-lost' },
-                                          'funciona mal': { es: '⚠️ Funciona Mal', en: '⚠️ Malfunctioning', class: 'status-maintenance' },
-                                          reclamada: { es: '🛡️ Reclamada', en: '🛡️ Claimed', class: 'status-rented' }
+                                          nuevo: { es: 'Ã¢ÂÂ¨ Nuevo', en: 'Ã¢ÂÂ¨ New', class: 'status-rented' },
+                                          bueno: { es: 'Ã°ÂÂÂ¢ Bueno', en: 'Ã°ÂÂÂ¢ Good', class: 'status-available' },
+                                          regular: { es: 'Ã°ÂÂÂ¡ Regular', en: 'Ã°ÂÂÂ¡ Regular', class: 'status-maintenance' },
+                                          'para venta': { es: 'Ã°ÂÂÂ£ Para Venta', en: 'Ã°ÂÂÂ£ For Sale', class: 'status-sold' },
+                                          'no funciona': { es: 'Ã¢ÂÂ No funciona', en: 'Ã¢ÂÂ Broken', class: 'status-lost' },
+                                          'funciona mal': { es: 'Ã¢ÂÂ Ã¯Â¸Â Funciona Mal', en: 'Ã¢ÂÂ Ã¯Â¸Â Malfunctioning', class: 'status-maintenance' },
+                                          reclamada: { es: 'Ã°ÂÂÂ¡Ã¯Â¸Â Reclamada', en: 'Ã°ÂÂÂ¡Ã¯Â¸Â Claimed', class: 'status-rented' }
                                         };
                                         const label = condLabels[cond] || condLabels['bueno'];
                                         return (
@@ -8057,17 +8343,17 @@ USING (true);`;
                                   )}
                                   <td>
                                     {totalCount === 1 ? (() => {
-                                      const hasAnnouncedReturn = prod.category_id === catBikeId && rentals.some(r => r.bike_id === prod.id && r.status === 'Devolución en Proceso');
+                                      const hasAnnouncedReturn = prod.category_id === catBikeId && rentals.some(r => r.bike_id === prod.id && r.status === 'DevoluciÃÂ³n en Proceso');
                                        const displayStatus = hasAnnouncedReturn
-                                         ? 'Devolución en Proceso'
+                                         ? 'DevoluciÃÂ³n en Proceso'
                                          : (prod.status === 'Disponible' && prod.maintenance_status === 'Requiere Service')
                                            ? 'Requiere Service'
-                                           : (prod.status === 'Disponible' && prod.maintenance_status === 'Al día' && isWithinLast30Days(prod.last_service_date))
-                                             ? 'Recién Revisada'
+                                           : (prod.status === 'Disponible' && prod.maintenance_status === 'Al dÃÂ­a' && isWithinLast30Days(prod.last_service_date))
+                                             ? 'ReciÃÂ©n Revisada'
                                              : prod.status;
                                       return (
                                         <span 
-                                          className={`badge ${displayStatus === 'Disponible' ? 'status-available' : displayStatus === 'Recién Revisada' ? 'status-reviewed' : (displayStatus === 'Requiere Service' || displayStatus === 'Robada' || displayStatus === 'Perdida/Garda' || displayStatus === 'Perdida') ? 'status-lost' : displayStatus === 'Rentada' ? 'status-rented' : (displayStatus === 'Mantenimiento' || displayStatus === 'Devolución en Proceso') ? 'status-maintenance' : displayStatus === 'Financiada' ? 'status-financed' : 'status-sold'}`}
+                                          className={`badge ${displayStatus === 'Disponible' ? 'status-available' : displayStatus === 'ReciÃÂ©n Revisada' ? 'status-reviewed' : (displayStatus === 'Requiere Service' || displayStatus === 'Robada' || displayStatus === 'Perdida/Garda' || displayStatus === 'Perdida') ? 'status-lost' : displayStatus === 'Rentada' ? 'status-rented' : (displayStatus === 'Mantenimiento' || displayStatus === 'DevoluciÃÂ³n en Proceso') ? 'status-maintenance' : displayStatus === 'Financiada' ? 'status-financed' : 'status-sold'}`}
                                           style={displayStatus === 'Financiada' ? { cursor: 'pointer' } : {}}
                                           onClick={() => {
                                             if (displayStatus === 'Financiada') {
@@ -8086,8 +8372,8 @@ USING (true);`;
                                               const totalPayments = payments.length;
                                               return `${language === 'es' ? 'Financiada' : 'Financed'} (${paidPayments}/${totalPayments})`;
                                             }
-                                            if (displayStatus === 'Devolución en Proceso') {
-                                               return language === 'es' ? 'Devolución en Proceso' : 'Return in Process';
+                                            if (displayStatus === 'DevoluciÃÂ³n en Proceso') {
+                                               return language === 'es' ? 'DevoluciÃÂ³n en Proceso' : 'Return in Process';
                                              }
                                              if (displayStatus === 'Mantenimiento') {
                                                return language === 'es' ? 'En Taller' : 'In Shop';
@@ -8095,8 +8381,8 @@ USING (true);`;
                                              if (displayStatus === 'Requiere Service') {
                                                return language === 'es' ? 'Requiere Service' : 'Needs Service';
                                              }
-                                            if (displayStatus === 'Recién Revisada') {
-                                              return language === 'es' ? 'Recién Revisada' : 'Recently Serviced';
+                                            if (displayStatus === 'ReciÃÂ©n Revisada') {
+                                              return language === 'es' ? 'ReciÃÂ©n Revisada' : 'Recently Serviced';
                                             }
                                             return displayStatus;
                                           })()}
@@ -8104,9 +8390,7 @@ USING (true);`;
                                       );
                                     })() : (() => {
                                       // "Stock" here = active stock only (sold/lost/stolen are already excluded from this tab).
-                                      const displayRent = isConsolidated
-                                        ? (rentals || []).filter(r => group.some(p => p.id === r.bike_id) && r.status === 'Activo').length
-                                        : countRent;
+                                      const displayRent = countRent;
                                       const displayShop = isConsolidated ? group.filter(p => p.status === 'Mantenimiento').length : countShop;
                                       const displayDisp = isConsolidated
                                         ? Math.max(0, totalCount - displayRent - displayShop)
@@ -8149,7 +8433,7 @@ USING (true);`;
                                   <td>
                                     {bikeModifications.filter(m => m.bike_id === prod.id).length > 0
                                       ? <span className="badge status-rented" style={{ fontSize: '11px', cursor: 'pointer' }} onClick={() => { setSelectedProductId(prod.id); fetchModifications(prod.id); setModalType('bikeModifications'); }}>
-                                          🛠️ {bikeModifications.filter(m => m.bike_id === prod.id).length}
+                                          Ã°ÂÂÂ Ã¯Â¸Â {bikeModifications.filter(m => m.bike_id === prod.id).length}
                                         </span>
                                       : <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>-</span>
                                     }
@@ -8165,7 +8449,7 @@ USING (true);`;
                                           // Prefer a Disponible row that still has real stock; fall back to any Disponible row
                                           const availableUnit = group.find(p => p.status === 'Disponible' && (!isConsolidated || Object.values((p.custom_field_values?.location_distribution as Record<string, number>) || {}).reduce((a, b) => a + b, 0) > 0)) || group.find(p => p.status === 'Disponible');
                                           if (availableUnit) openSoldModal(availableUnit);
-                                        }}>💶 {t.markSold}</button>
+                                        }}>Ã°ÂÂÂ¶ {t.markSold}</button>
                                       ) : (
                                         <button 
                                           className="btn-primary btn-xs" 
@@ -8177,9 +8461,9 @@ USING (true);`;
                                             boxShadow: 'none',
                                             border: '1px solid rgba(255, 255, 255, 0.08)'
                                           }}
-                                          title={language === 'es' ? 'No se puede vender un artículo rentado o en mantenimiento' : 'Cannot sell a rented or in-shop item'}
+                                          title={language === 'es' ? 'No se puede vender un artÃÂ­culo rentado o en mantenimiento' : 'Cannot sell a rented or in-shop item'}
                                         >
-                                          💶 {t.markSold}
+                                          Ã°ÂÂÂ¶ {t.markSold}
                                         </button>
                                       )}
 
@@ -8204,390 +8488,10 @@ USING (true);`;
                                             }
                                           }}
                                         >
-                                          ➕ {language === 'es' ? 'Más' : 'More'}
+                                          Ã¢ÂÂ {language === 'es' ? 'MÃÂ¡s' : 'More'}
                                         </button>
-
-                                        {activeStockMenuId === prod.id && (
-                                          <>
-                                            {/* Click-away overlay */}
-                                            <div 
-                                              style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 90, cursor: 'default' }}
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                setActiveStockMenuId(null);
-                                              }}
-                                            />
-                                            
-                                            {/* Dropdown Menu */}
-                                            <div 
-                                              style={{ 
-                                                position: 'absolute', 
-                                                ...(isLastFew ? { bottom: 'calc(100% + 4px)' } : { top: 'calc(100% + 4px)' }),
-                                                right: 0, 
-                                                background: 'rgba(23, 23, 37, 0.98)', 
-                                                backdropFilter: 'blur(12px)',
-                                                WebkitBackdropFilter: 'blur(12px)',
-                                                border: '1px solid rgba(255, 255, 255, 0.08)', 
-                                                borderRadius: '8px', 
-                                                padding: '6px', 
-                                                minWidth: '150px', 
-                                                zIndex: 100, 
-                                                boxShadow: '0 10px 25px rgba(0, 0, 0, 0.6)',
-                                                display: 'flex',
-                                                flexDirection: 'column',
-                                                gap: '4px'
-                                              }}
-                                            >
-                                              <button
-                                                className="dropdown-item"
-                                                style={{
-                                                  width: '100%',
-                                                  textAlign: 'left',
-                                                  background: 'transparent',
-                                                  border: 'none',
-                                                  borderRadius: '6px',
-                                                  padding: '8px 12px',
-                                                  fontSize: '12px',
-                                                  color: 'var(--text-muted)',
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease'
-                                                }}
-                                                onClick={() => {
-                                                  setActiveStockMenuId(null);
-                                                  openProductModal(prod);
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                  e.currentTarget.style.color = 'var(--text-bright)';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'var(--text-muted)';
-                                                }}
-                                              >
-                                                ✏️ {t.edit}
-                                              </button>
-
-                                              {prod.category_id === catLockId && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    if (prod.custom_field_values?.associated_bike_id) {
-                                                      setModalType('confirmUnlinkLock');
-                                                    } else {
-                                                      setModalType('linkLockToBike');
-                                                    }
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  {prod.custom_field_values?.associated_bike_id 
-                                                    ? (language === 'es' ? '🔗 Desvincular de Bike' : '🔗 Unlink from Bike')
-                                                    : (language === 'es' ? '🔗 Vincular a Bike' : '🔗 Link to Bike')
-                                                  }
-                                                </button>
-                                              )}
-
-                                              {prod.status !== 'Vendida' && prod.status !== 'Financiada' && (
-                                                <>
-                                                  <button
-                                                    className="dropdown-item"
-                                                    style={{ 
-                                                      width: '100%', 
-                                                      textAlign: 'left', 
-                                                      background: 'transparent', 
-                                                      border: 'none', 
-                                                      borderRadius: '6px', 
-                                                      padding: '8px 12px', 
-                                                      fontSize: '12px', 
-                                                      color: 'var(--text-muted)', 
-                                                      cursor: 'pointer',
-                                                      display: 'flex',
-                                                      alignItems: 'center',
-                                                      gap: '8px',
-                                                      transition: 'all 0.2s ease'
-                                                    }}
-                                                    onClick={() => {
-                                                      setActiveStockMenuId(null);
-                                                      setSelectedProductId(prod.id);
-                                                      setSelectedLocation((prod.custom_field_values?.location as string) || '');
-                                                      setSelectedLocationDate((prod.custom_field_values?.location_date as string) || new Date().toISOString().split('T')[0]);
-                                                      setModalType('changeLocation');
-                                                    }}
-                                                    onMouseEnter={(e) => {
-                                                      e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                      e.currentTarget.style.color = 'var(--text-bright)';
-                                                    }}
-                                                    onMouseLeave={(e) => {
-                                                      e.currentTarget.style.background = 'transparent';
-                                                      e.currentTarget.style.color = 'var(--text-muted)';
-                                                    }}
-                                                  >
-                                                    📍 {language === 'es' ? 'Ubicación' : 'Location'}
-                                                  </button>
-
-                                                  {(prod.category_id === catBikeId || prod.category_id === catBattId) && (
-                                                    <button 
-                                                      className="dropdown-item"
-                                                      style={{ 
-                                                        width: '100%', 
-                                                        textAlign: 'left', 
-                                                        background: 'transparent', 
-                                                        border: 'none', 
-                                                        borderRadius: '6px', 
-                                                        padding: '8px 12px', 
-                                                        fontSize: '12px', 
-                                                        color: 'var(--text-muted)', 
-                                                        cursor: 'pointer',
-                                                        display: 'flex',
-                                                        alignItems: 'center',
-                                                        gap: '8px',
-                                                        transition: 'all 0.2s ease'
-                                                      }}
-                                                      onClick={() => {
-                                                        setActiveStockMenuId(null);
-                                                        setSelectedProductId(prod.id);
-                                                        setSelectedCondition(prod.condition || 'bueno');
-                                                        setModalType('changeCondition');
-                                                      }}
-                                                      onMouseEnter={(e) => {
-                                                        e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                        e.currentTarget.style.color = 'var(--text-bright)';
-                                                      }}
-                                                      onMouseLeave={(e) => {
-                                                        e.currentTarget.style.background = 'transparent';
-                                                        e.currentTarget.style.color = 'var(--text-muted)';
-                                                      }}
-                                                    >
-                                                      ✨ {language === 'es' ? 'Condición' : 'Condition'}
-                                                    </button>
-                                                  )}
-                                                </>
-                                              )}
-
-                                              {(prod.category_id === catBikeId || prod.category_id === catBattId) && (prod.status || '') !== 'Vendida' && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    setModalType('bikeHistory');
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  🔧 Service
-                                                </button>
-                                              )}
-
-                                              {prod.category_id === catBikeId && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    setModalType('bikeHistory');
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  📊 {language === 'es' ? 'Ver Historial' : 'View History'}
-                                                </button>
-                                              )}
-
-                                              {prod.category_id === catBikeId && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    setModalType('bikeModifications');
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  🛠️ {language === 'es' ? 'Modificaciones' : 'Modifications'}
-                                                </button>
-                                              )}
-
-
-                                              <button 
-                                                className="dropdown-item"
-                                                style={{ 
-                                                  width: '100%', 
-                                                  textAlign: 'left', 
-                                                  background: 'transparent', 
-                                                  border: 'none', 
-                                                  borderRadius: '6px', 
-                                                  padding: '8px 12px', 
-                                                  fontSize: '12px', 
-                                                  color: 'var(--text-muted)', 
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease'
-                                                }}
-                                                onClick={() => {
-                                                  setActiveStockMenuId(null);
-                                                  setActiveNoteProduct(prod);
-                                                  setActiveNoteProductGroup(group);
-                                                  setProductNotesText(prod.notes || '');
-                                                  setModalType('productNotes');
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                  e.currentTarget.style.color = 'var(--text-bright)';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'var(--text-muted)';
-                                                }}
-                                              >
-                                                📝 {language === 'es' ? 'Notas' : 'Notes'}
-                                              </button>
-
-                                              <button 
-                                                className="dropdown-item-danger"
-                                                style={{ 
-                                                  width: '100%', 
-                                                  textAlign: 'left', 
-                                                  background: 'transparent', 
-                                                  border: 'none', 
-                                                  borderRadius: '6px', 
-                                                  padding: '8px 12px', 
-                                                  fontSize: '12px', 
-                                                  color: 'rgba(239, 68, 68, 0.85)', 
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease',
-                                                  borderTop: '1px solid rgba(255, 255, 255, 0.06)',
-                                                  marginTop: '4px',
-                                                  paddingTop: '8px'
-                                                }}
-                                                onClick={async () => {
-                                                  setActiveStockMenuId(null);
-                                                  const confirmMsg = totalCount > 1 
-                                                    ? (language === 'es' ? `⚠️ ¿Eliminar TODAS las ${totalCount} unidades de este lote?` : `⚠️ Delete ALL ${totalCount} units of this batch?`)
-                                                    : (language === 'es' ? '¿Eliminar este producto del inventario?' : 'Delete this product from inventory?');
-                                                  
-                                                  if (hasRentals) {
-                                                    if (!confirm(language === 'es' ? '⚠️ Este lote/producto tiene alquileres activos. ¿Eliminar de todos modos?' : '⚠️ This batch/product has active rentals. Delete anyway?')) return;
-                                                  } else {
-                                                    if (!confirm(confirmMsg)) return;
-                                                  }
-
-                                                  try {
-                                                    await Promise.all(group.map(p => deleteProduct(p.id)));
-                                                    showToast(language === 'es' ? 'Stock eliminado.' : 'Stock deleted.');
-                                                    triggerReload();
-                                                  } catch { showToast(language === 'es' ? 'Error al eliminar.' : 'Delete error.', 'error'); }
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(239, 68, 68, 0.12)';
-                                                  e.currentTarget.style.color = '#f87171';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'rgba(239, 68, 68, 0.85)';
-                                                }}
-                                              >
-                                                🗑️ {t.delete}
-                                              </button>
-                                            </div>
-                                          </>
-                                        )}
+                                        
+                                        
                                       </div>
                                     </div>
                                   </td>
@@ -8613,7 +8517,7 @@ USING (true);`;
                         style={soldFilterType === 'all' ? { color: 'var(--color-primary)', background: '#10b9811f', borderColor: '#10b98140', boxShadow: 'var(--shadow-sm)' } : {}}
                         onClick={() => setSoldFilterType('all')}
                       >
-                        🌐 {language === 'es' ? 'Todo' : 'All'}
+                        Ã°ÂÂÂ {language === 'es' ? 'Todo' : 'All'}
                       </button>
                       <button
                         type="button"
@@ -8621,7 +8525,8 @@ USING (true);`;
                         style={soldFilterType === 'month' ? { color: 'var(--color-primary)', background: '#10b9811f', borderColor: '#10b98140', boxShadow: 'var(--shadow-sm)' } : {}}
                         onClick={() => setSoldFilterType('month')}
                       >
-                        📅 {language === 'es' ? 'Mes Actual' : 'Current Month'}
+                        Ã°ÂÂÂ
+ {language === 'es' ? 'Mes Actual' : 'Current Month'}
                       </button>
                       <button
                         type="button"
@@ -8629,7 +8534,7 @@ USING (true);`;
                         style={soldFilterType === 'year' ? { color: 'var(--color-primary)', background: '#10b9811f', borderColor: '#10b98140', boxShadow: 'var(--shadow-sm)' } : {}}
                         onClick={() => setSoldFilterType('year')}
                       >
-                        📆 {language === 'es' ? 'Año Actual' : 'Current Year'}
+                        Ã°ÂÂÂ {language === 'es' ? 'AÃÂ±o Actual' : 'Current Year'}
                       </button>
                       <button
                         type="button"
@@ -8637,7 +8542,7 @@ USING (true);`;
                         style={soldFilterType === 'custom' ? { color: 'var(--color-primary)', background: '#10b9811f', borderColor: '#10b98140', boxShadow: 'var(--shadow-sm)' } : {}}
                         onClick={() => setSoldFilterType('custom')}
                       >
-                        ⚙️ {language === 'es' ? 'Rango Personalizado' : 'Custom Range'}
+                        Ã¢ÂÂÃ¯Â¸Â {language === 'es' ? 'Rango Personalizado' : 'Custom Range'}
                       </button>
                     </div>
 
@@ -8667,7 +8572,7 @@ USING (true);`;
                   <div className="filter-row" style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '16px' }}>
                     <input
                       className="form-control filter-input"
-                      placeholder={language === 'es' ? 'Buscar por código o nombre…' : 'Search by code or name…'}
+                      placeholder={language === 'es' ? 'Buscar por cÃÂ³digo o nombreÃ¢ÂÂ¦' : 'Search by code or nameÃ¢ÂÂ¦'}
                       value={searchSold}
                       onChange={e => setSearchSold(e.target.value)}
                     />
@@ -8677,7 +8582,7 @@ USING (true);`;
                       value={filterSoldCategory}
                       onChange={e => setFilterSoldCategory(e.target.value)}
                     >
-                      <option value="all">{language === 'es' ? 'Todas Categorías' : 'All Categories'}</option>
+                      <option value="all">{language === 'es' ? 'Todas CategorÃÂ­as' : 'All Categories'}</option>
                       {(categories || []).filter(c => c && c.id).map(c => (
                         <option key={c.id} value={c.id}>
                           {language === 'es' ? (c.name_es || c.name_en || '') : (c.name_en || c.name_es || '')}
@@ -8692,7 +8597,7 @@ USING (true);`;
                         onClick={() => setShowSoldColVisPicker(v => !v)}
                         title={language === 'es' ? 'Columnas visibles' : 'Visible columns'}
                       >
-                        ⊞ {language === 'es' ? 'Columnas' : 'Columns'}
+                        Ã¢ÂÂ {language === 'es' ? 'Columnas' : 'Columns'}
                       </button>
                       {showSoldColVisPicker && (
                         <>
@@ -8702,26 +8607,28 @@ USING (true);`;
                               {language === 'es' ? 'Columnas visibles' : 'Visible columns'}
                             </div>
                             {[
-                              { key: '_code',    label: language === 'es' ? '🔒 Código'              : '🔒 Code' },
-                              { key: '_name',    label: language === 'es' ? '🔒 Nombre / SKU'        : '🔒 Name / SKU' },
-                              { key: '_actions', label: language === 'es' ? '🔒 Acciones'            : '🔒 Actions' },
+                              { key: '_code',    label: language === 'es' ? 'Ã°ÂÂÂ CÃÂ³digo'              : 'Ã°ÂÂÂ Code' },
+                              { key: '_name',    label: language === 'es' ? 'Ã°ÂÂÂ Nombre / SKU'        : 'Ã°ÂÂÂ Name / SKU' },
+                              { key: '_actions', label: language === 'es' ? 'Ã°ÂÂÂ Acciones'            : 'Ã°ÂÂÂ Actions' },
                             ].map(col => (
                               <div key={col.key} className="col-vis-item locked checked">
-                                <div className="col-vis-check">✓</div>
+                                <div className="col-vis-check">Ã¢ÂÂ</div>
                                 <span>{col.label}</span>
                               </div>
                             ))}
                             {[
-                              { key: 'sale_date',     label: language === 'es' ? '📅 Fecha Venta'      : '📅 Sale Date' },
-                              { key: 'cost',          label: language === 'es' ? '💰 Costo'             : '💰 Cost' },
-                              { key: 'price_sold',    label: language === 'es' ? '💶 Precio Venta'      : '💶 Sale Price' },
-                              { key: 'profit',        label: language === 'es' ? '📈 Ganancia Neta'     : '📈 Net Profit' },
-                              { key: 'status',        label: language === 'es' ? '📌 Estado'            : '📌 Status' },
-                              { key: 'customer',      label: language === 'es' ? '👤 Comprador'         : '👤 Buyer' },
-                              { key: 'category',      label: language === 'es' ? '📁 Categoría'         : '📁 Category' },
-                              { key: 'frame_serial',  label: language === 'es' ? '🔢 Número de Cuadro'  : '🔢 Frame Serial' },
-                              { key: 'purchase_date', label: language === 'es' ? '🗓️ Fecha Compra'      : '🗓️ Purchase Date' },
-                              { key: 'roi',           label: '📊 ROI' },
+                              { key: 'sale_date',     label: language === 'es' ? 'Ã°ÂÂÂ
+ Fecha Venta'      : 'Ã°ÂÂÂ
+ Sale Date' },
+                              { key: 'cost',          label: language === 'es' ? 'Ã°ÂÂÂ° Costo'             : 'Ã°ÂÂÂ° Cost' },
+                              { key: 'price_sold',    label: language === 'es' ? 'Ã°ÂÂÂ¶ Precio Venta'      : 'Ã°ÂÂÂ¶ Sale Price' },
+                              { key: 'profit',        label: language === 'es' ? 'Ã°ÂÂÂ Ganancia Neta'     : 'Ã°ÂÂÂ Net Profit' },
+                              { key: 'status',        label: language === 'es' ? 'Ã°ÂÂÂ Estado'            : 'Ã°ÂÂÂ Status' },
+                              { key: 'customer',      label: language === 'es' ? 'Ã°ÂÂÂ¤ Comprador'         : 'Ã°ÂÂÂ¤ Buyer' },
+                              { key: 'category',      label: language === 'es' ? 'Ã°ÂÂÂ CategorÃÂ­a'         : 'Ã°ÂÂÂ Category' },
+                              { key: 'frame_serial',  label: language === 'es' ? 'Ã°ÂÂÂ¢ NÃÂºmero de Cuadro'  : 'Ã°ÂÂÂ¢ Frame Serial' },
+                              { key: 'purchase_date', label: language === 'es' ? 'Ã°ÂÂÂÃ¯Â¸Â Fecha Compra'      : 'Ã°ÂÂÂÃ¯Â¸Â Purchase Date' },
+                              { key: 'roi',           label: 'Ã°ÂÂÂ ROI' },
                             ].map(col => {
                               const isChecked = !!soldVisibleCols[col.key];
                               return (
@@ -8730,7 +8637,7 @@ USING (true);`;
                                   className={`col-vis-item ${isChecked ? 'checked' : ''}`}
                                   onClick={() => setSoldVisibleCols(prev => ({ ...prev, [col.key]: !isChecked }))}
                                 >
-                                  <div className="col-vis-check">{isChecked ? '✓' : ''}</div>
+                                  <div className="col-vis-check">{isChecked ? 'Ã¢ÂÂ' : ''}</div>
                                   <span>{col.label}</span>
                                 </div>
                               );
@@ -8792,16 +8699,16 @@ USING (true);`;
                           </div>
                           <div className="glass-card stat-card" style={{ padding: '16px' }}>
                             <div className="stat-label">{language === 'es' ? 'Ingresos de Venta' : 'Sales Revenue'}</div>
-                            <div className="stat-value" style={{ color: 'var(--text-bright)' }}>€{totalRevenue}</div>
+                            <div className="stat-value" style={{ color: 'var(--text-bright)' }}>Ã¢ÂÂ¬{totalRevenue}</div>
                           </div>
                           <div className="glass-card stat-card" style={{ padding: '16px' }}>
-                            <div className="stat-label">{language === 'es' ? 'Costo de Adquisición' : 'Acquisition Cost'}</div>
-                            <div className="stat-value" style={{ color: 'var(--text-muted)' }}>€{totalCost}</div>
+                            <div className="stat-label">{language === 'es' ? 'Costo de AdquisiciÃÂ³n' : 'Acquisition Cost'}</div>
+                            <div className="stat-value" style={{ color: 'var(--text-muted)' }}>Ã¢ÂÂ¬{totalCost}</div>
                           </div>
                           <div className="glass-card stat-card" style={{ padding: '16px' }}>
                             <div className="stat-label">{language === 'es' ? 'Ganancia Neta' : 'Net Profit'}</div>
                             <div className="stat-value" style={{ color: totalProfit >= 0 ? '#34d399' : '#f87171' }}>
-                              {totalProfit >= 0 ? `+€${displayTotalProfit}` : `-€${displayAbsTotalProfit}`}
+                              {totalProfit >= 0 ? `+Ã¢ÂÂ¬${displayTotalProfit}` : `-Ã¢ÂÂ¬${displayAbsTotalProfit}`}
                             </div>
                           </div>
                         </div>
@@ -8815,13 +8722,13 @@ USING (true);`;
                                   {soldVisibleCols.sale_date    && <th>{language === 'es' ? 'Fecha Venta' : 'Sale Date'}</th>}
                                   <th>{t.code}</th>
                                   <th>{language === 'es' ? 'Nombre / SKU' : 'Name / SKU'}</th>
-                                  {soldVisibleCols.category     && <th>{language === 'es' ? 'Categoría' : 'Category'}</th>}
+                                  {soldVisibleCols.category     && <th>{language === 'es' ? 'CategorÃÂ­a' : 'Category'}</th>}
                                   {soldVisibleCols.cost         && <th>{language === 'es' ? 'Costo' : 'Cost'}</th>}
                                   {soldVisibleCols.price_sold   && <th>{language === 'es' ? 'Precio Venta' : 'Sale Price'}</th>}
                                   {soldVisibleCols.profit       && <th>{language === 'es' ? 'Ganancia Neta' : 'Net Profit'}</th>}
                                   {soldVisibleCols.status       && <th>{language === 'es' ? 'Estado / Financiamiento' : 'Status / Financing'}</th>}
                                   {soldVisibleCols.customer     && <th>{language === 'es' ? 'Comprador' : 'Buyer'}</th>}
-                                  {soldVisibleCols.frame_serial && <th>{language === 'es' ? 'N° Cuadro' : 'Frame Serial'}</th>}
+                                  {soldVisibleCols.frame_serial && <th>{language === 'es' ? 'NÃÂ° Cuadro' : 'Frame Serial'}</th>}
                                   {soldVisibleCols.purchase_date && <th>{language === 'es' ? 'Fecha Compra' : 'Purchase Date'}</th>}
                                   {soldVisibleCols.roi          && <th>ROI</th>}
                                   <th>{t.actions}</th>
@@ -8858,12 +8765,12 @@ USING (true);`;
                                         <td><span style={{ fontFamily: 'monospace', fontSize: '11px', background: 'rgba(255,255,255,0.06)', padding: '2px 6px', borderRadius: '4px', color: 'var(--text-bright)' }}>{serialDisplay}</span></td>
                                         <td>{s.name}</td>
                                         {soldVisibleCols.category     && <td style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{categoryName}</td>}
-                                        {soldVisibleCols.cost         && <td><strong>€{s.price_paid}</strong></td>}
-                                        {soldVisibleCols.price_sold   && <td><strong>€{s.price_sold || 0}</strong></td>}
+                                        {soldVisibleCols.cost         && <td><strong>Ã¢ÂÂ¬{s.price_paid}</strong></td>}
+                                        {soldVisibleCols.price_sold   && <td><strong>Ã¢ÂÂ¬{s.price_sold || 0}</strong></td>}
                                         {soldVisibleCols.profit       && (
                                           <td>
                                             <span style={{ fontWeight: 'bold', color: gain >= 0 ? '#34d399' : '#f87171' }}>
-                                              {gain >= 0 ? `+€${displayGain}` : `-€${displayAbsGain}`}
+                                              {gain >= 0 ? `+Ã¢ÂÂ¬${displayGain}` : `-Ã¢ÂÂ¬${displayAbsGain}`}
                                             </span>
                                           </td>
                                         )}
@@ -8878,11 +8785,11 @@ USING (true);`;
                                                 }}
                                               >
                                                 <span className="badge status-financed" style={{ fontSize: '11px', alignSelf: 'start' }}>
-                                                  💳 {language === 'es' ? 'Financiada' : 'Financed'} ({paidPayments}/{totalPayments})
+                                                  Ã°ÂÂÂ³ {language === 'es' ? 'Financiada' : 'Financed'} ({paidPayments}/{totalPayments})
                                                 </span>
                                                 {sale?.received_via && (
                                                   <span style={{ fontSize: '10px', color: 'var(--text-muted)' }}>
-                                                    {language === 'es' ? 'Entrada:' : 'Down pay:'} {sale.received_via === 'efectivo' ? '💵 Efectivo' : '🏦 Transfer'}
+                                                    {language === 'es' ? 'Entrada:' : 'Down pay:'} {sale.received_via === 'efectivo' ? 'Ã°ÂÂÂµ Efectivo' : 'Ã°ÂÂÂ¦ Transfer'}
                                                   </span>
                                                 )}
                                                 <div style={{ width: '100px', height: '6px', background: 'rgba(255,255,255,0.1)', borderRadius: '3px', overflow: 'hidden' }}>
@@ -8892,20 +8799,20 @@ USING (true);`;
                                             ) : (
                                               <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                                                 <span className="badge status-sold" style={{ fontSize: '11px' }}>
-                                                  ✔️ {language === 'es' ? 'Venta Completa' : 'Fully Sold'}
+                                                  Ã¢ÂÂÃ¯Â¸Â {language === 'es' ? 'Venta Completa' : 'Fully Sold'}
                                                 </span>
                                                 {sale?.received_via && (
                                                   <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-                                                    {sale.received_via === 'efectivo' ? '💵 Efectivo' : '🏦 Transferencia'}
+                                                    {sale.received_via === 'efectivo' ? 'Ã°ÂÂÂµ Efectivo' : 'Ã°ÂÂÂ¦ Transferencia'}
                                                   </span>
                                                 )}
                                               </div>
                                             )}
                                           </td>
                                         )}
-                                        {soldVisibleCols.customer     && <td style={{ fontSize: '12px' }}>{buyer ? `${buyer.first_name || ''} ${buyer.last_name || ''}`.trim() : '—'}</td>}
-                                        {soldVisibleCols.frame_serial && <td style={{ fontFamily: 'monospace', fontSize: '11px' }}>{s.frame_serial || '—'}</td>}
-                                        {soldVisibleCols.purchase_date && <td style={{ fontSize: '12px' }}>{s.purchase_date || '—'}</td>}
+                                        {soldVisibleCols.customer     && <td style={{ fontSize: '12px' }}>{buyer ? `${buyer.first_name || ''} ${buyer.last_name || ''}`.trim() : 'Ã¢ÂÂ'}</td>}
+                                        {soldVisibleCols.frame_serial && <td style={{ fontFamily: 'monospace', fontSize: '11px' }}>{s.frame_serial || 'Ã¢ÂÂ'}</td>}
+                                        {soldVisibleCols.purchase_date && <td style={{ fontSize: '12px' }}>{s.purchase_date || 'Ã¢ÂÂ'}</td>}
                                         {soldVisibleCols.roi          && <td>{renderROIBadge(s.id)}</td>}
                                         <td style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
                                           {s.status === 'Financiada' && plan && paidPayments < totalPayments && (
@@ -8919,14 +8826,14 @@ USING (true);`;
                                               }}
                                               style={{ background: '#8b5cf6', borderColor: '#a78bfa' }}
                                             >
-                                              🪙 {language === 'es' ? 'Cobrar Cuota' : 'Collect Installment'}
+                                              Ã°ÂÂªÂ {language === 'es' ? 'Cobrar Cuota' : 'Collect Installment'}
                                             </button>
                                           )}
                                           <button
                                             className="btn-secondary btn-xs"
                                             onClick={() => openProductModal(s)}
                                           >
-                                            ✏️ {language === 'es' ? 'Editar' : 'Edit'}
+                                            Ã¢ÂÂÃ¯Â¸Â {language === 'es' ? 'Editar' : 'Edit'}
                                           </button>
                                           {isProductGeneric(s) && (
                                             <button 
@@ -8949,7 +8856,7 @@ USING (true);`;
                                                 }
                                               }}
                                             >
-                                              ➕ {language === 'es' ? 'Más' : 'More'}
+                                              Ã¢ÂÂ {language === 'es' ? 'MÃÂ¡s' : 'More'}
                                             </button>
                                           )}
                                         </td>
@@ -8983,8 +8890,8 @@ USING (true);`;
                       <table className="custom-table">
                         <thead>
                           <tr>
-                            <th>{language === 'es' ? 'Categoría' : 'Category'}</th>
-                            <th>{language === 'es' ? 'Número de Serie' : 'Serial Number'}</th>
+                            <th>{language === 'es' ? 'CategorÃÂ­a' : 'Category'}</th>
+                            <th>{language === 'es' ? 'NÃÂºmero de Serie' : 'Serial Number'}</th>
                             <th>{language === 'es' ? 'Nombre' : 'Name'}</th>
                             <th>{language === 'es' ? 'Estado' : 'Status'}</th>
                             <th>{language === 'es' ? 'Notas' : 'Notes'}</th>
@@ -9007,7 +8914,7 @@ USING (true);`;
                               return (
                                 <tr>
                                   <td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-muted)', fontStyle: 'italic', padding: '24px' }}>
-                                    {language === 'es' ? 'No hay artículos robados o perdidos registrados.' : 'No stolen or lost items registered.'}
+                                    {language === 'es' ? 'No hay artÃÂ­culos robados o perdidos registrados.' : 'No stolen or lost items registered.'}
                                   </td>
                                 </tr>
                               );
@@ -9050,9 +8957,9 @@ USING (true);`;
                   {/* ---- PRODUCT TEMPLATES / MODELS ---- */}
                   <div className="glass-card">
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', flexWrap: 'wrap', gap: '8px' }}>
-                      <h3>📋 {language === 'es' ? 'Modelos y Plantillas de Flota' : 'Fleet Models & Templates'}</h3>
+                      <h3>Ã°ÂÂÂ {language === 'es' ? 'Modelos y Plantillas de Flota' : 'Fleet Models & Templates'}</h3>
                       <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                        <button className="btn-secondary btn-xs" onClick={() => setViewCFModalOpen(true)}>🧩 {language === 'es' ? 'Campos Personalizados' : 'Custom Fields'}</button>
+                        <button className="btn-secondary btn-xs" onClick={() => setViewCFModalOpen(true)}>Ã°ÂÂ§Â© {language === 'es' ? 'Campos Personalizados' : 'Custom Fields'}</button>
                         <button className="btn-primary btn-xs" onClick={() => {
                           setTmplEditing(null);
                           setTmplCategory(catBikeId);
@@ -9060,12 +8967,12 @@ USING (true);`;
                           setTmplBrand(''); setTmplModel(''); setTmplWeeklyRate(50); setTmplDeposit(150); setTmplColor('');
                           setTmplImageFile(null); setTmplImagePreview(null);
                           setTmplModalOpen(true);
-                        }}>➕ {language === 'es' ? 'Nueva Plantilla' : 'New Template'}</button>
+                        }}>Ã¢ÂÂ {language === 'es' ? 'Nueva Plantilla' : 'New Template'}</button>
                       </div>
                     </div>
                     {(productModels || []).length === 0 ? (
                       <p style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>
-                        {language === 'es' ? 'No hay plantillas. Crea una para registrar productos más rápido.' : 'No templates yet. Create one to register products faster.'}
+                        {language === 'es' ? 'No hay plantillas. Crea una para registrar productos mÃÂ¡s rÃÂ¡pido.' : 'No templates yet. Create one to register products faster.'}
                       </p>
                     ) : (
                       <div className="table-container">
@@ -9074,7 +8981,7 @@ USING (true);`;
                             <tr>
                               <th>{language === 'es' ? 'Imagen' : 'Image'}</th>
                               <th>{language === 'es' ? 'Nombre / Marca' : 'Name / Brand'}</th>
-                              <th>{language === 'es' ? 'Categoría' : 'Category'}</th>
+                              <th>{language === 'es' ? 'CategorÃÂ­a' : 'Category'}</th>
                               <th>{language === 'es' ? 'Unidades' : 'Units'}</th>
                               <th>{language === 'es' ? 'Tarifas Sugeridas' : 'Suggested Rates'}</th>
                               <th>{t.actions}</th>
@@ -9097,7 +9004,7 @@ USING (true);`;
                                           style={{ width: '50px', height: '40px', objectFit: 'cover', borderRadius: '6px', border: '1px solid var(--border-color)' }} 
                                         />
                                       ) : (
-                                        <div style={{ width: '50px', height: '40px', background: 'rgba(255,255,255,0.04)', borderRadius: '6px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', border: '1px solid var(--border-color)', color: 'var(--text-muted)' }}>📷</div>
+                                        <div style={{ width: '50px', height: '40px', background: 'rgba(255,255,255,0.04)', borderRadius: '6px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', border: '1px solid var(--border-color)', color: 'var(--text-muted)' }}>Ã°ÂÂÂ·</div>
                                       )}
                                     </td>
                                     <td>
@@ -9123,8 +9030,8 @@ USING (true);`;
                                     <td>
                                       {pm.category_id === catBikeId ? (
                                         <div style={{ display: 'flex', gap: '12px', fontSize: '12px' }}>
-                                          <span>💰 €{pm.suggested_weekly_rate || 0}/{language === 'es' ? 'sem' : 'wk'}</span>
-                                          <span>🛡️ €{pm.suggested_deposit || 0}</span>
+                                          <span>Ã°ÂÂÂ° Ã¢ÂÂ¬{pm.suggested_weekly_rate || 0}/{language === 'es' ? 'sem' : 'wk'}</span>
+                                          <span>Ã°ÂÂÂ¡Ã¯Â¸Â Ã¢ÂÂ¬{pm.suggested_deposit || 0}</span>
                                         </div>
                                       ) : (
                                         <span style={{ color: 'var(--text-muted)' }}>-</span>
@@ -9142,12 +9049,12 @@ USING (true);`;
                                           setTmplImageFile(null); setTmplImagePreview(pm.image_url || null);
                                           setTmplModalOpen(true);
                                         }}>
-                                          ✏️ {t.edit}
+                                          Ã¢ÂÂÃ¯Â¸Â {t.edit}
                                         </button>
                                         <button className="btn-danger btn-xs" onClick={async () => {
                                           if ((pm.unit_count || 0) > 0) {
                                             if (!await asyncConfirm(language === 'es'
-                                              ? `Esta plantilla tiene ${pm.unit_count} unidades vinculadas. ¿Eliminar igualmente? Los productos no se borrarán.`
+                                              ? `Esta plantilla tiene ${pm.unit_count} unidades vinculadas. ÃÂ¿Eliminar igualmente? Los productos no se borrarÃÂ¡n.`
                                               : `This template has ${pm.unit_count} linked units. Delete anyway? Products won't be deleted.`
                                             )) return;
                                           }
@@ -9157,7 +9064,7 @@ USING (true);`;
                                             triggerReload();
                                           } catch { showToast(language === 'es' ? 'Error al eliminar.' : 'Delete error.', 'error'); }
                                         }}>
-                                          🗑️ {t.delete}
+                                          Ã°ÂÂÂÃ¯Â¸Â {t.delete}
                                         </button>
                                       </div>
                                     </td>
@@ -9210,7 +9117,7 @@ USING (true);`;
                           onClick={() => setShowRentalColVisPicker(v => !v)}
                           title={language === 'es' ? 'Columnas visibles' : 'Visible columns'}
                         >
-                          ⊞ {language === 'es' ? 'Columnas' : 'Columns'}
+                          Ã¢ÂÂ {language === 'es' ? 'Columnas' : 'Columns'}
                         </button>
                         {showRentalColVisPicker && (
                           <>
@@ -9223,21 +9130,21 @@ USING (true);`;
                                 {language === 'es' ? 'Columnas visibles' : 'Visible columns'}
                               </div>
                               {[
-                                { key: '_code',  label: language === 'es' ? '🔒 Código' : '🔒 Code' },
-                                { key: '_bike', label: language === 'es' ? '🔒 Bicicleta' : '🔒 Bicycle' },
-                                { key: '_actions', label: language === 'es' ? '🔒 Acciones' : '🔒 Actions' },
+                                { key: '_code',  label: language === 'es' ? 'Ã°ÂÂÂ CÃÂ³digo' : 'Ã°ÂÂÂ Code' },
+                                { key: '_bike', label: language === 'es' ? 'Ã°ÂÂÂ Bicicleta' : 'Ã°ÂÂÂ Bicycle' },
+                                { key: '_actions', label: language === 'es' ? 'Ã°ÂÂÂ Acciones' : 'Ã°ÂÂÂ Actions' },
                               ].map(col => (
                                 <div key={col.key} className="col-vis-item locked checked">
-                                  <div className="col-vis-check">✓</div>
+                                  <div className="col-vis-check">Ã¢ÂÂ</div>
                                   <span>{col.label}</span>
                                 </div>
                               ))}
                               {[
-                                { key: 'status_rider', label: language === 'es' ? '📌 Estado / Rider' : '📌 Status / Rider' },
-                                { key: 'roi',          label: '📊 ROI' },
-                                { key: 'earnings',     label: language === 'es' ? '💰 Ganancias Totales' : '💰 Total Earnings' },
-                                { key: 'app_account',  label: language === 'es' ? '📱 Cuenta de App' : '📱 App Account' },
-                                { key: 'user_count',   label: language === 'es' ? '👥 Cantidad de Usuarios' : '👥 User Count' },
+                                { key: 'status_rider', label: language === 'es' ? 'Ã°ÂÂÂ Estado / Rider' : 'Ã°ÂÂÂ Status / Rider' },
+                                { key: 'roi',          label: 'Ã°ÂÂÂ ROI' },
+                                { key: 'earnings',     label: language === 'es' ? 'Ã°ÂÂÂ° Ganancias Totales' : 'Ã°ÂÂÂ° Total Earnings' },
+                                { key: 'app_account',  label: language === 'es' ? 'Ã°ÂÂÂ± Cuenta de App' : 'Ã°ÂÂÂ± App Account' },
+                                { key: 'user_count',   label: language === 'es' ? 'Ã°ÂÂÂ¥ Cantidad de Usuarios' : 'Ã°ÂÂÂ¥ User Count' },
                               ].map(col => {
                                 const isChecked = !!rentalVisibleCols[col.key];
                                 return (
@@ -9246,7 +9153,7 @@ USING (true);`;
                                     className={`col-vis-item ${isChecked ? 'checked' : ''}`}
                                     onClick={() => setRentalVisibleCols(prev => ({ ...prev, [col.key]: !isChecked }))}
                                   >
-                                    <div className="col-vis-check">{isChecked ? '✓' : ''}</div>
+                                    <div className="col-vis-check">{isChecked ? 'Ã¢ÂÂ' : ''}</div>
                                     <span>{col.label}</span>
                                   </div>
                                 );
@@ -9279,7 +9186,7 @@ USING (true);`;
                       </span>
                     </div>
                     <button className="btn-primary rental-new-btn" onClick={() => { setWizardStep(1); setShowRentalWizard(true); setWizRatePaymentMethod('efectivo'); setWizDepositPaymentMethod('efectivo'); }} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      ⚡ {language === 'es' ? 'Nuevo Alquiler' : 'New Rental'}
+                      Ã¢ÂÂ¡ {language === 'es' ? 'Nuevo Alquiler' : 'New Rental'}
                     </button>
                   </div>
                   <div className="glass-card">
@@ -9287,7 +9194,7 @@ USING (true);`;
                       <table className="custom-table">
                         <thead>
                           <tr>
-                            <th>{language === 'es' ? 'Código' : 'Code'}</th>
+                            <th>{language === 'es' ? 'CÃÂ³digo' : 'Code'}</th>
                             <th>{language === 'es' ? 'Bicicleta' : 'Bicycle'}</th>
                             {rentalVisibleCols.status_rider && <th>{language === 'es' ? 'Estado / Rider' : 'Status / Rider'}</th>}
                             {rentalVisibleCols.roi && <th>ROI</th>}
@@ -9312,20 +9219,20 @@ USING (true);`;
                               const searchLower = searchRider.toLowerCase();
                               const matchesSerial = p.serial_number?.toLowerCase().includes(searchLower);
                               const matchesName = p.name?.toLowerCase().includes(searchLower);
-                              const activeRental = rentals.find(r => r.bike_id === p.id && (r.status === 'Activo' || r.status === 'Devolución en Proceso'));
+                              const activeRental = rentals.find(r => r.bike_id === p.id && (r.status === 'Activo' || r.status === 'DevoluciÃÂ³n en Proceso'));
                               const rider = activeRental ? customers.find(c => c.id === activeRental.customer_id) : null;
                               const matchesRider = rider ? `${rider.first_name} ${rider.last_name}`.toLowerCase().includes(searchLower) : false;
                               return matchesSerial || matchesName || matchesRider;
                             })
                             .map(bike => {
-                              const activeRental = rentals.find(r => r.bike_id === bike.id && (r.status === 'Activo' || r.status === 'Devolución en Proceso'));
+                              const activeRental = rentals.find(r => r.bike_id === bike.id && (r.status === 'Activo' || r.status === 'DevoluciÃÂ³n en Proceso'));
                               const rider = activeRental ? customers.find(c => c.id === activeRental.customer_id) : null;
                               const stats = calculateProductROI(bike.id, products, categories, rentals, rentalItems, payments, expenses, records);
 
                               // 1. Linked app account type
                               const linkedAccount = rider ? appAccounts.find(a => a.current_renter_id === rider.id && a.status === 'Activa') : null;
                               const linkedPlatform = linkedAccount ? platforms.find(p => p.id === linkedAccount.platform_id) : null;
-                              const appAccountName = linkedPlatform ? linkedPlatform.name : '—';
+                              const appAccountName = linkedPlatform ? linkedPlatform.name : 'Ã¢ÂÂ';
 
                               // 2. Quantity of unique users (riders)
                               const bikeRentals = rentals.filter(r => r.bike_id === bike.id);
@@ -9362,7 +9269,7 @@ USING (true);`;
                                           </span>
                                           {rider && (
                                             <div style={{ fontSize: '12px', marginTop: '2px' }}>
-                                              👤 <strong>{rider.first_name} {rider.last_name}</strong>
+                                              Ã°ÂÂÂ¤ <strong>{rider.first_name} {rider.last_name}</strong>
                                             </div>
                                           )}
                                         </div>
@@ -9401,7 +9308,7 @@ USING (true);`;
                                   {rentalVisibleCols.earnings && (
                                     <td>
                                       <strong style={{ color: '#10b981', fontSize: '14px' }}>
-                                        €{stats.totalPaid}
+                                        Ã¢ÂÂ¬{stats.totalPaid}
                                       </strong>
                                     </td>
                                   )}
@@ -9409,17 +9316,17 @@ USING (true);`;
                                     <td>
                                       {linkedAccount ? (
                                         <span className="badge status-rented" style={{ fontSize: '11.5px', background: 'rgba(52, 211, 153, 0.15)', color: '#34d399', border: '1px solid rgba(52, 211, 153, 0.3)' }}>
-                                          📱 {appAccountName}
+                                          Ã°ÂÂÂ± {appAccountName}
                                         </span>
                                       ) : (
-                                        <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>—</span>
+                                        <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>Ã¢ÂÂ</span>
                                       )}
                                     </td>
                                   )}
                                   {rentalVisibleCols.user_count && (
                                     <td>
                                       <span className="badge" style={{ background: 'rgba(255,255,255,0.06)', color: 'var(--text-bright)', fontSize: '11px' }}>
-                                        👥 {uniqueUsersCount}
+                                        Ã°ÂÂÂ¥ {uniqueUsersCount}
                                       </span>
                                     </td>
                                   )}
@@ -9427,16 +9334,16 @@ USING (true);`;
                                     <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
                                       {activeRental && (
                                         <>
-                                          <button className="btn-secondary btn-xs" onClick={() => setActiveCustomerId(activeRental.customer_id)}>
-                                            📋 {language === 'es' ? 'Ver Expediente' : 'View Profile'}
+                                          <button className="btn-secondary btn-xs" onClick={() => { setActiveCustomerId(activeRental.customer_id); setProfileRentalId(null); }}>
+                                            Ã°ÂÂÂ {language === 'es' ? 'Ver Expediente' : 'View Profile'}
                                           </button>
                                           <button className="btn-danger btn-xs" onClick={() => openReturnModal(activeRental)}>
-                                            🔄 {language === 'es' ? 'Devolver' : 'Return'}
+                                            Ã°ÂÂÂ {language === 'es' ? 'Devolver' : 'Return'}
                                           </button>
                                         </>
                                       )}
                                       <button className="btn-secondary btn-xs" onClick={() => { setSelectedProductId(bike.id); setModalType('bikeHistory'); }}>
-                                        📊 {language === 'es' ? 'Ver Historial' : 'History'}
+                                        Ã°ÂÂÂ {language === 'es' ? 'Ver Historial' : 'History'}
                                       </button>
 
                                       {/* Dropdown menu for unrented bikes */}
@@ -9450,7 +9357,7 @@ USING (true);`;
                                               setActiveRentalMenuId(activeRentalMenuId === bike.id ? null : bike.id);
                                             }}
                                           >
-                                            ➕ {language === 'es' ? 'Más' : 'More'}
+                                            Ã¢ÂÂ {language === 'es' ? 'MÃÂ¡s' : 'More'}
                                           </button>
                                           
                                           {activeRentalMenuId === bike.id && (
@@ -9513,7 +9420,7 @@ USING (true);`;
                                                     e.currentTarget.style.color = 'var(--color-error, #f87171)';
                                                   }}
                                                 >
-                                                  🚨 {language === 'es' ? 'Robo / Pérdida' : 'Theft / Loss'}
+                                                  Ã°ÂÂÂ¨ {language === 'es' ? 'Robo / PÃÂ©rdida' : 'Theft / Loss'}
                                                 </button>
                                               </div>
                                             </>
@@ -9539,13 +9446,29 @@ USING (true);`;
                       <input className="form-control filter-input" placeholder={t.searchPlaceholder} value={searchRider} onChange={e => setSearchRider(e.target.value)} style={{ margin: 0 }} />
                       <span style={{ fontSize: '13px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{customers.length} {language === 'es' ? 'riders registrados' : 'riders registered'}</span>
                     </div>
+                    <button
+                      className="btn-primary"
+                      onClick={() => {
+                        setQuickAddFirstName('');
+                        setQuickAddLastName('');
+                        setQuickAddPhone('');
+                        setQuickAddEmail('');
+                        setQuickAddNationality('Brasil');
+                        setQuickAddNotes('');
+                        setQuickAddSource('customers');
+                        setQuickAddRiderModalOpen(true);
+                      }}
+                      style={{ height: '38px', borderRadius: '8px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                    >
+                      Ã°ÂÂÂ¤ {language === 'es' ? 'Crear Usuario' : 'Create User'}
+                    </button>
                   </div>
                   <div className="glass-card">
                     <div className="table-container">
                       <table className="custom-table">
                         <thead>
                           <tr>
-                            <th>{language === 'es' ? 'Código' : 'Code'}</th><th>Rider</th><th>{language === 'es' ? 'Email / Teléfono' : 'Email / Phone'}</th>
+                            <th>{language === 'es' ? 'CÃÂ³digo' : 'Code'}</th><th>Rider</th><th>{language === 'es' ? 'Email / TelÃÂ©fono' : 'Email / Phone'}</th>
                             <th>{t.nationality}</th><th>{t.actions}</th>
                           </tr>
                         </thead>
@@ -9569,12 +9492,12 @@ USING (true);`;
                                   <td>
                                     <div style={{ display: 'flex', gap: '6px' }}>
                                       <button className="btn-secondary btn-xs" onClick={() => setActiveCustomerId(cust.id)}>
-                                        📋 {t.viewProfile}
+                                        Ã°ÂÂÂ {t.viewProfile}
                                       </button>
                                       <button 
                                         className="btn-danger btn-xs" 
                                         onClick={async () => {
-                                          const confirmName = window.prompt(language === 'es' ? `Escribe "${cust.first_name}" para confirmar la eliminación de este usuario:` : `Type "${cust.first_name}" to confirm deleting this user:`);
+                                          const confirmName = window.prompt(language === 'es' ? `Escribe "${cust.first_name}" para confirmar la eliminaciÃÂ³n de este usuario:` : `Type "${cust.first_name}" to confirm deleting this user:`);
                                           if (confirmName === cust.first_name) {
                                             try {
                                               await deleteCustomer(cust.id);
@@ -9584,10 +9507,10 @@ USING (true);`;
                                               showToast(language === 'es' ? 'Error al eliminar usuario.' : 'Error deleting user.', 'error');
                                             }
                                           } else if (confirmName !== null) {
-                                            showToast(language === 'es' ? 'Nombre incorrecto, eliminación abortada.' : 'Incorrect name, deletion aborted.', 'error');
+                                            showToast(language === 'es' ? 'Nombre incorrecto, eliminaciÃÂ³n abortada.' : 'Incorrect name, deletion aborted.', 'error');
                                           }
                                         }}>
-                                        🗑️ {language === 'es' ? 'Eliminar' : 'Delete'}
+                                        Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? 'Eliminar' : 'Delete'}
                                       </button>
                                     </div>
                                   </td>
@@ -9609,8 +9532,9 @@ USING (true);`;
             const cust = customers.find(c => c.id === activeCustomerId);
             if (!cust) return null;
             const custRentals = rentals.filter(r => r.customer_id === cust.id);
-            const activeRentals = custRentals.filter(r => r.status === 'Activo' || r.status === 'Devolución en Proceso');
-            const latestRental = custRentals.length > 0 ? [...custRentals].sort((a, b) => b.created_at.localeCompare(a.created_at))[0] : null;
+            const activeRentals = custRentals.filter(r => r.status === 'Activo' || r.status === 'DevoluciÃÂ³n en Proceso');
+            const overrideRental = profileRentalId ? custRentals.find(r => r.id === profileRentalId) : null;
+            const latestRental = overrideRental || (custRentals.length > 0 ? [...custRentals].sort((a, b) => b.created_at.localeCompare(a.created_at))[0] : null);
             const totalPaidForRental = payments.filter(p => custRentals.some(r => r.id === p.rental_id)).reduce((a, p) => a + p.amount, 0);
             const totalDeposit = custRentals.reduce((a, r) => a + (r.deposit_amount || 0) - (r.deposit_refunded || 0), 0);
             const totalMaintenance = expenses.filter(e => custRentals.some(r => r.id === e.rental_id)).reduce((a, e) => a + e.cost, 0);
@@ -9666,8 +9590,8 @@ USING (true);`;
             return (
               <div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-                  <button className="btn-secondary btn-xs" onClick={() => setActiveCustomerId(null)}>
-                    ← {language === 'es' ? 'Volver a Clientes' : 'Back to Customers'}
+                  <button className="btn-secondary btn-xs" onClick={() => { setActiveCustomerId(null); setProfileRentalId(null); }}>
+                    Ã¢ÂÂ {language === 'es' ? 'Volver a Clientes' : 'Back to Customers'}
                   </button>
                   {activeRentals.length > 0 && (() => {
                     const activeBike = products.find(p => p.id === activeRentals[0].bike_id);
@@ -9682,7 +9606,7 @@ USING (true);`;
                           setReportTheftOpen(true);
                         }}
                       >
-                        🚨 {language === 'es' ? 'Reportar Robo/Pérdida' : 'Report Theft/Loss'}
+                        Ã°ÂÂÂ¨ {language === 'es' ? 'Reportar Robo/PÃÂ©rdida' : 'Report Theft/Loss'}
                       </button>
                     );
                   })()}
@@ -9692,7 +9616,7 @@ USING (true);`;
                   <div className="glass-card">
                     {isEditingRider ? (
                       <div>
-                        <h3 style={{ marginBottom: '16px' }}>{language === 'es' ? '✏️ Editar Datos' : '✏️ Edit Rider Details'}</h3>
+                        <h3 style={{ marginBottom: '16px' }}>{language === 'es' ? 'Ã¢ÂÂÃ¯Â¸Â Editar Datos' : 'Ã¢ÂÂÃ¯Â¸Â Edit Rider Details'}</h3>
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                           <div className="form-group" style={{ marginBottom: 0 }}>
                             <label className="form-label" style={{ fontSize: '11px', marginBottom: '4px' }}>{language === 'es' ? 'Nombre' : 'First Name'}</label>
@@ -9715,7 +9639,7 @@ USING (true);`;
                             />
                           </div>
                           <div className="form-group" style={{ marginBottom: 0 }}>
-                            <label className="form-label" style={{ fontSize: '11px', marginBottom: '4px' }}>{language === 'es' ? 'Código de Usuario' : 'User Code'}</label>
+                            <label className="form-label" style={{ fontSize: '11px', marginBottom: '4px' }}>{language === 'es' ? 'CÃÂ³digo de Usuario' : 'User Code'}</label>
                             <div style={{ display: 'flex' }}>
                               <span style={{ 
                                 background: 'rgba(255,255,255,0.06)', 
@@ -9777,7 +9701,7 @@ USING (true);`;
                             />
                           </div>
                           <div className="form-group" style={{ marginBottom: 0 }}>
-                            <label className="form-label" style={{ fontSize: '11px', marginBottom: '4px' }}>{language === 'es' ? 'Teléfono' : 'Phone'}</label>
+                            <label className="form-label" style={{ fontSize: '11px', marginBottom: '4px' }}>{language === 'es' ? 'TelÃÂ©fono' : 'Phone'}</label>
                             <input 
                               type="text" 
                               className="form-control" 
@@ -9809,7 +9733,7 @@ USING (true);`;
                                   className="form-control" 
                                   value={editRefWhatsApp} 
                                   onChange={e => handleEditRefWhatsAppChange(e.target.value)} 
-                                  placeholder={language === 'es' ? 'Ej: Repartidores Dublín' : 'E.g.: Dublin Delivery Group'}
+                                  placeholder={language === 'es' ? 'Ej: Repartidores DublÃÂ­n' : 'E.g.: Dublin Delivery Group'}
                                   style={{ height: '34px', fontSize: '13px', flex: 1 }}
                                 />
                                 <label className="form-label" style={{ margin: 0, whiteSpace: 'nowrap', fontSize: '11px', color: 'var(--text-muted)' }}>
@@ -9826,7 +9750,7 @@ USING (true);`;
                                     className="form-control" 
                                     value={editRefUserQuery} 
                                     onChange={e => handleEditRefUserQueryChange(e.target.value)} 
-                                    placeholder={language === 'es' ? '🔍 Escribe 3 letras para buscar...' : '🔍 Type 3 letters to search...'}
+                                    placeholder={language === 'es' ? 'Ã°ÂÂÂ Escribe 3 letras para buscar...' : 'Ã°ÂÂÂ Type 3 letters to search...'}
                                     style={{ height: '34px', fontSize: '13px', width: '100%' }}
                                   />
                                   {editRefUserQuery.trim().length >= 3 && (
@@ -9889,18 +9813,18 @@ USING (true);`;
                                   className="form-control" 
                                   value={editRefOther} 
                                   onChange={e => handleEditRefOtherChange(e.target.value)} 
-                                  placeholder={language === 'es' ? 'Ej: Recomendación de un amigo' : 'E.g.: Friend recommendation'}
+                                  placeholder={language === 'es' ? 'Ej: RecomendaciÃÂ³n de un amigo' : 'E.g.: Friend recommendation'}
                                   style={{ height: '34px', fontSize: '13px', flex: 1 }}
                                 />
                                 <label className="form-label" style={{ margin: 0, whiteSpace: 'nowrap', fontSize: '11px', color: 'var(--text-muted)' }}>
-                                  {language === 'es' ? 'Especificar origen / información extra' : 'Specify source / extra info'}
+                                  {language === 'es' ? 'Especificar origen / informaciÃÂ³n extra' : 'Specify source / extra info'}
                                 </label>
                               </div>
                             )}
                           </div>
                           <div style={{ marginTop: '16px', display: 'flex', gap: '8px' }}>
-                            <button className="btn-primary btn-xs" onClick={() => handleSaveRiderEdits(cust)}>💾 {language === 'es' ? 'Guardar' : 'Save'}</button>
-                            <button className="btn-secondary btn-xs" onClick={() => setIsEditingRider(false)}>❌ {language === 'es' ? 'Cancelar' : 'Cancel'}</button>
+                            <button className="btn-primary btn-xs" onClick={() => handleSaveRiderEdits(cust)}>Ã°ÂÂÂ¾ {language === 'es' ? 'Guardar' : 'Save'}</button>
+                            <button className="btn-secondary btn-xs" onClick={() => setIsEditingRider(false)}>Ã¢ÂÂ {language === 'es' ? 'Cancelar' : 'Cancel'}</button>
                           </div>
                         </div>
                       </div>
@@ -9909,7 +9833,7 @@ USING (true);`;
                         <div style={{ marginBottom: '16px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '12px' }}>
                           <div>
                             <h3>{cust.first_name} {cust.last_name}</h3>
-                            <p style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{cust.customer_code} · {formatNationality(cust.nationality)}</p>
+                            <p style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{cust.customer_code} ÃÂ· {formatNationality(cust.nationality)}</p>
                           </div>
                           <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
                             <button 
@@ -9920,33 +9844,33 @@ USING (true);`;
                               className="btn-primary btn-xs"
                               style={{ padding: '4px 8px', minHeight: 'unset', height: '28px', display: 'flex', alignItems: 'center', gap: '4px', border: 'none' }}
                             >
-                              📲 WhatsApp
+                              Ã°ÂÂÂ² WhatsApp
                             </button>
                             <a 
                               href={`mailto:${cust.email}`} 
                               className="btn-secondary btn-xs"
                               style={{ padding: '4px 8px', minHeight: 'unset', height: '28px', display: 'flex', alignItems: 'center', gap: '4px', textDecoration: 'none' }}
                             >
-                              📧 Email
+                              Ã°ÂÂÂ§ Email
                             </a>
                             <button 
                               className="btn-secondary btn-xs" 
                               style={{ padding: '4px 8px', minHeight: 'unset', height: '28px', display: 'flex', alignItems: 'center', gap: '4px' }} 
                               onClick={() => startEditingRider(cust)}
                             >
-                              ✏️ {language === 'es' ? 'Editar' : 'Edit'}
+                              Ã¢ÂÂÃ¯Â¸Â {language === 'es' ? 'Editar' : 'Edit'}
                             </button>
                           </div>
                         </div>
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '13px' }}>
-                          <div>📧 {cust.email}</div>
-                          <div>📱 {cust.phone}</div>
-                          <div>🔗 {cust.referral_source}</div>
+                          <div>Ã°ÂÂÂ§ {cust.email}</div>
+                          <div>Ã°ÂÂÂ± {cust.phone}</div>
+                          <div>Ã°ÂÂÂ {cust.referral_source}</div>
                         </div>
 
                         <div style={{ marginTop: '14px', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '14px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                            <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>🪪 {language === 'es' ? 'Documento ID:' : 'ID Document:'}</span>
+                            <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>Ã°ÂÂªÂª {language === 'es' ? 'Documento ID:' : 'ID Document:'}</span>
                             <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
                               {cust.id_document_url ? (
                                 <>
@@ -9955,17 +9879,17 @@ USING (true);`;
                                     style={{ padding: '2px 8px', height: '24px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px' }}
                                     onClick={() => {
                                       setLightboxUrl(cust.id_document_url);
-                                      setLightboxTitle(language === 'es' ? `Documento ID – ${cust.first_name} ${cust.last_name}` : `ID Document – ${cust.first_name} ${cust.last_name}`);
+                                      setLightboxTitle(language === 'es' ? `Documento ID Ã¢ÂÂ ${cust.first_name} ${cust.last_name}` : `ID Document Ã¢ÂÂ ${cust.first_name} ${cust.last_name}`);
                                     }}
                                   >
-                                    👁️ {language === 'es' ? 'Ver ID' : 'View ID'}
+                                    Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? 'Ver ID' : 'View ID'}
                                   </button>
                                   <label 
                                     className="btn-secondary btn-xs"
                                     style={{ padding: '2px 8px', height: '24px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', margin: 0 }}
                                     title={language === 'es' ? 'Reemplazar ID' : 'Replace ID'}
                                   >
-                                    🔄 {isUploadingDoc === 'id' ? '...' : ''}
+                                    Ã°ÂÂÂ {isUploadingDoc === 'id' ? '...' : ''}
                                     <input 
                                       type="file" 
                                       accept="image/jpeg, image/png, image/webp" 
@@ -9986,7 +9910,7 @@ USING (true);`;
                                     className="btn-primary btn-xs"
                                     style={{ padding: '2px 8px', height: '24px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', margin: 0 }}
                                   >
-                                    📤 {language === 'es' ? 'Subir' : 'Upload'}
+                                    Ã°ÂÂÂ¤ {language === 'es' ? 'Subir' : 'Upload'}
                                     <input 
                                       type="file" 
                                       accept="image/jpeg, image/png, image/webp" 
@@ -10002,7 +9926,7 @@ USING (true);`;
                             </div>
                           </div>
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                            <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>📄 {language === 'es' ? 'Contrato:' : 'Contract:'}</span>
+                            <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>Ã°ÂÂÂ {language === 'es' ? 'Contrato:' : 'Contract:'}</span>
                             <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                               {latestRental?.contract_url ? (
                                 <>
@@ -10013,10 +9937,10 @@ USING (true);`;
                                       style={{ padding: '2px 8px', height: '24px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px' }}
                                       onClick={() => {
                                         setLightboxUrl(url);
-                                        setLightboxTitle(language === 'es' ? `Contrato de Alquiler (Pág. ${idx + 1}/${arr.length}) – ${cust.first_name} ${cust.last_name}` : `Rental Contract (Page ${idx + 1}/${arr.length}) – ${cust.first_name} ${cust.last_name}`);
+                                        setLightboxTitle(language === 'es' ? `Contrato de Alquiler (PÃÂ¡g. ${idx + 1}/${arr.length}) Ã¢ÂÂ ${cust.first_name} ${cust.last_name}` : `Rental Contract (Page ${idx + 1}/${arr.length}) Ã¢ÂÂ ${cust.first_name} ${cust.last_name}`);
                                       }}
                                     >
-                                      👁️ {language === 'es' ? `Pág. ${idx + 1}` : `Page ${idx + 1}`}
+                                      Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? `PÃÂ¡g. ${idx + 1}` : `Page ${idx + 1}`}
                                     </button>
                                   ))}
                                   <label 
@@ -10024,7 +9948,7 @@ USING (true);`;
                                     style={{ padding: '2px 8px', height: '24px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', margin: 0 }}
                                     title={language === 'es' ? 'Agregar fotos del contrato' : 'Add contract photos'}
                                   >
-                                    ➕ {isUploadingDoc === 'contract' ? '...' : (language === 'es' ? 'Añadir' : 'Add')}
+                                    Ã¢ÂÂ {isUploadingDoc === 'contract' ? '...' : (language === 'es' ? 'AÃÂ±adir' : 'Add')}
                                     <input
                                       type="file"
                                       multiple
@@ -10043,12 +9967,12 @@ USING (true);`;
                                     className="btn-secondary btn-xs"
                                     style={{ padding: '2px 8px', height: '24px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px', color: '#f87171', borderColor: 'rgba(248,113,113,0.2)' }}
                                     onClick={async () => {
-                                      if (await asyncConfirm(language === 'es' ? '¿Estás seguro de eliminar todas las imágenes del contrato?' : 'Are you sure you want to delete all contract images?')) {
+                                      if (await asyncConfirm(language === 'es' ? 'ÃÂ¿EstÃÂ¡s seguro de eliminar todas las imÃÂ¡genes del contrato?' : 'Are you sure you want to delete all contract images?')) {
                                         try {
                                           const updatedRental = { ...latestRental, contract_url: null, contract_type: 'digital' as const };
                                           await upsertRental(updatedRental);
                                           triggerReload();
-                                          showToast(language === 'es' ? 'Imágenes del contrato eliminadas.' : 'Contract images deleted.', 'success');
+                                          showToast(language === 'es' ? 'ImÃÂ¡genes del contrato eliminadas.' : 'Contract images deleted.', 'success');
                                         } catch (err) {
                                           console.error(err);
                                           showToast('Error', 'error');
@@ -10056,20 +9980,20 @@ USING (true);`;
                                       }
                                     }}
                                   >
-                                    🗑️
+                                    Ã°ÂÂÂÃ¯Â¸Â
                                   </button>
                                 </>
                               ) : latestRental?.contract_type === 'digital' ? (
                                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                                   <span style={{ color: '#fbbf24', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '4px' }} title={language === 'es' ? 'Esperando firma digital del rider' : 'Waiting for rider\'s digital signature'}>
-                                    ⏳ {language === 'es' ? 'Pendiente Firma' : 'Pending Sign'}
+                                    Ã¢ÂÂ³ {language === 'es' ? 'Pendiente Firma' : 'Pending Sign'}
                                   </span>
                                   <label 
                                     className="btn-primary btn-xs"
                                     style={{ padding: '2px 8px', height: '24px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', margin: 0 }}
-                                    title={language === 'es' ? 'Subir contrato firmado físicamente' : 'Upload physically signed contract'}
+                                    title={language === 'es' ? 'Subir contrato firmado fÃÂ­sicamente' : 'Upload physically signed contract'}
                                   >
-                                    📤 {language === 'es' ? 'Subir' : 'Upload'}
+                                    Ã°ÂÂÂ¤ {language === 'es' ? 'Subir' : 'Upload'}
                                     <input 
                                       type="file" 
                                       multiple
@@ -10092,7 +10016,7 @@ USING (true);`;
                                       className="btn-primary btn-xs"
                                       style={{ padding: '2px 8px', height: '24px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', margin: 0 }}
                                     >
-                                      📤 {language === 'es' ? 'Subir' : 'Upload'}
+                                      Ã°ÂÂÂ¤ {language === 'es' ? 'Subir' : 'Upload'}
                                       <input 
                                         type="file" 
                                         multiple
@@ -10111,7 +10035,7 @@ USING (true);`;
                           </div>
                           
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                            <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>📸 {language === 'es' ? 'Fotos Bici:' : 'Bike Photos:'}</span>
+                            <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>Ã°ÂÂÂ¸ {language === 'es' ? 'Fotos Bici:' : 'Bike Photos:'}</span>
                             <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                               {latestRental?.condition_photos && latestRental.condition_photos.length > 0 ? (
                                 <>
@@ -10144,10 +10068,10 @@ USING (true);`;
                                         }}
                                         onClick={() => {
                                           setLightboxUrl(url);
-                                          setLightboxTitle(language === 'es' ? `Foto de Estado ${idx + 1} – ${cust.first_name} ${cust.last_name}` : `Bike Condition Photo ${idx + 1} – ${cust.first_name} ${cust.last_name}`);
+                                          setLightboxTitle(language === 'es' ? `Foto de Estado ${idx + 1} Ã¢ÂÂ ${cust.first_name} ${cust.last_name}` : `Bike Condition Photo ${idx + 1} Ã¢ÂÂ ${cust.first_name} ${cust.last_name}`);
                                         }}
                                       >
-                                        👁️ {language === 'es' ? `Foto ${idx + 1}` : `Photo ${idx + 1}`}
+                                        Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? `Foto ${idx + 1}` : `Photo ${idx + 1}`}
                                       </button>
                                       <button
                                         style={{
@@ -10169,7 +10093,7 @@ USING (true);`;
                                         onClick={() => handleDeleteBikePhoto(cust, idx)}
                                         title={language === 'es' ? 'Eliminar Foto' : 'Delete Photo'}
                                       >
-                                        ✕
+                                        Ã¢ÂÂ
                                       </button>
                                     </div>
                                   ))}
@@ -10178,7 +10102,7 @@ USING (true);`;
                                     style={{ padding: '2px 8px', height: '24px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', margin: 0 }}
                                     title={language === 'es' ? 'Agregar Foto' : 'Add Photo'}
                                   >
-                                    ➕ {isUploadingDoc === 'bike_photo' ? '...' : ''}
+                                    Ã¢ÂÂ {isUploadingDoc === 'bike_photo' ? '...' : ''}
                                     <input 
                                       type="file" 
                                       accept="image/jpeg, image/png, image/webp" 
@@ -10200,7 +10124,7 @@ USING (true);`;
                                       className="btn-primary btn-xs"
                                       style={{ padding: '2px 8px', height: '24px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', margin: 0 }}
                                     >
-                                      📤 {language === 'es' ? 'Subir' : 'Upload'}
+                                      Ã°ÂÂÂ¤ {language === 'es' ? 'Subir' : 'Upload'}
                                       <input 
                                         type="file" 
                                         accept="image/jpeg, image/png, image/webp" 
@@ -10218,7 +10142,7 @@ USING (true);`;
                           </div>
 
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                            <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>🛡️ {language === 'es' ? 'Seguro:' : 'Insurance:'}</span>
+                            <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>Ã°ÂÂÂ¡Ã¯Â¸Â {language === 'es' ? 'Seguro:' : 'Insurance:'}</span>
                             <span style={{ 
                               fontSize: '12px', 
                               fontWeight: '500', 
@@ -10229,13 +10153,13 @@ USING (true);`;
                               border: latestRental?.has_insurance ? '1px solid rgba(52, 211, 153, 0.2)' : '1px solid rgba(248, 113, 113, 0.2)'
                             }}>
                               {latestRental?.has_insurance 
-                                ? (language === 'es' ? 'Sí' : 'Yes') 
+                                ? (language === 'es' ? 'SÃÂ­' : 'Yes') 
                                 : (language === 'es' ? 'No' : 'No')}
                             </span>
                           </div>
 
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                            <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>📱 {language === 'es' ? 'Cuenta de app:' : 'Gig Account:'}</span>
+                            <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>Ã°ÂÂÂ± {language === 'es' ? 'Cuenta de app:' : 'Gig Account:'}</span>
                             {(() => {
                               const gigAcc = appAccounts.find(a => a.current_renter_id === cust.id);
                               if (!gigAcc) {
@@ -10249,7 +10173,7 @@ USING (true);`;
                                         setSelectedAccountId(null);
                                         setModalType('link-account');
                                       }}
-                                    >🔗 {language === 'es' ? 'Vincular' : 'Link'}</button>
+                                    >Ã°ÂÂÂ {language === 'es' ? 'Vincular' : 'Link'}</button>
                                   </div>
                                 );
                               }
@@ -10292,7 +10216,7 @@ USING (true);`;
                                     onClick={() => setAccountToUnlink(gigAcc)}
                                     title={language === 'es' ? 'Desvincular' : 'Unlink'}
                                   >
-                                    ❌
+                                    Ã¢ÂÂ
                                   </button>
                                 </div>
                               );
@@ -10300,7 +10224,7 @@ USING (true);`;
                           </div>
 
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                            <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>🖼️ {language === 'es' ? 'Fotos de Instagram:' : 'Instagram Photos:'}</span>
+                            <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>Ã°ÂÂÂ¼Ã¯Â¸Â {language === 'es' ? 'Fotos de Instagram:' : 'Instagram Photos:'}</span>
                             <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                               {latestRental?.instagram_photos && latestRental.instagram_photos.length > 0 ? (
                                 <>
@@ -10333,10 +10257,10 @@ USING (true);`;
                                         }}
                                         onClick={() => {
                                           setLightboxUrl(url);
-                                          setLightboxTitle(language === 'es' ? `Foto de Instagram ${idx + 1} – ${cust.first_name} ${cust.last_name}` : `Instagram Photo ${idx + 1} – ${cust.first_name} ${cust.last_name}`);
+                                          setLightboxTitle(language === 'es' ? `Foto de Instagram ${idx + 1} Ã¢ÂÂ ${cust.first_name} ${cust.last_name}` : `Instagram Photo ${idx + 1} Ã¢ÂÂ ${cust.first_name} ${cust.last_name}`);
                                         }}
                                       >
-                                        👁️ {language === 'es' ? `Foto ${idx + 1}` : `Photo ${idx + 1}`}
+                                        Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? `Foto ${idx + 1}` : `Photo ${idx + 1}`}
                                       </button>
                                       <button
                                         style={{
@@ -10358,7 +10282,7 @@ USING (true);`;
                                         onClick={() => handleDeleteInstagramPhoto(cust, idx)}
                                         title={language === 'es' ? 'Eliminar Foto' : 'Delete Photo'}
                                       >
-                                        ✕
+                                        Ã¢ÂÂ
                                       </button>
                                     </div>
                                   ))}
@@ -10367,7 +10291,7 @@ USING (true);`;
                                     style={{ padding: '2px 8px', height: '24px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', margin: 0 }}
                                     title={language === 'es' ? 'Agregar Foto' : 'Add Photo'}
                                   >
-                                    ➕ {isUploadingDoc === 'instagram_photo' ? '...' : ''}
+                                    Ã¢ÂÂ {isUploadingDoc === 'instagram_photo' ? '...' : ''}
                                     <input 
                                       type="file" 
                                       accept="image/jpeg, image/png, image/webp" 
@@ -10389,7 +10313,7 @@ USING (true);`;
                                       className="btn-primary btn-xs"
                                       style={{ padding: '2px 8px', height: '24px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', margin: 0 }}
                                     >
-                                      📤 {language === 'es' ? 'Subir' : 'Upload'}
+                                      Ã°ÂÂÂ¤ {language === 'es' ? 'Subir' : 'Upload'}
                                       <input 
                                         type="file" 
                                         accept="image/jpeg, image/png, image/webp" 
@@ -10407,7 +10331,7 @@ USING (true);`;
                           </div>
 
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                            <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>📸 {language === 'es' ? 'Fotos de Devolución:' : 'Return Photos:'}</span>
+                            <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>Ã°ÂÂÂ¸ {language === 'es' ? 'Fotos de DevoluciÃÂ³n:' : 'Return Photos:'}</span>
                             <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                               {latestRental?.return_photos && latestRental.return_photos.length > 0 ? (
                                 latestRental.return_photos.map((url, idx) => (
@@ -10439,10 +10363,10 @@ USING (true);`;
                                       }}
                                       onClick={() => {
                                         setLightboxUrl(url);
-                                        setLightboxTitle(language === 'es' ? `Foto de Devolución ${idx + 1} – ${cust.first_name} ${cust.last_name}` : `Return Photo ${idx + 1} – ${cust.first_name} ${cust.last_name}`);
+                                        setLightboxTitle(language === 'es' ? `Foto de DevoluciÃÂ³n ${idx + 1} Ã¢ÂÂ ${cust.first_name} ${cust.last_name}` : `Return Photo ${idx + 1} Ã¢ÂÂ ${cust.first_name} ${cust.last_name}`);
                                       }}
                                     >
-                                      👁️ {language === 'es' ? `Foto ${idx + 1}` : `Photo ${idx + 1}`}
+                                      Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? `Foto ${idx + 1}` : `Photo ${idx + 1}`}
                                     </button>
                                   </div>
                                 ))
@@ -10453,6 +10377,115 @@ USING (true);`;
                               )}
                             </div>
                           </div>
+
+                          {/* Delivery checklist (E-bike) */}
+                          {(() => {
+                            const cl = latestRental
+                              ? deliveryChecklists.find(c => c.rental_id === latestRental.id && c.audience === 'customer')
+                              : null;
+                            return (
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '10px' }}>
+                                <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>Ã°ÂÂÂ {language === 'es' ? 'Checklist E-bike:' : 'E-bike Checklist:'}</span>
+                                <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                                  {cl ? (
+                                    <>
+                                      <span style={{
+                                        fontSize: '11px', padding: '2px 8px', borderRadius: '6px',
+                                        background: cl.status === 'completed' ? 'rgba(16,185,129,0.15)' : 'rgba(251,146,60,0.15)',
+                                        color: cl.status === 'completed' ? 'var(--color-primary)' : '#fb923c',
+                                        border: '1px solid rgba(255,255,255,0.08)'
+                                      }}>
+                                        {cl.status === 'completed' ? (language === 'es' ? 'Ã¢ÂÂ Completada' : 'Ã¢ÂÂ Completed') : (language === 'es' ? 'Ã¢ÂÂ³ Pendiente' : 'Ã¢ÂÂ³ Pending')}
+                                      </span>
+                                      {cl.status === 'completed' ? (
+                                        <button
+                                          className="btn-secondary btn-xs"
+                                          style={{ padding: '2px 8px', height: '22px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px' }}
+                                          onClick={() => setViewChecklist(cl)}
+                                        >
+                                          Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? 'Ver' : 'View'}
+                                        </button>
+                                      ) : (
+                                        <button
+                                          className="btn-secondary btn-xs"
+                                          style={{ padding: '2px 8px', height: '22px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px' }}
+                                          onClick={async () => {
+                                            const url = `${window.location.origin}${window.location.pathname}?checklist=${cl.id}`;
+                                            try { await navigator.clipboard.writeText(url); } catch { /* ignore */ }
+                                            showToast(language === 'es' ? 'Ã°ÂÂÂ Enlace de checklist copiado' : 'Ã°ÂÂÂ Checklist link copied', 'success');
+                                          }}
+                                        >
+                                          Ã°ÂÂÂ {language === 'es' ? 'Copiar enlace' : 'Copy link'}
+                                        </button>
+                                      )}
+                                    </>
+                                  ) : (
+                                    <span style={{ color: 'var(--text-muted)', fontSize: '12px', fontStyle: 'italic' }}>
+                                      {language === 'es' ? 'Sin checklist' : 'No checklist'}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })()}
+
+                          {/* Internal technical checklist */}
+                          {(() => {
+                            const icl = latestRental
+                              ? deliveryChecklists.find(c => c.rental_id === latestRental.id && c.audience === 'internal')
+                              : null;
+                            const checkedCount = icl ? INTERNAL_CHECKLIST_ITEM_KEYS.filter(k => icl.items?.[k]).length : 0;
+                            const total = INTERNAL_CHECKLIST_ITEM_KEYS.length;
+                            const openEditor = () => {
+                              if (!latestRental) return;
+                              const bike = products.find(p => p.id === latestRental.bike_id);
+                              setEditInternalChecklist({
+                                rentalId: latestRental.id,
+                                existingId: icl ? icl.id : null,
+                                customerName: `${cust.first_name} ${cust.last_name}`.trim(),
+                                bikeModel: icl?.bike_model || bike?.name || '',
+                                bikeSerial: icl?.bike_serial || bike?.serial_number || '',
+                                deliveryDate: icl?.delivery_date || new Date().toISOString().split('T')[0],
+                              });
+                              setEditInternalValue(icl
+                                ? { battery_level: icl.battery_level || '', items: icl.items || {}, notes: icl.notes || {}, signatureUrl: icl.signature_url, signatureDataUrl: null }
+                                : emptyInternalChecklist());
+                            };
+                            return (
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '10px' }}>
+                                <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>Ã°ÂÂÂ§ {language === 'es' ? 'Checklist tÃÂ©cnica (interno):' : 'Technical checklist (internal):'}</span>
+                                <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                                  {icl ? (
+                                    <>
+                                      <span style={{
+                                        fontSize: '11px', padding: '2px 8px', borderRadius: '6px',
+                                        background: checkedCount === total ? 'rgba(16,185,129,0.15)' : 'rgba(251,146,60,0.15)',
+                                        color: checkedCount === total ? 'var(--color-primary)' : '#fb923c',
+                                        border: '1px solid rgba(255,255,255,0.08)'
+                                      }}>
+                                        {checkedCount}/{total} {checkedCount === total ? 'Ã¢ÂÂ' : ''}
+                                      </span>
+                                      <button
+                                        className="btn-secondary btn-xs"
+                                        style={{ padding: '2px 8px', height: '22px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px' }}
+                                        onClick={openEditor}
+                                      >
+                                        Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? 'Ver/Editar' : 'View/Edit'}
+                                      </button>
+                                    </>
+                                  ) : (
+                                    <button
+                                      className="btn-secondary btn-xs"
+                                      style={{ padding: '2px 8px', height: '22px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px' }}
+                                      onClick={openEditor}
+                                    >
+                                      Ã¢ÂÂ {language === 'es' ? 'Completar' : 'Fill in'}
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })()}
                         </div>
                       </>
                     )}
@@ -10460,30 +10493,30 @@ USING (true);`;
 
                   {/* Financial summary */}
                   <div className="glass-card">
-                    <h3 style={{ marginBottom: '16px' }}>💶 {t.financialSummary}</h3>
+                    <h3 style={{ marginBottom: '16px' }}>Ã°ÂÂÂ¶ {t.financialSummary}</h3>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                       {[
-                        [language === 'es' ? 'Depósito' : 'Deposit', `€${totalDeposit}`],
-                        [language === 'es' ? 'Pagado por Alquiler' : 'Paid for Rental', `€${totalPaidForRental}`],
-                        [language === 'es' ? 'Mantenimiento' : 'Maintenance', `-€${totalMaintenance}`],
-                        [language === 'es' ? 'Total' : 'Total', `€${totalPaid}`],
+                        [language === 'es' ? 'DepÃÂ³sito' : 'Deposit', `Ã¢ÂÂ¬${totalDeposit}`],
+                        [language === 'es' ? 'Pagado por Alquiler' : 'Paid for Rental', `Ã¢ÂÂ¬${totalPaidForRental}`],
+                        [language === 'es' ? 'Mantenimiento' : 'Maintenance', `-Ã¢ÂÂ¬${totalMaintenance}`],
+                        [language === 'es' ? 'Total' : 'Total', `Ã¢ÂÂ¬${totalPaid}`],
                         [
                           latestRental
                             ? (latestRental.rate_type === 'diario'
-                              ? (language === 'es' ? 'Cantidad de días' : 'Days count')
+                              ? (language === 'es' ? 'Cantidad de dÃÂ­as' : 'Days count')
                               : latestRental.rate_type === 'mensual'
                                 ? (language === 'es' ? 'Cantidad de meses' : 'Months count')
                                 : (language === 'es' ? 'Cantidad de semanas' : 'Weeks count'))
                             : (language === 'es' ? 'Cantidad de semanas' : 'Weeks count'),
                           totalWeeks.toString()
                         ],
-                        [language === 'es' ? 'Próximo pago' : 'Next payment', nextPaymentDateStr],
+                        [language === 'es' ? 'PrÃÂ³ximo pago' : 'Next payment', nextPaymentDateStr],
                       ].map(([label, val]) => {
                         let valColor = 'var(--color-primary)';
                         if (label === 'Mantenimiento' || label === 'Maintenance') {
                           valColor = totalMaintenance > 0 ? '#f87171' : '#fb923c';
                         }
-                        if (label === 'Próximo pago' || label === 'Next payment') {
+                        if (label === 'PrÃÂ³ximo pago' || label === 'Next payment') {
                           valColor = 'var(--text-bright)';
                         }
                         return (
@@ -10498,7 +10531,7 @@ USING (true);`;
 
                   {/* Active rentals */}
                   <div className="glass-card">
-                    <h3 style={{ marginBottom: '12px' }}>⚡ {t.activeRentalsList}</h3>
+                    <h3 style={{ marginBottom: '12px' }}>Ã¢ÂÂ¡ {t.activeRentalsList}</h3>
                     {activeRentals.length === 0 && !latestRental ? (
                       <p style={{ fontSize: '13px', color: 'var(--text-muted)' }}>No active rentals.</p>
                     ) : (
@@ -10528,7 +10561,7 @@ USING (true);`;
                           return (
                             <div key={r.id} style={{ background: 'rgba(0,0,0,0.1)', padding: '12px', borderRadius: '8px', marginBottom: '8px' }}>
                               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                                <strong>{bike?.serial_number} — {bike?.name}</strong>
+                                <strong>{bike?.serial_number} Ã¢ÂÂ {bike?.name}</strong>
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                                   <span className={`badge ${r.status === 'Activo' ? 'status-rented' : r.status === 'Inactivo' ? 'status-sold' : 'status-maintenance'}`}>{r.status === 'Inactivo' ? (language === 'es' ? 'Finalizado' : 'Finished') : r.status}</span>
                                   {r.status === 'Activo' && (
@@ -10558,10 +10591,10 @@ USING (true);`;
                                         setEditRentalKitDetails(r.kit_details || '');
                                         setEditRentalModalOpen(true);
                                       }} className="btn-secondary" style={{ padding: '2px 8px', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', borderRadius: '4px', border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'var(--text-color)' }} title={language === 'es' ? 'Editar Alquiler' : 'Edit Rental'}>
-                                        ✏️ {language === 'es' ? 'Editar' : 'Edit'}
+                                        Ã¢ÂÂÃ¯Â¸Â {language === 'es' ? 'Editar' : 'Edit'}
                                       </button>
                                       <button onClick={async () => {
-                                        if (await asyncConfirm(language === 'es' ? '¿Estás seguro de eliminar este alquiler permanentemente?' : 'Are you sure you want to permanently delete this rental?')) {
+                                        if (await asyncConfirm(language === 'es' ? 'ÃÂ¿EstÃÂ¡s seguro de eliminar este alquiler permanentemente?' : 'Are you sure you want to permanently delete this rental?')) {
                                           try {
                                             await deleteRental(r.id);
                                             showToast(language === 'es' ? 'Alquiler eliminado' : 'Rental deleted', 'success');
@@ -10571,7 +10604,7 @@ USING (true);`;
                                           }
                                         }
                                       }} className="btn-secondary" style={{ padding: '2px 8px', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', borderRadius: '4px', border: '1px solid rgba(239,68,68,0.3)', background: 'rgba(239,68,68,0.1)', color: '#f87171' }} title={language === 'es' ? 'Eliminar Alquiler' : 'Delete Rental'}>
-                                        🗑️ {language === 'es' ? 'Eliminar' : 'Delete'}
+                                        Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? 'Eliminar' : 'Delete'}
                                       </button>
                                     </>
                                   )}
@@ -10581,29 +10614,29 @@ USING (true);`;
                                 Desde: {r.start_date}
                               </p>
                               <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
-                                €{r.rental_rate}/{r.rate_type} · Depósito: €{r.deposit_amount}
+                                Ã¢ÂÂ¬{r.rental_rate}/{r.rate_type} ÃÂ· DepÃÂ³sito: Ã¢ÂÂ¬{r.deposit_amount}
                               </p>
                               <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
                                 Kilometraje Inicial: {r.odometer_start} km
                               </p>
                               {kitItems.map((kItem, kIdx) => (
                                 <p key={kItem.id} style={{ fontSize: '11px', color: 'var(--color-accent)', marginTop: '4px' }}>
-                                  🎒 {language === 'es' ? 'Art. Kit' : 'Kit Item'}{kitItems.length > 1 ? ` ${kIdx + 1}` : ''}: {kItem.serial_number} — {kItem.name}
+                                  Ã°ÂÂÂ {language === 'es' ? 'Art. Kit' : 'Kit Item'}{kitItems.length > 1 ? ` ${kIdx + 1}` : ''}: {kItem.serial_number} Ã¢ÂÂ {kItem.name}
                                 </p>
                               ))}
                               {batteries.map((bat, idx) => (
                                 <p key={bat.id} style={{ fontSize: '11px', color: 'var(--color-primary)', marginTop: '4px' }}>
-                                  🔋 {language === 'es' ? 'Batería' : 'Battery'}{batteries.length > 1 ? ` ${idx + 1}` : ''}: {bat.serial_number} — {bat.name}
+                                  Ã°ÂÂÂ {language === 'es' ? 'BaterÃÂ­a' : 'Battery'}{batteries.length > 1 ? ` ${idx + 1}` : ''}: {bat.serial_number} Ã¢ÂÂ {bat.name}
                                 </p>
                               ))}
                               {lock && (
                                 <p style={{ fontSize: '11px', color: 'var(--color-primary)', marginTop: '4px' }}>
-                                  🔒 {language === 'es' ? 'Candado' : 'Lock'}: {lock.serial_number} — {lock.name}
+                                  Ã°ÂÂÂ {language === 'es' ? 'Candado' : 'Lock'}: {lock.serial_number} Ã¢ÂÂ {lock.name}
                                 </p>
                               )}
                               {r.kit_details && (
                                 <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '6px', fontStyle: 'italic' }}>
-                                  💬 {r.kit_details}
+                                  Ã°ÂÂÂ¬ {r.kit_details}
                                 </p>
                               )}
                               {/* Add payment + return buttons */}
@@ -10617,7 +10650,7 @@ USING (true);`;
                                     setPayFormType('rent');
                                     setPayFormReceivedVia('efectivo');
                                     setModalType('rentalPayment');
-                                  }}>💶 {t.logPayment}</button>
+                                  }}>Ã°ÂÂÂ¶ {t.logPayment}</button>
 
                                   <button className="btn-secondary btn-xs" onClick={() => {
                                     setMaintExpenseFormCost('');
@@ -10628,24 +10661,24 @@ USING (true);`;
                                     setMaintPhotoPreviews([]);
                                     setIsUploadingMaintPhotos(false);
                                     setModalType('maintenanceExpense');
-                                  }}>🛠️ {language === 'es' ? 'Mantenimiento' : 'Maintenance'}</button>
+                                  }}>Ã°ÂÂÂ Ã¯Â¸Â {language === 'es' ? 'Mantenimiento' : 'Maintenance'}</button>
 
                                   <button
                                     className="btn-secondary btn-xs"
                                     onClick={() => {
                                       (async () => {
-                                        const isCurrentlyNotice = r.status === 'Devolución en Proceso';
-                                        const nextStatus = isCurrentlyNotice ? 'Activo' : 'Devolución en Proceso';
+                                        const isCurrentlyNotice = r.status === 'DevoluciÃÂ³n en Proceso';
+                                        const nextStatus = isCurrentlyNotice ? 'Activo' : 'DevoluciÃÂ³n en Proceso';
                                         try {
                                           await upsertRental({ ...r, status: nextStatus });
                                           
                                           if (isCurrentlyNotice) {
-                                            const evToDelete = events.find(e => e.description.includes(`Rental ID: ${r.id}`) && e.title.startsWith('[Devolución]'));
+                                            const evToDelete = events.find(e => e.description.includes(`Rental ID: ${r.id}`) && e.title.startsWith('[DevoluciÃÂ³n]'));
                                             if (evToDelete) {
                                               await deleteEvent(evToDelete.id);
                                             }
                                             triggerReload();
-                                            showToast(language === 'es' ? 'Aviso de devolución cancelado.' : 'Return notice cancelled.', 'success');
+                                            showToast(language === 'es' ? 'Aviso de devoluciÃÂ³n cancelado.' : 'Return notice cancelled.', 'success');
                                           } else {
                                             const [ry, rm, rd] = r.start_date.split('-').map(Number);
                                             let futureN = new Date(ry, rm - 1, rd);
@@ -10664,8 +10697,8 @@ USING (true);`;
                                             
                                             await upsertEvent({
                                               id: crypto.randomUUID(),
-                                              title: `[Devolución] ${bike?.serial_number || ''} - ${cust.first_name} ${cust.last_name}`,
-                                              description: `Aviso de devolución registrado. Rental ID: ${r.id}`,
+                                              title: `[DevoluciÃÂ³n] ${bike?.serial_number || ''} - ${cust.first_name} ${cust.last_name}`,
+                                              description: `Aviso de devoluciÃÂ³n registrado. Rental ID: ${r.id}`,
                                               event_date: returnDateStr,
                                               remind_one_week: false,
                                               remind_one_day: true,
@@ -10673,7 +10706,7 @@ USING (true);`;
                                             });
                                             
                                             triggerReload();
-                                            showToast(language === 'es' ? 'Aviso de devolución registrado.' : 'Return notice registered.', 'success');
+                                            showToast(language === 'es' ? 'Aviso de devoluciÃÂ³n registrado.' : 'Return notice registered.', 'success');
                                           }
                                         } catch {
                                           showToast(language === 'es' ? 'Error al actualizar el estado.' : 'Error updating rental status.', 'error');
@@ -10681,14 +10714,14 @@ USING (true);`;
                                       })();
                                     }}
                                   >
-                                    {r.status === 'Devolución en Proceso'
-                                      ? (language === 'es' ? '🔄 Cancelar Aviso' : '🔄 Cancel Notice')
-                                      : (language === 'es' ? '🔔 Aviso Devolución' : '🔔 Return Notice')
+                                    {r.status === 'DevoluciÃÂ³n en Proceso'
+                                      ? (language === 'es' ? 'Ã°ÂÂÂ Cancelar Aviso' : 'Ã°ÂÂÂ Cancel Notice')
+                                      : (language === 'es' ? 'Ã°ÂÂÂ Aviso DevoluciÃÂ³n' : 'Ã°ÂÂÂ Return Notice')
                                     }
                                   </button>
 
                                   <button className="btn-danger btn-xs" onClick={() => openReturnModal(r)}>
-                                    🔄 {t.returnBike}
+                                    Ã°ÂÂÂ {t.returnBike}
                                   </button>
                                 </div>
                               )}
@@ -10702,7 +10735,7 @@ USING (true);`;
                 <div style={{ marginTop: '24px' }}>
                   {/* Past rentals */}
                   <div className="glass-card">
-                    <h3 style={{ marginBottom: '12px' }}>📖 {t.pastRentalsList}</h3>
+                    <h3 style={{ marginBottom: '12px' }}>Ã°ÂÂÂ {t.pastRentalsList}</h3>
                     {custRentals.length === 0
                       ? <p style={{ fontSize: '13px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Sin alquileres registrados.' : 'No rentals recorded.'}</p>
                       : [...custRentals]
@@ -10712,14 +10745,14 @@ USING (true);`;
                             
                             // Chronological events timeline
                             const rentalEvents: { id: string | null, date: string, text: string, type: string, desc?: string, photos?: string[], regIndex: number }[] = [
-                              { id: null, date: r.start_date, text: language === 'es' ? '🚲 Alquilado (Inicio)' : '🚲 Rented (Start)', type: 'start', regIndex: 0 },
-                              { id: null, date: r.start_date, text: (language === 'es' ? `🔒 Depósito: €${r.deposit_amount}` : `🔒 Deposit: €${r.deposit_amount}`) + (r.deposit_received_via ? ` (${r.deposit_received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''), type: 'deposit', regIndex: 1 },
+                              { id: null, date: r.start_date, text: language === 'es' ? 'Ã°ÂÂÂ² Alquilado (Inicio)' : 'Ã°ÂÂÂ² Rented (Start)', type: 'start', regIndex: 0 },
+                              { id: null, date: r.start_date, text: (language === 'es' ? `Ã°ÂÂÂ DepÃÂ³sito: Ã¢ÂÂ¬${r.deposit_amount}` : `Ã°ÂÂÂ Deposit: Ã¢ÂÂ¬${r.deposit_amount}`) + (r.deposit_received_via ? ` (${r.deposit_received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''), type: 'deposit', regIndex: 1 },
                               ...expenses
                                 .filter(e => e.rental_id === r.id)
                                 .map((e, idx) => ({
                                   id: e.id,
                                   date: e.date,
-                                  text: language === 'es' ? `🛠️ Mantenimiento: -€${e.cost}` : `🛠️ Maintenance: -€${e.cost}`,
+                                  text: language === 'es' ? `Ã°ÂÂÂ Ã¯Â¸Â Mantenimiento: -Ã¢ÂÂ¬${e.cost}` : `Ã°ÂÂÂ Ã¯Â¸Â Maintenance: -Ã¢ÂÂ¬${e.cost}`,
                                   type: 'maintenance',
                                   desc: e.description,
                                   photos: e.photos || [],
@@ -10734,8 +10767,8 @@ USING (true);`;
                                     id: p.id,
                                     date: p.payment_date,
                                     text: (isOther
-                                      ? (language === 'es' ? `💵 Otro pago: €${p.amount}` : `💵 Other payment: €${p.amount}`)
-                                      : (language === 'es' ? `💵 Pago renta: €${p.amount}` : `💵 Rent payment: €${p.amount}`)) + (p.received_via ? ` (${p.received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''),
+                                      ? (language === 'es' ? `Ã°ÂÂÂµ Otro pago: Ã¢ÂÂ¬${p.amount}` : `Ã°ÂÂÂµ Other payment: Ã¢ÂÂ¬${p.amount}`)
+                                      : (language === 'es' ? `Ã°ÂÂÂµ Pago renta: Ã¢ÂÂ¬${p.amount}` : `Ã°ÂÂÂµ Rent payment: Ã¢ÂÂ¬${p.amount}`)) + (p.received_via ? ` (${p.received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''),
                                     type: 'payment',
                                     desc: note,
                                     regIndex: 1000 - idx
@@ -10744,14 +10777,14 @@ USING (true);`;
                               ...(r.status === 'Inactivo' ? [{
                                 id: null,
                                 date: r.end_date || '',
-                                text: language === 'es' ? `🏁 Devuelto (Fin)` : `🏁 Returned (End)`,
+                                text: language === 'es' ? `Ã°ÂÂÂ Devuelto (Fin)` : `Ã°ÂÂÂ Returned (End)`,
                                 type: 'end',
                                 regIndex: 9999
                               }] : []),
                               ...(r.deposit_refunded !== null && r.deposit_refunded > 0 ? [{
                                 id: null,
                                 date: r.end_date || r.start_date,
-                                text: language === 'es' ? `🔓 Depósito Devuelto: €${r.deposit_refunded}` : `🔓 Deposit Refunded: €${r.deposit_refunded}`,
+                                text: language === 'es' ? `Ã°ÂÂÂ DepÃÂ³sito Devuelto: Ã¢ÂÂ¬${r.deposit_refunded}` : `Ã°ÂÂÂ Deposit Refunded: Ã¢ÂÂ¬${r.deposit_refunded}`,
                                 type: 'deposit_refund',
                                 regIndex: 9998
                               }] : [])
@@ -10773,16 +10806,16 @@ USING (true);`;
                                         onClick={() => {
                                           const todayStr = new Date().toISOString().split('T')[0];
                                           sendRentalReminderEmail(r, bike, cust, todayStr, language as any, emailTemplates);
-                                          showToast(language === 'es' ? 'Recordatorio de pago de alquiler enviado con éxito (Consola).' : 'Rental payment reminder sent successfully (Console).', 'success');
+                                          showToast(language === 'es' ? 'Recordatorio de pago de alquiler enviado con ÃÂ©xito (Consola).' : 'Rental payment reminder sent successfully (Console).', 'success');
                                         }}
                                         style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '2px 8px', fontSize: '10.5px', height: 'auto', background: 'rgba(167, 139, 250, 0.1)', border: '1px solid rgba(167, 139, 250, 0.2)', color: '#c084fc' }}
                                       >
-                                        📧 {language === 'es' ? 'Enviar Recordatorio' : 'Send Reminder'}
+                                        Ã°ÂÂÂ§ {language === 'es' ? 'Enviar Recordatorio' : 'Send Reminder'}
                                       </button>
                                     )}
                                     <span className={`badge ${statusCls}`} style={{ fontSize: '10px', padding: '2px 6px' }}>{r.status === 'Inactivo' ? (language === 'es' ? 'Finalizado' : 'Finished') : r.status}</span>
                                     <button onClick={async () => {
-                                      if (await asyncConfirm(language === 'es' ? '¿Estás seguro de eliminar este alquiler permanentemente?' : 'Are you sure you want to permanently delete this rental?')) {
+                                      if (await asyncConfirm(language === 'es' ? 'ÃÂ¿EstÃÂ¡s seguro de eliminar este alquiler permanentemente?' : 'Are you sure you want to permanently delete this rental?')) {
                                         try {
                                           await deleteRental(r.id);
                                           showToast(language === 'es' ? 'Alquiler eliminado' : 'Rental deleted', 'success');
@@ -10792,7 +10825,7 @@ USING (true);`;
                                         }
                                       }
                                     }} style={{ background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '12px', opacity: 0.7, padding: '2px' }} title={language === 'es' ? 'Eliminar Alquiler' : 'Delete Rental'}>
-                                      🗑️
+                                      Ã°ÂÂÂÃ¯Â¸Â
                                     </button>
                                   </div>
                                 </div>
@@ -10805,7 +10838,11 @@ USING (true);`;
                                         <span style={{ color: 'var(--text-light)', fontWeight: '500' }}>{ev.text}</span>
                                         {ev.type === 'maintenance' && ev.desc && (
                                           <button 
-                                            onClick={() => window.alert(language === 'es' ? `Detalle del arreglo:\n\n${ev.desc}` : `Repair details:\n\n${ev.desc}`)}
+                                            onClick={() => window.alert(language === 'es' ? `Detalle del arreglo:\
+\
+${ev.desc}` : `Repair details:\
+\
+${ev.desc}`)}
                                             style={{
                                               background: 'none', border: 'none', cursor: 'pointer',
                                               color: 'var(--color-accent)', fontSize: '11px', textDecoration: 'underline', padding: 0, marginLeft: '4px'
@@ -10837,7 +10874,7 @@ USING (true);`;
                                                   setLightboxTitle(language === 'es' ? `Foto Mantenimiento ${pIdx + 1}` : `Maint Photo ${pIdx + 1}`);
                                                 }}
                                               >
-                                                👁️ {language === 'es' ? `Foto ${pIdx + 1}` : `Photo ${pIdx + 1}`}
+                                                Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? `Foto ${pIdx + 1}` : `Photo ${pIdx + 1}`}
                                               </button>
                                             ))}
                                           </div>
@@ -10851,7 +10888,7 @@ USING (true);`;
                                       {ev.type === 'payment' && ev.id && (
                                         <button 
                                           onClick={async () => {
-                                            if (await asyncConfirm(language === 'es' ? '¿Estás seguro de eliminar este pago?' : 'Are you sure you want to delete this payment?')) {
+                                            if (await asyncConfirm(language === 'es' ? 'ÃÂ¿EstÃÂ¡s seguro de eliminar este pago?' : 'Are you sure you want to delete this payment?')) {
                                               try {
                                                 await deletePayment(ev.id!);
                                                 triggerReload();
@@ -10876,15 +10913,15 @@ USING (true);`;
                                           onMouseEnter={e => e.currentTarget.style.opacity = '1'}
                                           onMouseLeave={e => e.currentTarget.style.opacity = '0.7'}
                                         >
-                                          🗑️
+                                          Ã°ÂÂÂÃ¯Â¸Â
                                         </button>
                                       )}
                                     </div>
                                   ))}
                                 </div>
 
-                                {r.damage_report && <p style={{ fontSize: '11px', color: '#f87171', marginTop: '6px' }}>⚠️ {r.damage_report}</p>}
-                                {r.deposit_refunded !== null && <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>Depósito devuelto: €{r.deposit_refunded}</p>}
+                                {r.damage_report && <p style={{ fontSize: '11px', color: '#f87171', marginTop: '6px' }}>Ã¢ÂÂ Ã¯Â¸Â {r.damage_report}</p>}
+                                {r.deposit_refunded !== null && <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>DepÃÂ³sito devuelto: Ã¢ÂÂ¬{r.deposit_refunded}</p>}
                               </div>
                             );
                           })
@@ -10910,7 +10947,7 @@ USING (true);`;
                   setLeadFormReminderDate('');
                   setLeadFormReminderAction('');
                   setModalType('lead');
-                }}>🎯 {language === 'es' ? 'Nuevo Lead CRM' : 'New CRM Lead'}</button>
+                }}>Ã°ÂÂÂ¯ {language === 'es' ? 'Nuevo Lead CRM' : 'New CRM Lead'}</button>
                 <input className="form-control filter-input" placeholder={t.searchPlaceholder} value={searchLead} onChange={e => setSearchLead(e.target.value)} />
               </div>
               <div className="glass-card">
@@ -10919,9 +10956,9 @@ USING (true);`;
                     <thead>
                       <tr>
                         <th>{language === 'es' ? 'Prospecto / Lead' : 'Lead'}</th>
-                        <th>{language === 'es' ? 'Categoría' : 'Category'}</th>
+                        <th>{language === 'es' ? 'CategorÃÂ­a' : 'Category'}</th>
                         <th>{language === 'es' ? 'Contacto' : 'Contact'}</th>
-                        <th>{language === 'es' ? 'Interés' : 'Interest'}</th>
+                        <th>{language === 'es' ? 'InterÃÂ©s' : 'Interest'}</th>
                         <th>{t.status}</th>
                         <th>{language === 'es' ? 'Seguimiento' : 'Follow-up'}</th>
                         <th>{t.actions}</th>
@@ -10969,12 +11006,14 @@ USING (true);`;
                                 
                                 const nextDate = upcomingEvent ? upcomingEvent.event_date : lead.follow_up_date;
                                 const nextAction = upcomingEvent 
-                                  ? (upcomingEvent.description ? upcomingEvent.description.split('\n')[0] : 'Seguimiento')
+                                  ? (upcomingEvent.description ? upcomingEvent.description.split('\
+')[0] : 'Seguimiento')
                                   : lead.follow_up_action;
 
                                 return nextDate ? (
                                   <>
-                                    <span style={{ fontWeight: 'bold', color: '#a7f3d0' }}>📅 {nextDate}</span>
+                                    <span style={{ fontWeight: 'bold', color: '#a7f3d0' }}>Ã°ÂÂÂ
+ {nextDate}</span>
                                     {nextAction && <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '2px' }}>{nextAction}</p>}
                                   </>
                                 ) : (
@@ -10992,7 +11031,7 @@ USING (true);`;
                                   className="btn-primary btn-xs"
                                   style={{ border: 'none' }}
                                 >
-                                  📲 WhatsApp
+                                  Ã°ÂÂÂ² WhatsApp
                                 </button>
                                 
                                 <div style={{ position: 'relative', display: 'inline-block' }}>
@@ -11004,7 +11043,7 @@ USING (true);`;
                                       setActiveLeadMenuId(activeLeadMenuId === lead.id ? null : lead.id);
                                     }}
                                   >
-                                    ➕ {language === 'es' ? 'Más' : 'More'}
+                                    Ã¢ÂÂ {language === 'es' ? 'MÃÂ¡s' : 'More'}
                                   </button>
                                   
                                   {activeLeadMenuId === lead.id && (
@@ -11060,7 +11099,7 @@ USING (true);`;
                                             setModalType('leadStatus');
                                           }}
                                         >
-                                          🔄 {language === 'es' ? 'Estado' : 'Status'}
+                                          Ã°ÂÂÂ {language === 'es' ? 'Estado' : 'Status'}
                                         </button>
                                         
                                         <button 
@@ -11090,7 +11129,8 @@ USING (true);`;
                                             setModalType('leadFollowUp');
                                           }}
                                         >
-                                          📅 {language === 'es' ? 'Seguimiento' : 'Follow-up'}
+                                          Ã°ÂÂÂ
+ {language === 'es' ? 'Seguimiento' : 'Follow-up'}
                                         </button>
                                         
                                         <button 
@@ -11124,7 +11164,7 @@ USING (true);`;
                                             setModalType('lead');
                                           }}
                                         >
-                                          ✏️ {language === 'es' ? 'Editar' : 'Edit'}
+                                          Ã¢ÂÂÃ¯Â¸Â {language === 'es' ? 'Editar' : 'Edit'}
                                         </button>
                                         
                                         <div style={{ height: '1px', background: 'rgba(255,255,255,0.06)', margin: '4px 0' }} />
@@ -11147,7 +11187,7 @@ USING (true);`;
                                           }}
                                           onClick={async () => {
                                             setActiveLeadMenuId(null);
-                                            if (!await asyncConfirm(language === 'es' ? '¿Eliminar lead?' : 'Delete lead?')) return;
+                                            if (!await asyncConfirm(language === 'es' ? 'ÃÂ¿Eliminar lead?' : 'Delete lead?')) return;
                                             try {
                                               await deleteLead(lead.id);
                                               triggerReload();
@@ -11155,7 +11195,7 @@ USING (true);`;
                                             } catch { showToast('Error.', 'error'); }
                                           }}
                                         >
-                                          🗑️ {language === 'es' ? 'Eliminar' : 'Delete'}
+                                          Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? 'Eliminar' : 'Delete'}
                                         </button>
                                       </div>
                                     </>
@@ -11178,19 +11218,19 @@ USING (true);`;
           {currentTab === 'accounts' && (
             <>
               <div className="accounts-filter-row filter-row">
-                <button className="btn-primary" onClick={() => openAccountModal()}>➕ {language === 'es' ? 'Nueva Cuenta de Reparto' : 'New Gig Account'}</button>
+                <button className="btn-primary" onClick={() => openAccountModal()}>Ã¢ÂÂ {language === 'es' ? 'Nueva Cuenta de Reparto' : 'New Gig Account'}</button>
               </div>
               <div className="glass-card">
                 <div className="table-container">
                   <table className="custom-table">
                     <thead>
                       <tr>
-                        <th>{language === 'es' ? 'Código' : 'Code'}</th>
+                        <th>{language === 'es' ? 'CÃÂ³digo' : 'Code'}</th>
                         <th>{language === 'es' ? 'Propietario' : 'Owner'}</th>
-                        <th>{language === 'es' ? 'Plataforma y Vehículo' : 'Platform & Vehicle'}</th>
+                        <th>{language === 'es' ? 'Plataforma y VehÃÂ­culo' : 'Platform & Vehicle'}</th>
                         <th>{language === 'es' ? 'Repartidor / Rider' : 'Renter'}</th>
                         <th>{language === 'es' ? 'Tarifas e Ingresos' : 'Rate & Earnings'}</th>
-                        <th>{language === 'es' ? 'Próximo Pago' : 'Next Payment'}</th>
+                        <th>{language === 'es' ? 'PrÃÂ³ximo Pago' : 'Next Payment'}</th>
                         <th>{t.status}</th>
                         <th>{t.actions}</th>
                       </tr>
@@ -11226,7 +11266,7 @@ USING (true);`;
                                   alignItems: 'center',
                                   gap: '6px'
                                 }}>
-                                  🛵 {cust.first_name} {cust.last_name}
+                                  Ã°ÂÂÂµ {cust.first_name} {cust.last_name}
                                   <button 
                                     onClick={() => setAccountToUnlink(acc)}
                                     title={language === 'es' ? 'Desvincular Rider' : 'Unlink Rider'}
@@ -11245,7 +11285,7 @@ USING (true);`;
                                     onMouseOver={e => e.currentTarget.style.color = '#ff6b6b'}
                                     onMouseOut={e => e.currentTarget.style.color = 'rgba(255, 255, 255, 0.4)'}
                                   >
-                                    ✕
+                                    Ã¢ÂÂ
                                   </button>
                                 </span>
                               ) : (
@@ -11254,13 +11294,13 @@ USING (true);`;
                                   onClick={() => openAccountModal(acc, false, true)} 
                                   style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
                                 >
-                                  🔗 {language === 'es' ? 'Vincular Rider' : 'Link Rider'}
+                                  Ã°ÂÂÂ {language === 'es' ? 'Vincular Rider' : 'Link Rider'}
                                 </button>
                               )}
                             </td>
                             <td>
-                              <div style={{ fontSize: '13px' }}>{language === 'es' ? 'Semanal: ' : 'Weekly: '}<strong>€{acc.weekly_rate}</strong></div>
-                              <div style={{ fontSize: '12px', color: 'var(--color-primary)', marginTop: '2px' }}>Total: <strong>€{totalEarned}</strong></div>
+                              <div style={{ fontSize: '13px' }}>{language === 'es' ? 'Semanal: ' : 'Weekly: '}<strong>Ã¢ÂÂ¬{acc.weekly_rate}</strong></div>
+                              <div style={{ fontSize: '12px', color: 'var(--color-primary)', marginTop: '2px' }}>Total: <strong>Ã¢ÂÂ¬{totalEarned}</strong></div>
                             </td>
                             <td>
                               {acc.current_renter_id && acc.start_date ? (() => {
@@ -11319,20 +11359,20 @@ USING (true);`;
                                   setEarnFormDate(new Date().toISOString().split('T')[0]);
                                   setEarnFormNotes(''); setModalType('earning');
                                 }} title={t.addEarning} style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                                  💶 {t.addEarning}
+                                  Ã°ÂÂÂ¶ {t.addEarning}
                                 </button>
                                 <button className="btn-secondary btn-xs" onClick={() => setActiveAccountId(acc.id)} title={t.notesJournal} style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                                  📔 {language === 'es' ? 'Bitácora' : 'Journal'}
+                                  Ã°ÂÂÂ {language === 'es' ? 'BitÃÂ¡cora' : 'Journal'}
                                 </button>
                                 <button className="btn-secondary btn-xs" onClick={() => openAccountModal(acc)} title={t.edit} style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                                  ✏️ {t.edit}
+                                  Ã¢ÂÂÃ¯Â¸Â {t.edit}
                                 </button>
                                 <button
                                   className="btn-secondary btn-xs"
                                   style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#f87171', borderColor: 'rgba(248,113,113,0.3)' }}
                                   title={language === 'es' ? 'Eliminar cuenta' : 'Delete account'}
                                   onClick={async () => {
-                                    if (!await asyncConfirm(language === 'es' ? `¿Eliminar la cuenta "${acc.platform_account_number}"? Esta acción no se puede deshacer.` : `Delete account "${acc.platform_account_number}"? This cannot be undone.`)) return;
+                                    if (!await asyncConfirm(language === 'es' ? `ÃÂ¿Eliminar la cuenta "${acc.platform_account_number}"? Esta acciÃÂ³n no se puede deshacer.` : `Delete account "${acc.platform_account_number}"? This cannot be undone.`)) return;
                                     try {
                                       await deleteAppAccount(acc.id);
                                       triggerReload();
@@ -11342,7 +11382,7 @@ USING (true);`;
                                     }
                                   }}
                                 >
-                                  🗑️ {language === 'es' ? 'Eliminar' : 'Delete'}
+                                  Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? 'Eliminar' : 'Delete'}
                                 </button>
                               </div>
                             </td>
@@ -11364,13 +11404,13 @@ USING (true);`;
                   <div className="modal-overlay" onClick={() => setActiveAccountId(null)}>
                     <div className="modal-content" style={{ maxWidth: '700px' }} onClick={e => e.stopPropagation()}>
                       <div className="modal-header">
-                        <h3>📔 {language === 'es' ? 'Bitácora y Pagos' : 'Bitacora & Payouts'}: {acc.owner_name}</h3>
-                        <button className="btn-secondary btn-xs" onClick={() => setActiveAccountId(null)}>✕</button>
+                        <h3>Ã°ÂÂÂ {language === 'es' ? 'BitÃÂ¡cora y Pagos' : 'Bitacora & Payouts'}: {acc.owner_name}</h3>
+                        <button className="btn-secondary btn-xs" onClick={() => setActiveAccountId(null)}>Ã¢ÂÂ</button>
                       </div>
                       <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
                         <div>
                           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '10px', alignItems: 'center' }}>
-                            <h4 style={{ color: 'var(--color-primary)' }}>📝 {t.notesJournal}</h4>
+                            <h4 style={{ color: 'var(--color-primary)' }}>Ã°ÂÂÂ {t.notesJournal}</h4>
                             <button className="btn-primary btn-xs" onClick={() => { setNoteFormText(''); setNoteFormDate(new Date().toISOString().split('T')[0]); setModalType('note'); }}>
                               + {t.addJournalEntry}
                             </button>
@@ -11379,24 +11419,25 @@ USING (true);`;
                             : notes.map(n => (
                               <div key={n.id} style={{ background: 'rgba(0,0,0,0.1)', padding: '10px 14px', borderRadius: '8px', marginBottom: '8px', fontSize: '13px' }}>
                                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
-                                  <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>📅 {n.date}</div>
+                                  <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Ã°ÂÂÂ
+ {n.date}</div>
                                   <button
                                     className="btn-danger btn-xs"
                                     style={{ padding: '2px 6px', fontSize: '10px', background: 'transparent', border: 'none', color: '#ff6b6b', cursor: 'pointer' }}
                                     onClick={async () => {
-                                      if (await asyncConfirm(language === 'es' ? '¿Eliminar esta anotación?' : 'Delete this note?')) {
+                                      if (await asyncConfirm(language === 'es' ? 'ÃÂ¿Eliminar esta anotaciÃÂ³n?' : 'Delete this note?')) {
                                         try {
                                           await deleteAccountNote(n.id);
                                           triggerReload();
-                                          showToast(language === 'es' ? 'Anotación eliminada.' : 'Note deleted.', 'success');
+                                          showToast(language === 'es' ? 'AnotaciÃÂ³n eliminada.' : 'Note deleted.', 'success');
                                         } catch {
-                                          showToast(language === 'es' ? 'Error al eliminar anotación.' : 'Error deleting note.', 'error');
+                                          showToast(language === 'es' ? 'Error al eliminar anotaciÃÂ³n.' : 'Error deleting note.', 'error');
                                         }
                                       }
                                     }}
-                                    title={language === 'es' ? 'Eliminar Anotación' : 'Delete Note'}
+                                    title={language === 'es' ? 'Eliminar AnotaciÃÂ³n' : 'Delete Note'}
                                   >
-                                    ✕
+                                    Ã¢ÂÂ
                                   </button>
                                 </div>
                                 <p style={{ color: 'var(--text-bright)', paddingRight: '20px' }}>{n.note}</p>
@@ -11405,8 +11446,8 @@ USING (true);`;
                           }
                         </div>
                         <div>
-                          <h4 style={{ color: 'var(--color-accent)', marginBottom: '10px' }}>💶 {t.earningsLog}</h4>
-                          {earns.length === 0 ? <p style={{ fontSize: '13px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Sin pagos registrados aún' : 'No earnings logged yet'}</p>
+                          <h4 style={{ color: 'var(--color-accent)', marginBottom: '10px' }}>Ã°ÂÂÂ¶ {t.earningsLog}</h4>
+                          {earns.length === 0 ? <p style={{ fontSize: '13px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Sin pagos registrados aÃÂºn' : 'No earnings logged yet'}</p>
                             : (
                               <table className="custom-table">
                                 <thead>
@@ -11421,13 +11462,13 @@ USING (true);`;
                                   {earns.map(ae => (
                                     <tr key={ae.id}>
                                       <td>{ae.date}</td>
-                                      <td><strong>€{ae.amount}</strong></td>
+                                      <td><strong>Ã¢ÂÂ¬{ae.amount}</strong></td>
                                       <td>{ae.notes}</td>
                                       <td>
                                         <button
                                           className="btn-danger btn-xs"
                                           onClick={async () => {
-                                            if (await asyncConfirm(language === 'es' ? '¿Eliminar este registro de pago?' : 'Delete this payment record?')) {
+                                            if (await asyncConfirm(language === 'es' ? 'ÃÂ¿Eliminar este registro de pago?' : 'Delete this payment record?')) {
                                               try {
                                                 await deleteAccountEarning(ae.id);
                                                 triggerReload();
@@ -11439,7 +11480,7 @@ USING (true);`;
                                           }}
                                           title={language === 'es' ? 'Eliminar Pago' : 'Delete Payment'}
                                         >
-                                          🗑️
+                                          Ã°ÂÂÂÃ¯Â¸Â
                                         </button>
                                       </td>
                                     </tr>
@@ -11467,17 +11508,19 @@ USING (true);`;
                   <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
                     {calendarViewMode === 'month' ? (
                       <>
-                        <button className="btn-secondary btn-xs" onClick={prevCalMonth}>← {language === 'es' ? 'Anterior' : 'Previous'}</button>
-                        <h2 style={{ fontSize: '20px', margin: 0 }}>📅 {language === 'es' ? calMonthNamesEs[calMonth] : calMonthNames[calMonth]} {calYear}</h2>
-                        <button className="btn-secondary btn-xs" onClick={nextCalMonth}>{language === 'es' ? 'Siguiente' : 'Next'} →</button>
-                        <button className="btn-secondary btn-xs" onClick={() => { setCalYear(new Date().getFullYear()); setCalMonth(new Date().getMonth()); }}>📌 {language === 'es' ? 'Hoy' : 'Today'}</button>
+                        <button className="btn-secondary btn-xs" onClick={prevCalMonth}>Ã¢ÂÂ {language === 'es' ? 'Anterior' : 'Previous'}</button>
+                        <h2 style={{ fontSize: '20px', margin: 0 }}>Ã°ÂÂÂ
+ {language === 'es' ? calMonthNamesEs[calMonth] : calMonthNames[calMonth]} {calYear}</h2>
+                        <button className="btn-secondary btn-xs" onClick={nextCalMonth}>{language === 'es' ? 'Siguiente' : 'Next'} Ã¢ÂÂ</button>
+                        <button className="btn-secondary btn-xs" onClick={() => { setCalYear(new Date().getFullYear()); setCalMonth(new Date().getMonth()); }}>Ã°ÂÂÂ {language === 'es' ? 'Hoy' : 'Today'}</button>
                       </>
                     ) : (
                       <>
-                        <button className="btn-secondary btn-xs" onClick={prevWeek}>← {language === 'es' ? 'Anterior' : 'Previous'}</button>
-                        <h2 style={{ fontSize: '20px', margin: 0 }}>📅 {language === 'es' ? `Semana del ${weekStartStr} al ${weekEndStr}` : `Week of ${weekStartStr} to ${weekEndStr}`} ({weekYear})</h2>
-                        <button className="btn-secondary btn-xs" onClick={nextWeek}>{language === 'es' ? 'Siguiente' : 'Next'} →</button>
-                        <button className="btn-secondary btn-xs" onClick={() => setSelectedWeekDate(new Date())}>📌 {language === 'es' ? 'Hoy' : 'Today'}</button>
+                        <button className="btn-secondary btn-xs" onClick={prevWeek}>Ã¢ÂÂ {language === 'es' ? 'Anterior' : 'Previous'}</button>
+                        <h2 style={{ fontSize: '20px', margin: 0 }}>Ã°ÂÂÂ
+ {language === 'es' ? `Semana del ${weekStartStr} al ${weekEndStr}` : `Week of ${weekStartStr} to ${weekEndStr}`} ({weekYear})</h2>
+                        <button className="btn-secondary btn-xs" onClick={nextWeek}>{language === 'es' ? 'Siguiente' : 'Next'} Ã¢ÂÂ</button>
+                        <button className="btn-secondary btn-xs" onClick={() => setSelectedWeekDate(new Date())}>Ã°ÂÂÂ {language === 'es' ? 'Hoy' : 'Today'}</button>
                       </>
                     )}
                   </div>
@@ -11518,14 +11561,14 @@ USING (true);`;
                       </button>
                     </div>
 
-                    <button className="btn-primary" onClick={() => openEventModal()}>➕ {t.addEvent}</button>
+                    <button className="btn-primary" onClick={() => openEventModal()}>Ã¢ÂÂ {t.addEvent}</button>
                   </div>
                 </div>
 
                 {/* Calendar grid */}
                 <div className="calendar-scroll-container">
                   <div className="calendar-grid">
-                  {(language === 'es' ? ['Lun','Mar','Mié','Jue','Vie','Sáb','Dom'] : ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']).map(d => (
+                  {(language === 'es' ? ['Lun','Mar','MiÃÂ©','Jue','Vie','SÃÂ¡b','Dom'] : ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']).map(d => (
                     <div key={d} className="calendar-day-header">{d}</div>
                   ))}
                   
@@ -11614,7 +11657,7 @@ USING (true);`;
                                         paddingLeft: '4px',
                                         marginTop: '2px'
                                       }}>
-                                        + {dayEvents.length - (limit - 1)} {language === 'es' ? 'más...' : 'more...'}
+                                        + {dayEvents.length - (limit - 1)} {language === 'es' ? 'mÃÂ¡s...' : 'more...'}
                                       </div>
                                     )}
                                   </>
@@ -11712,7 +11755,7 @@ USING (true);`;
                                         paddingLeft: '4px',
                                         marginTop: '2px'
                                       }}>
-                                        + {dayEvents.length - (limit - 1)} {language === 'es' ? 'más...' : 'more...'}
+                                        + {dayEvents.length - (limit - 1)} {language === 'es' ? 'mÃÂ¡s...' : 'more...'}
                                       </div>
                                     )}
                                   </>
@@ -11729,7 +11772,7 @@ USING (true);`;
 
               {/* Events list */}
               <div style={{ marginTop: '32px' }}>
-                <h3 style={{ marginBottom: '16px' }}>📋 {language === 'es' ? 'Obligaciones de la Empresa' : 'Company Obligations'}</h3>
+                <h3 style={{ marginBottom: '16px' }}>Ã°ÂÂÂ {language === 'es' ? 'Obligaciones de la Empresa' : 'Company Obligations'}</h3>
                 <div className="table-container">
                   <table className="custom-table">
                     <thead>
@@ -11847,8 +11890,8 @@ USING (true);`;
                                       } catch { showToast('Error.', 'error'); }
                                     }}>
                                       {language === 'es' 
-                                        ? (ev.status === 'Realizado' ? '✓ Reabrir' : '✓ Marcar como Realizado') 
-                                        : (ev.status === 'Realizado' ? '✓ Reopen' : '✓ Mark as Completed')}
+                                        ? (ev.status === 'Realizado' ? 'Ã¢ÂÂ Reabrir' : 'Ã¢ÂÂ Marcar como Realizado') 
+                                        : (ev.status === 'Realizado' ? 'Ã¢ÂÂ Reopen' : 'Ã¢ÂÂ Mark as Completed')}
                                     </button>
                                 ) : (
                                   <>
@@ -11893,14 +11936,14 @@ USING (true);`;
                                       } catch { showToast('Error.', 'error'); }
                                     }}>
                                       {language === 'es' 
-                                        ? (ev.status === 'Realizado' ? '✓ Reabrir' : '✓ Marcar como Realizado') 
-                                        : (ev.status === 'Realizado' ? '✓ Reopen' : '✓ Mark as Completed')}
+                                        ? (ev.status === 'Realizado' ? 'Ã¢ÂÂ Reabrir' : 'Ã¢ÂÂ Marcar como Realizado') 
+                                        : (ev.status === 'Realizado' ? 'Ã¢ÂÂ Reopen' : 'Ã¢ÂÂ Mark as Completed')}
                                     </button>
                                     <button className="btn-danger btn-xs" onClick={async () => {
-                                      if (!await asyncConfirm('¿Eliminar evento?')) return;
+                                      if (!await asyncConfirm('ÃÂ¿Eliminar evento?')) return;
                                       try { await deleteEvent(ev.id); triggerReload(); showToast('Evento eliminado.', 'success'); }
                                       catch { showToast('Error.', 'error'); }
-                                    }}>✕</button>
+                                    }}>Ã¢ÂÂ</button>
                                   </>
                                 )}
                               </div>
@@ -11921,20 +11964,20 @@ USING (true);`;
           {currentTab === 'maintenance' && (
             <>
               <div className="filter-row">
-                <button className="btn-primary" onClick={() => openServiceModal()}>🔧 {t.addServiceRecord}</button>
+                <button className="btn-primary" onClick={() => openServiceModal()}>Ã°ÂÂÂ§ {t.addServiceRecord}</button>
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '24px' }}>
                 {[
-                  { status: 'Requiere Service', label: language === 'es' ? '🔴 Requiere Service' : '🔴 Service Due', color: '#f87171', border: '#ef4444' },
-                  { status: 'En Taller',        label: language === 'es' ? '🟡 En Taller' : '🟡 In Shop',       color: '#fb923c', border: '#f97316' },
-                  { status: 'Recién Revisada',  label: language === 'es' ? '🌸 Recién Revisada' : '🌸 Recently Serviced', color: '#f472b6', border: '#ec4899' },
+                  { status: 'Requiere Service', label: language === 'es' ? 'Ã°ÂÂÂ´ Requiere Service' : 'Ã°ÂÂÂ´ Service Due', color: '#f87171', border: '#ef4444' },
+                  { status: 'En Taller',        label: language === 'es' ? 'Ã°ÂÂÂ¡ En Taller' : 'Ã°ÂÂÂ¡ In Shop',       color: '#fb923c', border: '#f97316' },
+                  { status: 'ReciÃÂ©n Revisada',  label: language === 'es' ? 'Ã°ÂÂÂ¸ ReciÃÂ©n Revisada' : 'Ã°ÂÂÂ¸ Recently Serviced', color: '#f472b6', border: '#ec4899' },
                 ].map(({ status, label, color, border }) => {
                    const filteredBikes = products.filter(p => {
                      if ((p.category_id !== catBikeId && p.category_id !== catBattId) || p.status === 'Vendida') return false;
                      if (status === 'Requiere Service') return p.maintenance_status === 'Requiere Service';
                      if (status === 'En Taller') return p.maintenance_status === 'En Taller';
-                     if (status === 'Recién Revisada') {
-                       return p.maintenance_status === 'Al día' && isWithinLast30Days(p.last_service_date);
+                     if (status === 'ReciÃÂ©n Revisada') {
+                       return p.maintenance_status === 'Al dÃÂ­a' && isWithinLast30Days(p.last_service_date);
                      }
                      return false;
                    });
@@ -11942,13 +11985,13 @@ USING (true);`;
                    return (
                      <div key={status} className="glass-card" style={{ borderTop: `4px solid ${border}` }}>
                        <h3 style={{ marginBottom: '16px', color }}>{label}</h3>
-                       <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', maxHeight: '450px', overflowY: 'auto', paddingRight: '6px' }}>
+                       <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                          {filteredBikes.length === 0
-                           ? <p style={{ fontSize: '13px', color: 'var(--text-muted)' }}>{language === 'es' ? 'No hay vehículos o baterías en esta categoría' : 'No vehicles or batteries in this category'}</p>
-                           : filteredBikes.map(bike => (
+                           ? <p style={{ fontSize: '13px', color: 'var(--text-muted)' }}>{language === 'es' ? 'No hay vehÃÂ­culos o baterÃÂ­as en esta categorÃÂ­a' : 'No vehicles or batteries in this category'}</p>
+                           : filteredBikes.slice(0, 5).map(bike => (
                              <div key={bike.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(0,0,0,0.1)', padding: '10px 14px', borderRadius: '8px' }}>
                                <div>
-                                 <strong>{bike.serial_number}</strong> — {bike.name}
+                                 <strong>{bike.serial_number}</strong> Ã¢ÂÂ {bike.name}
                                  {bike.category_id === catBikeId && <p style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Km: {bike.odometer} km</p>}
                                </div>
                               {status === 'En Taller' && (
@@ -11973,17 +12016,17 @@ USING (true);`;
 
                                        await upsertProduct({ 
                                          ...bike, 
-                                         maintenance_status: 'Al día', 
+                                         maintenance_status: 'Al dÃÂ­a', 
                                          status: 'Disponible',
                                          last_service_date: todayStr
                                        });
                                        triggerReload(); showToast(`${bike.serial_number} marcada como lista.`, 'success');
                                      } catch { showToast('Error.', 'error'); }
-                                   }}>✓ {language === 'es' ? 'Finalizar Service' : 'Finish Service'}</button>
+                                   }}>Ã¢ÂÂ {language === 'es' ? 'Finalizar Service' : 'Finish Service'}</button>
                                    <button className="btn-secondary btn-xs" onClick={async () => {
                                      try {
                                        const confirmMsg = language === 'es' 
-                                         ? '¿Cancelar el ingreso al taller de esta bicicleta?' 
+                                         ? 'ÃÂ¿Cancelar el ingreso al taller de esta bicicleta?' 
                                          : 'Cancel workshop entry for this bicycle?';
                                        if (!await asyncConfirm(confirmMsg)) return;
                                        
@@ -12007,14 +12050,14 @@ USING (true);`;
                                        triggerReload();
                                        showToast(language === 'es' ? 'Ingreso al taller cancelado.' : 'Workshop entry canceled.', 'success');
                                      } catch { showToast('Error.', 'error'); }
-                                   }} title={language === 'es' ? 'Cancelar ingreso y volver a Requiere Service' : 'Cancel entry and return to Service Due'}>✕</button>
+                                   }} title={language === 'es' ? 'Cancelar ingreso y volver a Requiere Service' : 'Cancel entry and return to Service Due'}>Ã¢ÂÂ</button>
                                  </div>
                                )}
-                               {status === 'Recién Revisada' && (
+                               {status === 'ReciÃÂ©n Revisada' && (
                                  <button className="btn-secondary btn-xs" onClick={async () => {
                                    try {
                                      const confirmMsg = language === 'es'
-                                       ? '¿Deshacer la finalización del service y devolver la bicicleta al taller?'
+                                       ? 'ÃÂ¿Deshacer la finalizaciÃÂ³n del service y devolver la bicicleta al taller?'
                                        : 'Undo service completion and return the bicycle to the workshop?';
                                      if (!await asyncConfirm(confirmMsg)) return;
 
@@ -12024,9 +12067,9 @@ USING (true);`;
                                        status: 'Mantenimiento'
                                      });
                                      triggerReload();
-                                     showToast(language === 'es' ? 'Finalización cancelada. Devuelta al taller.' : 'Completion canceled. Returned to workshop.', 'success');
+                                     showToast(language === 'es' ? 'FinalizaciÃÂ³n cancelada. Devuelta al taller.' : 'Completion canceled. Returned to workshop.', 'success');
                                    } catch { showToast('Error.', 'error'); }
-                                 }}>↩️ {language === 'es' ? 'Deshacer' : 'Undo'}</button>
+                                 }}>Ã¢ÂÂ©Ã¯Â¸Â {language === 'es' ? 'Deshacer' : 'Undo'}</button>
                                )}
                             {status === 'Requiere Service' && (
                                <div style={{ position: 'relative' }}>
@@ -12034,7 +12077,7 @@ USING (true);`;
                                    e.stopPropagation();
                                    setOpenActionMenuBikeId(openActionMenuBikeId === bike.id ? null : bike.id);
                                  }}>
-                                   {language === 'es' ? 'Acciones ▾' : 'Actions ▾'}
+                                   {language === 'es' ? 'Acciones Ã¢ÂÂ¾' : 'Actions Ã¢ÂÂ¾'}
                                  </button>
                                  {openActionMenuBikeId === bike.id && (
                                    <div style={{
@@ -12072,12 +12115,12 @@ USING (true);`;
                                        e.stopPropagation();
                                        setOpenActionMenuBikeId(null);
                                        if (bike.status === 'Rentada') {
-                                         showToast(language === 'es' ? 'No es posible realizar un service a un vehículo mientras esté rentado.' : 'Cannot schedule a service for a vehicle while it is rented.', 'error');
+                                         showToast(language === 'es' ? 'No es posible realizar un service a un vehÃÂ­culo mientras estÃÂ© rentado.' : 'Cannot schedule a service for a vehicle while it is rented.', 'error');
                                          return;
                                        }
                                        openServiceModal(bike.id);
                                      }}>
-                                       🔧 {language === 'es' ? 'Editar Service' : 'Edit Service'}
+                                       Ã°ÂÂÂ§ {language === 'es' ? 'Editar Service' : 'Edit Service'}
                                      </button>
 
                                      <button style={{
@@ -12099,7 +12142,7 @@ USING (true);`;
                                        e.stopPropagation();
                                        setOpenActionMenuBikeId(null);
                                        if (bike.status === 'Rentada') {
-                                         showToast(language === 'es' ? 'No es posible ingresar al taller un vehículo mientras esté rentado.' : 'Cannot put a vehicle in the workshop while it is rented.', 'error');
+                                         showToast(language === 'es' ? 'No es posible ingresar al taller un vehÃÂ­culo mientras estÃÂ© rentado.' : 'Cannot put a vehicle in the workshop while it is rented.', 'error');
                                          return;
                                        }
                                        try {
@@ -12129,7 +12172,7 @@ USING (true);`;
                                              bike_id: bike.id,
                                              service_date: todayStr,
                                              location: 'Dublin Central Garage',
-                                             description: language === 'es' ? 'Ingreso directo a taller / Revisión general' : 'Direct check-in to workshop / General review',
+                                             description: language === 'es' ? 'Ingreso directo a taller / RevisiÃÂ³n general' : 'Direct check-in to workshop / General review',
                                              cost: 0,
                                              performed_by: 'Mechanic Sean'
                                            });
@@ -12148,7 +12191,7 @@ USING (true);`;
                                          showToast('Error.', 'error');
                                        }
                                      }}>
-                                       🧰 {language === 'es' ? 'Ingresar al Taller' : 'Enter Shop'}
+                                       Ã°ÂÂ§Â° {language === 'es' ? 'Ingresar al Taller' : 'Enter Shop'}
                                      </button>
 
                                      <button style={{
@@ -12172,7 +12215,7 @@ USING (true);`;
                                        setOpenActionMenuBikeId(null);
                                        try {
                                          const confirmMsg = language === 'es'
-                                           ? '¿Cancelar la solicitud de service para este vehículo?'
+                                           ? 'ÃÂ¿Cancelar la solicitud de service para este vehÃÂ­culo?'
                                            : 'Cancel the service request for this vehicle?';
                                          if (!await asyncConfirm(confirmMsg)) return;
 
@@ -12189,7 +12232,7 @@ USING (true);`;
 
                                          await upsertProduct({
                                            ...bike,
-                                           maintenance_status: 'Al día',
+                                           maintenance_status: 'Al dÃÂ­a',
                                            next_service_date: null,
                                            status: 'Disponible'
                                          });
@@ -12197,7 +12240,7 @@ USING (true);`;
                                          showToast(language === 'es' ? 'Requerimiento de service cancelado.' : 'Service request canceled.', 'success');
                                        } catch { showToast('Error.', 'error'); }
                                      }}>
-                                       ✕ {language === 'es' ? 'Cancelar Solicitud' : 'Cancel Request'}
+                                       Ã¢ÂÂ {language === 'es' ? 'Cancelar Solicitud' : 'Cancel Request'}
                                      </button>
                                    </div>
                                  )}
@@ -12215,9 +12258,9 @@ USING (true);`;
               {/* Maintenance log grouped by month */}
               <div className="glass-card" style={{ marginTop: '32px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px', flexWrap: 'wrap', gap: '12px' }}>
-                  <h3 style={{ margin: 0 }}>📖 {language === 'es' ? 'Historial de Entradas a Taller' : 'Garage Service Timeline'}</h3>
+                  <h3 style={{ margin: 0 }}>Ã°ÂÂÂ {language === 'es' ? 'Historial de Entradas a Taller' : 'Garage Service Timeline'}</h3>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                    <button className="btn-secondary btn-xs" onClick={prevMaintLogMonth}>← {language === 'es' ? 'Anterior' : 'Previous'}</button>
+                    <button className="btn-secondary btn-xs" onClick={prevMaintLogMonth}>Ã¢ÂÂ {language === 'es' ? 'Anterior' : 'Previous'}</button>
                     <strong style={{ fontSize: '14px', color: 'var(--color-primary)' }}>
                       {(() => {
                         const monthNamesEs = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
@@ -12225,8 +12268,8 @@ USING (true);`;
                         return language === 'es' ? `${monthNamesEs[maintLogMonth]} ${maintLogYear}` : `${monthNamesEn[maintLogMonth]} ${maintLogYear}`;
                       })()}
                     </strong>
-                    <button className="btn-secondary btn-xs" onClick={nextMaintLogMonth}>{language === 'es' ? 'Siguiente' : 'Next'} →</button>
-                    <button className="btn-secondary btn-xs" onClick={() => { setMaintLogYear(new Date().getFullYear()); setMaintLogMonth(new Date().getMonth()); }}>📌 Hoy</button>
+                    <button className="btn-secondary btn-xs" onClick={nextMaintLogMonth}>{language === 'es' ? 'Siguiente' : 'Next'} Ã¢ÂÂ</button>
+                    <button className="btn-secondary btn-xs" onClick={() => { setMaintLogYear(new Date().getFullYear()); setMaintLogMonth(new Date().getMonth()); }}>Ã°ÂÂÂ Hoy</button>
                   </div>
                 </div>
                 
@@ -12249,7 +12292,8 @@ USING (true);`;
                         paddingBottom: '8px',
                         marginTop: '16px'
                       }}>
-                        📅 {group.label}
+                        Ã°ÂÂÂ
+ {group.label}
                       </h4>
                       <div className="table-container">
                         <table className="custom-table">
@@ -12257,9 +12301,9 @@ USING (true);`;
                             <tr>
                               <th>{language === 'es' ? 'Fecha' : 'Date'}</th>
                               <th>E-Bike</th>
-                              <th>{language === 'es' ? 'Ubicación' : 'Location'}</th>
+                              <th>{language === 'es' ? 'UbicaciÃÂ³n' : 'Location'}</th>
                               <th>{language === 'es' ? 'Realizado por' : 'Performed By'}</th>
-                              <th>{language === 'es' ? 'Descripción' : 'Description'}</th>
+                              <th>{language === 'es' ? 'DescripciÃÂ³n' : 'Description'}</th>
                               <th>{language === 'es' ? 'Costo' : 'Cost'}</th>
                               <th>{t.actions}</th>
                             </tr>
@@ -12272,13 +12316,13 @@ USING (true);`;
                                 <td>{rec.location}</td>
                                 <td>{rec.performed_by}</td>
                                 <td>{rec.description}</td>
-                                <td><strong style={{ color: '#ef4444' }}>€{rec.cost}</strong></td>
+                                <td><strong style={{ color: '#ef4444' }}>Ã¢ÂÂ¬{rec.cost}</strong></td>
                                 <td>
                                   <button
                                     className="btn-danger btn-xs"
                                     onClick={async () => {
                                       const confirmMsg = language === 'es'
-                                        ? '¿Eliminar este registro de taller? Esto también eliminará los recordatorios del calendario asociados.'
+                                        ? 'ÃÂ¿Eliminar este registro de taller? Esto tambiÃÂ©n eliminarÃÂ¡ los recordatorios del calendario asociados.'
                                         : 'Delete this service record? This will also remove any associated calendar reminders.';
                                       if (!await asyncConfirm(confirmMsg)) return;
 
@@ -12297,7 +12341,7 @@ USING (true);`;
                                         if (bike && (bike.status === 'Mantenimiento' || bike.maintenance_status === 'En Taller' || bike.maintenance_status === 'Requiere Service')) {
                                           await upsertProduct({
                                             ...bike,
-                                            maintenance_status: 'Al día',
+                                            maintenance_status: 'Al dÃÂ­a',
                                             status: bike.status === 'Mantenimiento' ? 'Disponible' : bike.status,
                                             next_service_date: null,
                                           });
@@ -12318,7 +12362,7 @@ USING (true);`;
                                       }
                                     }}
                                   >
-                                    ✕
+                                    Ã¢ÂÂ
                                   </button>
                                 </td>
                               </tr>
@@ -12340,21 +12384,21 @@ USING (true);`;
             <div className="glass-card">
               {/* Tab Header with internal navigation */}
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', flexWrap: 'wrap', gap: '16px' }}>
-                <h2 style={{ margin: 0 }}>🏬 {t.suppliers}</h2>
+                <h2 style={{ margin: 0 }}>Ã°ÂÂÂ¬ {t.suppliers}</h2>
                 {suppliersSubTab === 'suppliers' && (
-                  <button className="btn-primary" onClick={() => openSupplierModal()}>➕ {language === 'es' ? 'Registrar Proveedor' : 'Add Supplier'}</button>
+                  <button className="btn-primary" onClick={() => openSupplierModal()}>Ã¢ÂÂ {language === 'es' ? 'Registrar Proveedor' : 'Add Supplier'}</button>
                 )}
                 {suppliersSubTab === 'catalog' && (
-                  <button className="btn-primary" onClick={() => openSupplierProductModal()}>➕ {language === 'es' ? 'Registrar Producto' : 'Add Product'}</button>
+                  <button className="btn-primary" onClick={() => openSupplierProductModal()}>Ã¢ÂÂ {language === 'es' ? 'Registrar Producto' : 'Add Product'}</button>
                 )}
               </div>
 
               {/* Sub-tabs bar */}
               <div style={{ display: 'flex', gap: '8px', marginBottom: '24px', flexWrap: 'wrap', borderBottom: '1px solid rgba(255,255,255,0.06)', paddingBottom: '12px' }}>
                 {[
-                  { key: 'compare',   label: language === 'es' ? '📊 Comparador' : '📊 Comparator' },
-                  { key: 'suppliers', label: language === 'es' ? '🏬 Proveedores' : '🏬 Suppliers' },
-                  { key: 'catalog',   label: language === 'es' ? '📦 Catálogo' : '📦 Catalog' },
+                  { key: 'compare',   label: language === 'es' ? 'Ã°ÂÂÂ Comparador' : 'Ã°ÂÂÂ Comparator' },
+                  { key: 'suppliers', label: language === 'es' ? 'Ã°ÂÂÂ¬ Proveedores' : 'Ã°ÂÂÂ¬ Suppliers' },
+                  { key: 'catalog',   label: language === 'es' ? 'Ã°ÂÂÂ¦ CatÃÂ¡logo' : 'Ã°ÂÂÂ¦ Catalog' },
                 ].map(t => (
                   <button key={t.key} 
                     onClick={() => setSuppliersSubTab(t.key as any)}
@@ -12381,12 +12425,12 @@ USING (true);`;
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '16px', marginBottom: '24px', flexWrap: 'wrap' }}>
                     <p style={{ fontSize: '13px', color: 'var(--text-muted)', margin: 0 }}>
                       {language === 'es'
-                        ? 'Comparación side-by-side inteligente. Verde = más barato, Lima = más rápido.'
+                        ? 'ComparaciÃÂ³n side-by-side inteligente. Verde = mÃÂ¡s barato, Lima = mÃÂ¡s rÃÂ¡pido.'
                         : 'Smart side-by-side match engine. Green = cheapest, Lime = fastest.'}
                     </p>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
                       <span style={{ fontSize: '13px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
-                        {language === 'es' ? 'Categoría:' : 'Category:'}
+                        {language === 'es' ? 'CategorÃÂ­a:' : 'Category:'}
                       </span>
                       <select
                         className="form-control"
@@ -12408,10 +12452,10 @@ USING (true);`;
                         }}
                       >
                         <option value="all">{language === 'es' ? 'Todas' : 'All'}</option>
-                        <option value="Bicicleta">{language === 'es' ? '🚲 Bicicleta' : '🚲 Bicycle'}</option>
-                        <option value="Batería">{language === 'es' ? '🔋 Batería' : '🔋 Battery'}</option>
-                        <option value="Repuesto">{language === 'es' ? '⚙️ Repuesto' : '⚙️ Spare Part'}</option>
-                        <option value="Accesorio">{language === 'es' ? '🎒 Accesorio' : '🎒 Accessory'}</option>
+                        <option value="Bicicleta">{language === 'es' ? 'Ã°ÂÂÂ² Bicicleta' : 'Ã°ÂÂÂ² Bicycle'}</option>
+                        <option value="BaterÃÂ­a">{language === 'es' ? 'Ã°ÂÂÂ BaterÃÂ­a' : 'Ã°ÂÂÂ Battery'}</option>
+                        <option value="Repuesto">{language === 'es' ? 'Ã¢ÂÂÃ¯Â¸Â Repuesto' : 'Ã¢ÂÂÃ¯Â¸Â Spare Part'}</option>
+                        <option value="Accesorio">{language === 'es' ? 'Ã°ÂÂÂ Accesorio' : 'Ã°ÂÂÂ Accessory'}</option>
                       </select>
                     </div>
                   </div>
@@ -12436,19 +12480,19 @@ USING (true);`;
                               </td>
                               <td>{sup?.name}</td>
                               <td>
-                                <strong style={{ fontSize: '15px' }}>€{sprod.cost}</strong>
-                                {isCheapest && <span className="badge status-available btn-xs" style={{ marginLeft: '8px', fontSize: '10px' }}>🏆 {t.cheapest}</span>}
+                                <strong style={{ fontSize: '15px' }}>Ã¢ÂÂ¬{sprod.cost}</strong>
+                                {isCheapest && <span className="badge status-available btn-xs" style={{ marginLeft: '8px', fontSize: '10px' }}>Ã°ÂÂÂ {t.cheapest}</span>}
                               </td>
                               <td>
                                 <strong>{sprod.delivery_time_days} days</strong>
-                                {isFastest && <span className="badge" style={{ background: 'rgba(132,204,22,0.15)', color: '#a3e635', marginLeft: '8px', fontSize: '10px' }}>⚡ {t.fastest}</span>}
+                                {isFastest && <span className="badge" style={{ background: 'rgba(132,204,22,0.15)', color: '#a3e635', marginLeft: '8px', fontSize: '10px' }}>Ã¢ÂÂ¡ {t.fastest}</span>}
                               </td>
                               <td style={{ fontSize: '12px' }}>
                                 {sprod.specs}<br />
                                 <span style={{ color: 'var(--text-muted)' }}>MOQ: {sprod.moq}</span>
                               </td>
                               <td>
-                                <a href={sprod.product_url} target="_blank" rel="noopener noreferrer" className="btn-secondary btn-xs" style={{ textDecoration: 'none' }}>🔗 URL</a>
+                                <a href={sprod.product_url} target="_blank" rel="noopener noreferrer" className="btn-secondary btn-xs" style={{ textDecoration: 'none' }}>Ã°ÂÂÂ URL</a>
                               </td>
                             </tr>
                           );
@@ -12472,7 +12516,7 @@ USING (true);`;
                         <tr>
                           <th>{language === 'es' ? 'Nombre' : 'Name'}</th>
                           <th>{language === 'es' ? 'Contacto' : 'Contact'}</th>
-                          <th>{language === 'es' ? 'Teléfono' : 'Phone'}</th>
+                          <th>{language === 'es' ? 'TelÃÂ©fono' : 'Phone'}</th>
                           <th>Email</th>
                           <th>Website</th>
                           <th>{language === 'es' ? 'Acciones' : 'Actions'}</th>
@@ -12490,20 +12534,20 @@ USING (true);`;
                             <td>{sup.email}</td>
                             <td>
                               {sup.website ? (
-                                <a href={sup.website.startsWith('http') ? sup.website : `https://${sup.website}`} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-primary)', textDecoration: 'none' }}>🌐 Link</a>
+                                <a href={sup.website.startsWith('http') ? sup.website : `https://${sup.website}`} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-primary)', textDecoration: 'none' }}>Ã°ÂÂÂ Link</a>
                               ) : '-'}
                             </td>
                             <td>
                               <div style={{ display: 'flex', gap: '8px' }}>
-                                <button className="btn-secondary btn-xs" onClick={() => openSupplierModal(sup)}>✏️</button>
+                                <button className="btn-secondary btn-xs" onClick={() => openSupplierModal(sup)}>Ã¢ÂÂÃ¯Â¸Â</button>
                                 <button className="btn-danger btn-xs" onClick={async () => {
-                                  if (!await asyncConfirm(language === 'es' ? '¿Eliminar proveedor?' : 'Delete supplier?')) return;
+                                  if (!await asyncConfirm(language === 'es' ? 'ÃÂ¿Eliminar proveedor?' : 'Delete supplier?')) return;
                                   try {
                                     await deleteSupplier(sup.id);
                                     triggerReload();
                                     showToast(language === 'es' ? 'Proveedor eliminado.' : 'Supplier deleted.', 'success');
                                   } catch { showToast('Error.', 'error'); }
-                                }}>✕</button>
+                                }}>Ã¢ÂÂ</button>
                               </div>
                             </td>
                           </tr>
@@ -12520,7 +12564,7 @@ USING (true);`;
                   {supplierProducts.length > 0 && (
                     <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '12px', marginBottom: '20px' }}>
                       <span style={{ fontSize: '13px', color: 'var(--text-muted)' }}>
-                        {language === 'es' ? 'Categoría:' : 'Category:'}
+                        {language === 'es' ? 'CategorÃÂ­a:' : 'Category:'}
                       </span>
                       <select
                         className="form-control"
@@ -12542,21 +12586,21 @@ USING (true);`;
                         }}
                       >
                         <option value="all">{language === 'es' ? 'Todas' : 'All'}</option>
-                        <option value="Bicicleta">{language === 'es' ? '🚲 Bicicleta' : '🚲 Bicycle'}</option>
-                        <option value="Batería">{language === 'es' ? '🔋 Batería' : '🔋 Battery'}</option>
-                        <option value="Repuesto">{language === 'es' ? '⚙️ Repuesto' : '⚙️ Spare Part'}</option>
-                        <option value="Accesorio">{language === 'es' ? '🎒 Accesorio' : '🎒 Accessory'}</option>
+                        <option value="Bicicleta">{language === 'es' ? 'Ã°ÂÂÂ² Bicicleta' : 'Ã°ÂÂÂ² Bicycle'}</option>
+                        <option value="BaterÃÂ­a">{language === 'es' ? 'Ã°ÂÂÂ BaterÃÂ­a' : 'Ã°ÂÂÂ Battery'}</option>
+                        <option value="Repuesto">{language === 'es' ? 'Ã¢ÂÂÃ¯Â¸Â Repuesto' : 'Ã¢ÂÂÃ¯Â¸Â Spare Part'}</option>
+                        <option value="Accesorio">{language === 'es' ? 'Ã°ÂÂÂ Accesorio' : 'Ã°ÂÂÂ Accessory'}</option>
                       </select>
                     </div>
                   )}
                   <div className="table-container">
                     {supplierProducts.length === 0 ? (
                       <p style={{ textAlign: 'center', padding: '24px', color: 'var(--text-muted)' }}>
-                        {language === 'es' ? 'No hay productos en el catálogo.' : 'No products in catalog.'}
+                        {language === 'es' ? 'No hay productos en el catÃÂ¡logo.' : 'No products in catalog.'}
                       </p>
                     ) : filteredSupplierProducts.length === 0 ? (
                       <p style={{ textAlign: 'center', padding: '24px', color: 'var(--text-muted)' }}>
-                        {language === 'es' ? 'No hay productos en la categoría seleccionada.' : 'No products in the selected category.'}
+                        {language === 'es' ? 'No hay productos en la categorÃÂ­a seleccionada.' : 'No products in the selected category.'}
                       </p>
                     ) : (
                       <table className="custom-table">
@@ -12580,20 +12624,20 @@ USING (true);`;
                                 <span className="badge" style={{ background: 'rgba(255,255,255,0.05)', fontSize: '10px', marginTop: '4px' }}>{sprod.category}</span>
                               </td>
                               <td>{sup?.name ?? '-'}</td>
-                              <td><strong>€{sprod.cost}</strong></td>
+                              <td><strong>Ã¢ÂÂ¬{sprod.cost}</strong></td>
                               <td>{sprod.delivery_time_days} days</td>
                               <td>{sprod.moq}</td>
                               <td>
                                 <div style={{ display: 'flex', gap: '8px' }}>
-                                  <button className="btn-secondary btn-xs" onClick={() => openSupplierProductModal(sprod)}>✏️</button>
+                                  <button className="btn-secondary btn-xs" onClick={() => openSupplierProductModal(sprod)}>Ã¢ÂÂÃ¯Â¸Â</button>
                                   <button className="btn-danger btn-xs" onClick={async () => {
-                                    if (!await asyncConfirm(language === 'es' ? '¿Eliminar producto?' : 'Delete product?')) return;
+                                    if (!await asyncConfirm(language === 'es' ? 'ÃÂ¿Eliminar producto?' : 'Delete product?')) return;
                                     try {
                                       await deleteSupplierProduct(sprod.id);
                                       triggerReload();
                                       showToast(language === 'es' ? 'Producto eliminado.' : 'Product deleted.', 'success');
                                     } catch { showToast('Error.', 'error'); }
-                                  }}>✕</button>
+                                  }}>Ã¢ÂÂ</button>
                                 </div>
                               </td>
                             </tr>
@@ -12617,17 +12661,17 @@ USING (true);`;
               {/* Create/Edit Form */}
               <div className="glass-card">
                 <h2 style={{ marginBottom: '20px', display: 'flex', alignItems: 'center', gap: '10px' }}>
-                  💬 {qrEditingId
-                    ? (language === 'es' ? 'Editar Respuesta Rápida' : 'Edit Quick Reply')
-                    : (language === 'es' ? 'Nueva Respuesta Rápida' : 'New Quick Reply')}
+                  Ã°ÂÂÂ¬ {qrEditingId
+                    ? (language === 'es' ? 'Editar Respuesta RÃÂ¡pida' : 'Edit Quick Reply')
+                    : (language === 'es' ? 'Nueva Respuesta RÃÂ¡pida' : 'New Quick Reply')}
                 </h2>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                   <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '16px' }} className="form-grid-mobile-stacked">
                     <div className="form-group" style={{ margin: 0 }}>
-                      <label className="form-label">{language === 'es' ? 'Título / Etiqueta' : 'Title / Label'}</label>
+                      <label className="form-label">{language === 'es' ? 'TÃÂ­tulo / Etiqueta' : 'Title / Label'}</label>
                       <input
                         className="form-control"
-                        placeholder={language === 'es' ? 'Ej: Bienvenida, Confirmación de pago...' : 'E.g.: Welcome, Payment confirmation...'}
+                        placeholder={language === 'es' ? 'Ej: Bienvenida, ConfirmaciÃÂ³n de pago...' : 'E.g.: Welcome, Payment confirmation...'}
                         value={qrTitle}
                         onChange={e => setQrTitle(e.target.value)}
                         style={{ height: '38px' }}
@@ -12641,9 +12685,9 @@ USING (true);`;
                         onChange={e => setQrLanguage(e.target.value as 'es' | 'en' | 'pt')}
                         style={{ width: '100%', height: '38px', borderRadius: '8px' }}
                       >
-                        <option value="es">🇪🇸 {language === 'es' ? 'Español' : 'Spanish'}</option>
-                        <option value="en">🇬🇧 {language === 'es' ? 'Inglés' : 'English'}</option>
-                        <option value="pt">🇵🇹 {language === 'es' ? 'Portugués' : 'Portuguese'}</option>
+                        <option value="es">Ã°ÂÂÂªÃ°ÂÂÂ¸ {language === 'es' ? 'EspaÃÂ±ol' : 'Spanish'}</option>
+                        <option value="en">Ã°ÂÂÂ¬Ã°ÂÂÂ§ {language === 'es' ? 'InglÃÂ©s' : 'English'}</option>
+                        <option value="pt">Ã°ÂÂÂµÃ°ÂÂÂ¹ {language === 'es' ? 'PortuguÃÂ©s' : 'Portuguese'}</option>
                       </select>
                     </div>
                   </div>
@@ -12652,7 +12696,7 @@ USING (true);`;
                     <textarea
                       className="form-control"
                       rows={5}
-                      placeholder={language === 'es' ? 'Escribe el texto de la respuesta rápida...' : 'Write the quick reply text...'}
+                      placeholder={language === 'es' ? 'Escribe el texto de la respuesta rÃÂ¡pida...' : 'Write the quick reply text...'}
                       value={qrContent}
                       onChange={e => setQrContent(e.target.value)}
                       style={{ resize: 'vertical', minHeight: '120px', fontFamily: 'var(--font-sans)', lineHeight: '1.6' }}
@@ -12675,12 +12719,12 @@ USING (true);`;
                           await upsertQuickReply({ id, title: prependedTitle, content: qrContent.trim(), created_at: new Date().toISOString() });
                           setQrTitle(''); setQrContent(''); setQrLanguage('es'); setQrEditingId(null);
                           triggerReload();
-                          showToast(language === 'es' ? 'Respuesta guardada ✓' : 'Reply saved ✓', 'success');
+                          showToast(language === 'es' ? 'Respuesta guardada Ã¢ÂÂ' : 'Reply saved Ã¢ÂÂ', 'success');
                         } catch { showToast(language === 'es' ? 'Error al guardar' : 'Error saving', 'error'); }
                       }}
                       style={{ display: 'flex', alignItems: 'center', gap: '6px' }}
                     >
-                      {qrEditingId ? '💾' : '➕'} {qrEditingId
+                      {qrEditingId ? 'Ã°ÂÂÂ¾' : 'Ã¢ÂÂ'} {qrEditingId
                         ? (language === 'es' ? 'Actualizar' : 'Update')
                         : (language === 'es' ? 'Guardar Respuesta' : 'Save Reply')}
                     </button>
@@ -12692,7 +12736,7 @@ USING (true);`;
               <div className="glass-card">
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', flexWrap: 'wrap', gap: '12px' }}>
                   <h2 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '10px' }}>
-                    📝 {language === 'es' ? 'Mis Respuestas' : 'My Replies'}
+                    Ã°ÂÂÂ {language === 'es' ? 'Mis Respuestas' : 'My Replies'}
                     <span style={{ fontSize: '14px', fontWeight: 400, color: 'var(--text-muted)' }}>
                       ({
                         (() => {
@@ -12714,7 +12758,7 @@ USING (true);`;
                     <div style={{ position: 'relative', flex: 1 }}>
                       <input
                         className="form-control"
-                        placeholder={language === 'es' ? '🔍 Buscar respuesta...' : '🔍 Search reply...'}
+                        placeholder={language === 'es' ? 'Ã°ÂÂÂ Buscar respuesta...' : 'Ã°ÂÂÂ Search reply...'}
                         value={qrSearch}
                         onChange={e => setQrSearch(e.target.value)}
                         style={{ paddingLeft: '14px', width: '100%', height: '38px' }}
@@ -12727,10 +12771,10 @@ USING (true);`;
                         onChange={e => setQrFilterLang(e.target.value as 'all' | 'es' | 'en' | 'pt')}
                         style={{ minWidth: '135px', height: '38px', borderRadius: '8px' }}
                       >
-                        <option value="all">🌍 {language === 'es' ? 'Todos' : 'All'}</option>
-                        <option value="es">🇪🇸 {language === 'es' ? 'Español' : 'Spanish'}</option>
-                        <option value="en">🇬🇧 {language === 'es' ? 'Inglés' : 'English'}</option>
-                        <option value="pt">🇵🇹 {language === 'es' ? 'Portugués' : 'Portuguese'}</option>
+                        <option value="all">Ã°ÂÂÂ {language === 'es' ? 'Todos' : 'All'}</option>
+                        <option value="es">Ã°ÂÂÂªÃ°ÂÂÂ¸ {language === 'es' ? 'EspaÃÂ±ol' : 'Spanish'}</option>
+                        <option value="en">Ã°ÂÂÂ¬Ã°ÂÂÂ§ {language === 'es' ? 'InglÃÂ©s' : 'English'}</option>
+                        <option value="pt">Ã°ÂÂÂµÃ°ÂÂÂ¹ {language === 'es' ? 'PortuguÃÂ©s' : 'Portuguese'}</option>
                       </select>
                     </div>
                   </div>
@@ -12749,11 +12793,11 @@ USING (true);`;
                   if (filteredReplies.length === 0) {
                     return (
                       <div style={{ textAlign: 'center', padding: '48px 20px' }}>
-                        <p style={{ fontSize: '48px', marginBottom: '12px' }}>💬</p>
+                        <p style={{ fontSize: '48px', marginBottom: '12px' }}>Ã°ÂÂÂ¬</p>
                         <p style={{ color: 'var(--text-muted)', fontSize: '14px' }}>
                           {qrSearch || qrFilterLang !== 'all'
                             ? (language === 'es' ? 'No se encontraron respuestas con los filtros aplicados.' : 'No replies found with the active filters.')
-                            : (language === 'es' ? 'Aún no tienes respuestas rápidas. ¡Crea la primera arriba!' : 'No quick replies yet. Create your first one above!')}
+                            : (language === 'es' ? 'AÃÂºn no tienes respuestas rÃÂ¡pidas. ÃÂ¡Crea la primera arriba!' : 'No quick replies yet. Create your first one above!')}
                         </p>
                       </div>
                     );
@@ -12764,10 +12808,10 @@ USING (true);`;
                       {filteredReplies.map(qr => {
                         const parsed = parseQuickReplyLang(qr.title);
                         const badgeInfo = parsed.lang === 'es'
-                          ? { text: '🇪🇸 Español', bg: 'rgba(239, 68, 68, 0.1)', color: '#f87171' }
+                          ? { text: 'Ã°ÂÂÂªÃ°ÂÂÂ¸ EspaÃÂ±ol', bg: 'rgba(239, 68, 68, 0.1)', color: '#f87171' }
                           : parsed.lang === 'en'
-                          ? { text: '🇬🇧 English', bg: 'rgba(59, 130, 246, 0.1)', color: '#60a5fa' }
-                          : { text: '🇵🇹 Português', bg: 'rgba(16, 185, 129, 0.1)', color: '#34d399' };
+                          ? { text: 'Ã°ÂÂÂ¬Ã°ÂÂÂ§ English', bg: 'rgba(59, 130, 246, 0.1)', color: '#60a5fa' }
+                          : { text: 'Ã°ÂÂÂµÃ°ÂÂÂ¹ PortuguÃÂªs', bg: 'rgba(16, 185, 129, 0.1)', color: '#34d399' };
 
                         return (
                           <div key={qr.id} className="qr-list-item">
@@ -12796,12 +12840,12 @@ USING (true);`;
                               <button
                                 className="qr-action-btn-inline qr-copy"
                                 onClick={async () => {
-                                  try { await navigator.clipboard.writeText(qr.content); showToast(language === 'es' ? '📋 Copiado al portapapeles' : '📋 Copied to clipboard', 'success'); }
+                                  try { await navigator.clipboard.writeText(qr.content); showToast(language === 'es' ? 'Ã°ÂÂÂ Copiado al portapapeles' : 'Ã°ÂÂÂ Copied to clipboard', 'success'); }
                                   catch { showToast(language === 'es' ? 'Error al copiar' : 'Copy failed', 'error'); }
                                 }}
                                 title={language === 'es' ? 'Copiar' : 'Copy'}
                               >
-                                📋 {language === 'es' ? 'Copiar' : 'Copy'}
+                                Ã°ÂÂÂ {language === 'es' ? 'Copiar' : 'Copy'}
                               </button>
                               <button
                                 className="qr-action-btn-inline qr-edit"
@@ -12814,18 +12858,18 @@ USING (true);`;
                                 }}
                                 title={language === 'es' ? 'Editar' : 'Edit'}
                               >
-                                ✏️ {language === 'es' ? 'Editar' : 'Edit'}
+                                Ã¢ÂÂÃ¯Â¸Â {language === 'es' ? 'Editar' : 'Edit'}
                               </button>
                               <button
                                 className="qr-action-btn-inline qr-delete"
                                 onClick={async () => {
-                                  if (!await asyncConfirm(language === 'es' ? '¿Eliminar esta respuesta rápida?' : 'Delete this quick reply?')) return;
+                                  if (!await asyncConfirm(language === 'es' ? 'ÃÂ¿Eliminar esta respuesta rÃÂ¡pida?' : 'Delete this quick reply?')) return;
                                   try { await deleteQuickReply(qr.id); triggerReload(); showToast(language === 'es' ? 'Respuesta eliminada' : 'Reply deleted', 'success'); }
                                   catch { showToast(language === 'es' ? 'Error al eliminar' : 'Error deleting', 'error'); }
                                 }}
                                 title={language === 'es' ? 'Eliminar' : 'Delete'}
                               >
-                                🗑️ {language === 'es' ? 'Eliminar' : 'Delete'}
+                                Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? 'Eliminar' : 'Delete'}
                               </button>
                             </div>
                           </div>
@@ -12879,7 +12923,7 @@ USING (true);`;
                     return [...prev, { template_key: selectedTemplateKey, language: selectedTemplateLang, subject: editorSubject, body_text: editorBody }];
                   }
                 });
-                showToast(language === 'es' ? 'Plantilla guardada con éxito ✓' : 'Template saved successfully ✓', 'success');
+                showToast(language === 'es' ? 'Plantilla guardada con ÃÂ©xito Ã¢ÂÂ' : 'Template saved successfully Ã¢ÂÂ', 'success');
               } catch (err) {
                 showToast(language === 'es' ? 'Error al guardar la plantilla' : 'Error saving template', 'error');
               }
@@ -12888,28 +12932,28 @@ USING (true);`;
             const getRenderedPreview = () => {
               let html = editorBody;
               html = html.replace(/\{\{CLIENT_NAME\}\}/g, 'John Doe');
-              html = html.replace(/\{\{TOTAL_SALE\}\}/g, '€1,200.00');
-              html = html.replace(/\{\{DOWN_PAYMENT\}\}/g, '€200.00');
-              html = html.replace(/\{\{FINANCED_AMOUNT\}\}/g, '€1,000.00');
+              html = html.replace(/\{\{TOTAL_SALE\}\}/g, 'Ã¢ÂÂ¬1,200.00');
+              html = html.replace(/\{\{DOWN_PAYMENT\}\}/g, 'Ã¢ÂÂ¬200.00');
+              html = html.replace(/\{\{FINANCED_AMOUNT\}\}/g, 'Ã¢ÂÂ¬1,000.00');
               html = html.replace(/\{\{INSTALLMENTS_COUNT\}\}/g, '10');
-              html = html.replace(/\{\{INSTALLMENT_AMOUNT\}\}/g, '€100.00');
+              html = html.replace(/\{\{INSTALLMENT_AMOUNT\}\}/g, 'Ã¢ÂÂ¬100.00');
               html = html.replace(/\{\{PAYMENT_FREQUENCY\}\}/g, selectedTemplateLang === 'es' ? 'mensual' : selectedTemplateLang === 'en' ? 'monthly' : 'mensal');
               html = html.replace(/\{\{FIRST_DUE_DATE\}\}/g, '30/06/2026');
               html = html.replace(/\{\{DUE_DATE\}\}/g, '30/06/2026');
               html = html.replace(/\{\{INSTALLMENT_NUMBER\}\}/g, '3');
-              html = html.replace(/\{\{VEHICLE_NAME\}\}/g, '🚲 E-Bike Smart - N/S: B-9831');
+              html = html.replace(/\{\{VEHICLE_NAME\}\}/g, 'Ã°ÂÂÂ² E-Bike Smart - N/S: B-9831');
               html = html.replace(/\{\{START_DATE\}\}/g, '30/05/2026');
-              html = html.replace(/\{\{MONTHLY_RATE\}\}/g, '€120.00');
-              html = html.replace(/\{\{DEPOSIT_AMOUNT\}\}/g, '€200.00');
+              html = html.replace(/\{\{MONTHLY_RATE\}\}/g, 'Ã¢ÂÂ¬120.00');
+              html = html.replace(/\{\{DEPOSIT_AMOUNT\}\}/g, 'Ã¢ÂÂ¬200.00');
               html = html.replace(/\{\{PRODUCTS_LIST\}\}/g, `
                 <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
                   <tr style="border-bottom: 1px solid rgba(255,255,255,0.1); text-align: left;">
-                    <th style="padding: 8px 0; color: #a78bfa; font-size: 13px;">Artículo</th>
+                    <th style="padding: 8px 0; color: #a78bfa; font-size: 13px;">ArtÃÂ­culo</th>
                     <th style="padding: 8px 0; text-align: right; color: #a78bfa; font-size: 13px;">Precio</th>
                   </tr>
                   <tr>
-                    <td style="padding: 8px 0; font-size: 12px; color: #e2e8f0;">🚲 E-Bike Smart - N/S: B-9831</td>
-                    <td style="padding: 8px 0; text-align: right; font-size: 12px; color: #e2e8f0; font-weight: bold;">€1,200.00</td>
+                    <td style="padding: 8px 0; font-size: 12px; color: #e2e8f0;">Ã°ÂÂÂ² E-Bike Smart - N/S: B-9831</td>
+                    <td style="padding: 8px 0; text-align: right; font-size: 12px; color: #e2e8f0; font-weight: bold;">Ã¢ÂÂ¬1,200.00</td>
                   </tr>
                 </table>
               `);
@@ -12934,7 +12978,7 @@ USING (true);`;
               ],
               installment_reminder: [
                 { tag: '{{CLIENT_NAME}}', label: language === 'es' ? 'Nombre Cliente' : 'Client Name' },
-                { tag: '{{INSTALLMENT_NUMBER}}', label: language === 'es' ? 'Número Cuota' : 'Installment No.' },
+                { tag: '{{INSTALLMENT_NUMBER}}', label: language === 'es' ? 'NÃÂºmero Cuota' : 'Installment No.' },
                 { tag: '{{INSTALLMENT_AMOUNT}}', label: language === 'es' ? 'Monto Cuota' : 'Installment Amount' },
                 { tag: '{{DUE_DATE}}', label: language === 'es' ? 'Fecha Vencimiento' : 'Due Date' },
               ],
@@ -12943,7 +12987,7 @@ USING (true);`;
                 { tag: '{{VEHICLE_NAME}}', label: language === 'es' ? 'E-Bike' : 'E-Bike' },
                 { tag: '{{START_DATE}}', label: language === 'es' ? 'Fecha Inicio' : 'Start Date' },
                 { tag: '{{MONTHLY_RATE}}', label: language === 'es' ? 'Alquiler Mensual' : 'Monthly Rate' },
-                { tag: '{{DEPOSIT_AMOUNT}}', label: language === 'es' ? 'Depósito / Fianza' : 'Security Deposit' },
+                { tag: '{{DEPOSIT_AMOUNT}}', label: language === 'es' ? 'DepÃÂ³sito / Fianza' : 'Security Deposit' },
               ],
               rental_reminder: [
                 { tag: '{{CLIENT_NAME}}', label: language === 'es' ? 'Nombre Cliente' : 'Client Name' },
@@ -12958,7 +13002,7 @@ USING (true);`;
                 { tag: '{{CLIENT_NAME}}', label: language === 'es' ? 'Nombre Cliente' : 'Client Name' },
                 { tag: '{{PAYMENT_AMOUNT}}', label: language === 'es' ? 'Monto Pago' : 'Payment Amount' },
                 { tag: '{{PAYMENT_DATE}}', label: language === 'es' ? 'Fecha Pago' : 'Payment Date' },
-                { tag: '{{PAYMENT_METHOD}}', label: language === 'es' ? 'Método / Comentario' : 'Method / Notes' },
+                { tag: '{{PAYMENT_METHOD}}', label: language === 'es' ? 'MÃÂ©todo / Comentario' : 'Method / Notes' },
               ],
               app_account_assigned: [
                 { tag: '{{CLIENT_NAME}}', label: language === 'es' ? 'Nombre Cliente' : 'Client Name' },
@@ -12970,7 +13014,7 @@ USING (true);`;
                 { tag: '{{VEHICLE_NAME}}', label: language === 'es' ? 'E-Bike' : 'E-Bike' },
                 { tag: '{{ODOMETER_END}}', label: language === 'es' ? 'Kilometraje Final' : 'Final Odometer' },
                 { tag: '{{DEPOSIT_REFUNDED}}', label: language === 'es' ? 'Fianza Devuelta' : 'Deposit Refunded' },
-                { tag: '{{DAMAGE_REPORT}}', label: language === 'es' ? 'Reporte Daños' : 'Damage Report' },
+                { tag: '{{DAMAGE_REPORT}}', label: language === 'es' ? 'Reporte DaÃÂ±os' : 'Damage Report' },
               ]
             };
 
@@ -12981,7 +13025,7 @@ USING (true);`;
                 <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
                     <h2 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '10px' }}>
-                      📧 {language === 'es' ? 'Plantillas de Correo' : 'Email Templates'}
+                      Ã°ÂÂÂ§ {language === 'es' ? 'Plantillas de Correo' : 'Email Templates'}
                     </h2>
                   </div>
 
@@ -12994,15 +13038,15 @@ USING (true);`;
                       onChange={e => setSelectedTemplateKey(e.target.value as any)}
                       style={{ width: '100%', height: '38px', borderRadius: '8px' }}
                     >
-                      <option value="sale_contado">🛍️ {language === 'es' ? 'Confirmación de Compra (Contado)' : 'Purchase Confirmation (Contado)'}</option>
-                      <option value="financing_welcome">🏦 {language === 'es' ? 'Bienvenida Financiamiento' : 'Financing Welcome'}</option>
-                      <option value="installment_reminder">⏰ {language === 'es' ? 'Recordatorio de Cuota' : 'Installment Reminder'}</option>
-                      <option value="rental_confirm">🚲 {language === 'es' ? 'Confirmación de Alquiler' : 'Rental Confirmation'}</option>
-                      <option value="rental_reminder">🔔 {language === 'es' ? 'Recordatorio de Alquiler' : 'Rental Reminder'}</option>
-                      <option value="financing_completed">🎉 {language === 'es' ? 'Finalización de Financiación' : 'Financing Completed'}</option>
-                      <option value="rental_payment_received">💳 {language === 'es' ? 'Confirmación de Pago' : 'Payment Confirmation'}</option>
-                      <option value="app_account_assigned">📱 {language === 'es' ? 'Asignación de Cuenta App' : 'App Account Assigned'}</option>
-                      <option value="rental_returned">🏁 {language === 'es' ? 'Devolución de Alquiler' : 'Rental Returned'}</option>
+                      <option value="sale_contado">Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? 'ConfirmaciÃÂ³n de Compra (Contado)' : 'Purchase Confirmation (Contado)'}</option>
+                      <option value="financing_welcome">Ã°ÂÂÂ¦ {language === 'es' ? 'Bienvenida Financiamiento' : 'Financing Welcome'}</option>
+                      <option value="installment_reminder">Ã¢ÂÂ° {language === 'es' ? 'Recordatorio de Cuota' : 'Installment Reminder'}</option>
+                      <option value="rental_confirm">Ã°ÂÂÂ² {language === 'es' ? 'ConfirmaciÃÂ³n de Alquiler' : 'Rental Confirmation'}</option>
+                      <option value="rental_reminder">Ã°ÂÂÂ {language === 'es' ? 'Recordatorio de Alquiler' : 'Rental Reminder'}</option>
+                      <option value="financing_completed">Ã°ÂÂÂ {language === 'es' ? 'FinalizaciÃÂ³n de FinanciaciÃÂ³n' : 'Financing Completed'}</option>
+                      <option value="rental_payment_received">Ã°ÂÂÂ³ {language === 'es' ? 'ConfirmaciÃÂ³n de Pago' : 'Payment Confirmation'}</option>
+                      <option value="app_account_assigned">Ã°ÂÂÂ± {language === 'es' ? 'AsignaciÃÂ³n de Cuenta App' : 'App Account Assigned'}</option>
+                      <option value="rental_returned">Ã°ÂÂÂ {language === 'es' ? 'DevoluciÃÂ³n de Alquiler' : 'Rental Returned'}</option>
                     </select>
                   </div>
 
@@ -13011,9 +13055,9 @@ USING (true);`;
                     <label className="form-label">{language === 'es' ? 'Idioma de la Plantilla' : 'Template Language'}</label>
                     <div style={{ display: 'flex', gap: '8px' }}>
                       {[
-                        { key: 'es', flag: '🇪🇸', label: 'Español' },
-                        { key: 'en', flag: '🇬🇧', label: 'English' },
-                        { key: 'pt', flag: '🇵🇹', label: 'Português' },
+                        { key: 'es', flag: 'Ã°ÂÂÂªÃ°ÂÂÂ¸', label: 'EspaÃÂ±ol' },
+                        { key: 'en', flag: 'Ã°ÂÂÂ¬Ã°ÂÂÂ§', label: 'English' },
+                        { key: 'pt', flag: 'Ã°ÂÂÂµÃ°ÂÂÂ¹', label: 'PortuguÃÂªs' },
                       ].map(lang => (
                         <button
                           key={lang.key}
@@ -13042,7 +13086,7 @@ USING (true);`;
                       className="form-control"
                       value={editorSubject}
                       onChange={e => setEditorSubject(e.target.value)}
-                      placeholder={language === 'es' ? 'Asunto del correo electrónico...' : 'Email subject line...'}
+                      placeholder={language === 'es' ? 'Asunto del correo electrÃÂ³nico...' : 'Email subject line...'}
                       style={{ height: '38px' }}
                     />
                   </div>
@@ -13072,7 +13116,7 @@ USING (true);`;
                   {/* Dynamic variable button pills */}
                   <div className="form-group" style={{ margin: 0 }}>
                     <label className="form-label" style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-                      💡 {language === 'es' ? 'Haz clic en una variable para insertarla en el texto:' : 'Click a variable to insert at cursor position:'}
+                      Ã°ÂÂÂ¡ {language === 'es' ? 'Haz clic en una variable para insertarla en el texto:' : 'Click a variable to insert at cursor position:'}
                     </label>
                     <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '6px' }}>
                       {variableTags[selectedTemplateKey]?.map(v => (
@@ -13113,7 +13157,7 @@ USING (true);`;
                       disabled={!editorSubject.trim() || !editorBody.trim()}
                       style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 24px' }}
                     >
-                      💾 {language === 'es' ? 'Guardar Plantilla' : 'Save Template'}
+                      Ã°ÂÂÂ¾ {language === 'es' ? 'Guardar Plantilla' : 'Save Template'}
                     </button>
                   </div>
                 </div>
@@ -13121,7 +13165,7 @@ USING (true);`;
                 {/* LIVE PREVIEW COLUMN */}
                 <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                   <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    👁️ {language === 'es' ? 'Vista Previa en Vivo' : 'Live Mockup Preview'}
+                    Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? 'Vista Previa en Vivo' : 'Live Mockup Preview'}
                   </h3>
 
                   <div style={{
@@ -13138,7 +13182,7 @@ USING (true);`;
                     <div style={{ fontSize: '12px', borderBottom: '1px solid rgba(255,255,255,0.05)', paddingBottom: '12px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
                       <p style={{ margin: 0 }}><span style={{ color: 'var(--text-muted)' }}>{language === 'es' ? 'De:' : 'From:'}</span> <strong style={{ color: 'var(--color-primary)' }}>The Fast Sheep</strong> <span style={{ color: 'var(--text-muted)' }}>&lt;info@thefastsheep.com&gt;</span></p>
                       <p style={{ margin: 0 }}><span style={{ color: 'var(--text-muted)' }}>{language === 'es' ? 'Para:' : 'To:'}</span> <strong>John Doe</strong> <span style={{ color: 'var(--text-muted)' }}>&lt;john.doe@rider.com&gt;</span></p>
-                      <p style={{ margin: 0 }}><span style={{ color: 'var(--text-muted)' }}>{language === 'es' ? 'Asunto:' : 'Subject:'}</span> <strong style={{ color: '#e2e8f0' }}>{editorSubject || '—'}</strong></p>
+                      <p style={{ margin: 0 }}><span style={{ color: 'var(--text-muted)' }}>{language === 'es' ? 'Asunto:' : 'Subject:'}</span> <strong style={{ color: '#e2e8f0' }}>{editorSubject || 'Ã¢ÂÂ'}</strong></p>
                     </div>
 
                     {/* Fake Email Body container simulating final deliverable */}
@@ -13166,7 +13210,7 @@ USING (true);`;
 
                       {/* Brand Footer */}
                       <div style={{ borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '16px', marginTop: '24px', textAlign: 'center', fontSize: '11px', color: 'var(--text-muted)' }}>
-                        <p style={{ margin: 0 }}>© {new Date().getFullYear()} The Fast Sheep. Todos los derechos reservados.</p>
+                        <p style={{ margin: 0 }}>ÃÂ© {new Date().getFullYear()} The Fast Sheep. Todos los derechos reservados.</p>
                       </div>
                     </div>
                   </div>
@@ -13195,38 +13239,32 @@ USING (true);`;
                 setUserFormPhone(cust.phone);
                 setUserFormRole(cust.last_name || '');
                 setUserFormNotes(cust.notes || '');
-                setUserFormCode(cust.customer_code ? cust.customer_code.replace(/^US-?/i, '') : '');
-                setUserFormNationality(cust.nationality || '');
                 
-                const ref = cust.referral_source || '';
-                setUserFormReferral(ref);
-                if (ref === 'Instagram') {
-                  setUserFormRefType('Instagram');
-                } else if (ref === 'Web') {
-                  setUserFormRefType('Web');
-                } else if (ref === 'Sin referido') {
-                  setUserFormRefType('Sin referido');
-                } else if (ref.startsWith('WhatsApp Group:')) {
+                const codeSuffix = cust.customer_code ? cust.customer_code.replace(/^US-?/i, '') : '';
+                setUserFormCode(codeSuffix);
+                setUserFormNationality(cust.nationality || 'Brasil');
+                
+                const refRaw = cust.referral_source || '';
+                setUserFormReferral(refRaw);
+                if (refRaw.startsWith('WhatsApp Group: ')) {
                   setUserFormRefType('WhatsApp Group');
-                  setUserFormRefWhatsApp(ref.replace('WhatsApp Group:', '').trim());
-                } else if (ref.startsWith('Usuario:')) {
+                  setUserFormRefWhatsApp(refRaw.replace('WhatsApp Group: ', ''));
+                } else if (refRaw.startsWith('Usuario: ')) {
                   setUserFormRefType('Usuario');
-                  const userPart = ref.replace('Usuario:', '').trim();
-                  setUserFormRefUserQuery(userPart);
-                  const matchedUser = customers.find(c => `${c.first_name} ${c.last_name} (${c.customer_code})`.toLowerCase() === userPart.toLowerCase());
-                  if (matchedUser) {
-                    setUserFormRefUserSelected(matchedUser);
-                  } else {
-                    setUserFormRefUserSelected(null);
-                  }
-                } else if (ref.startsWith('Otro:')) {
+                  const uQuery = refRaw.replace('Usuario: ', '');
+                  setUserFormRefUserQuery(uQuery);
+                  const matchedCust = customers.find(c => `${c.first_name} ${c.last_name} (${c.customer_code})` === uQuery);
+                  setUserFormRefUserSelected(matchedCust || null);
+                } else if (refRaw.startsWith('Otro: ')) {
                   setUserFormRefType('Otro');
-                  setUserFormRefOther(ref.replace('Otro:', '').trim());
-                } else if (ref) {
+                  setUserFormRefOther(refRaw.replace('Otro: ', ''));
+                } else if (refRaw === 'Instagram' || refRaw === 'Web' || refRaw === 'Sin referido') {
+                  setUserFormRefType(refRaw);
+                } else if (refRaw) {
                   setUserFormRefType('Otro');
-                  setUserFormRefOther(ref);
+                  setUserFormRefOther(refRaw);
                 } else {
-                  setUserFormRefType('Instagram');
+                  setUserFormRefType('Sin referido');
                 }
               } else {
                 setEditingUserId(null);
@@ -13237,12 +13275,12 @@ USING (true);`;
                 setUserFormNotes('');
                 setUserFormCode(String(customers.length + 1).padStart(3, '0'));
                 setUserFormNationality('Brasil');
+                setUserFormReferral('Instagram');
                 setUserFormRefType('Instagram');
                 setUserFormRefWhatsApp('');
-                setUserFormRefOther('');
                 setUserFormRefUserQuery('');
                 setUserFormRefUserSelected(null);
-                setUserFormReferral('Instagram');
+                setUserFormRefOther('');
               }
               setUserModalOpen(true);
             };
@@ -13260,13 +13298,13 @@ USING (true);`;
                     <input
                       className="form-control"
                       style={{ maxWidth: '280px' }}
-                      placeholder={language === 'es' ? '🔍 Buscar usuario...' : '🔍 Search user...'}
+                      placeholder={language === 'es' ? 'Ã°ÂÂÂ Buscar usuario...' : 'Ã°ÂÂÂ Search user...'}
                       value={usersSearch}
                       onChange={e => setUsersSearch(e.target.value)}
                     />
                     {isAdmin && (
                       <button className="btn-primary" onClick={() => openUserModal()}>
-                        ➕ {language === 'es' ? 'Nuevo Usuario' : 'New User'}
+                        Ã¢ÂÂ {language === 'es' ? 'Nuevo Usuario' : 'New User'}
                       </button>
                     )}
                   </div>
@@ -13276,7 +13314,7 @@ USING (true);`;
                       <table className="custom-table">
                         <thead>
                           <tr>
-                            <th>{language === 'es' ? 'Código' : 'Code'}</th>
+                            <th>{language === 'es' ? 'CÃÂ³digo' : 'Code'}</th>
                             <th>{language === 'es' ? 'Nombre' : 'Name'}</th>
                             <th>{language === 'es' ? 'Contacto' : 'Contact'}</th>
                             <th>{language === 'es' ? 'Origen / Rol' : 'Source / Role'}</th>
@@ -13328,7 +13366,7 @@ USING (true);`;
                                       {cust.referral_source}
                                     </span>
                                   ) : (
-                                    <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>—</span>
+                                    <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>Ã¢ÂÂ</span>
                                   )}
                                 </td>
                                 <td style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
@@ -13348,19 +13386,19 @@ USING (true);`;
                                       setUserNoteInput('');
                                     }}
                                   >
-                                    📝 {noteCount > 0 && <span style={{ background: '#6366f1', color: 'white', borderRadius: '99px', padding: '0 5px', fontSize: '10px', fontWeight: 700 }}>{noteCount}</span>}
+                                    Ã°ÂÂÂ {noteCount > 0 && <span style={{ background: '#6366f1', color: 'white', borderRadius: '99px', padding: '0 5px', fontSize: '10px', fontWeight: 700 }}>{noteCount}</span>}
                                     {noteCount === 0 && (language === 'es' ? 'Notas' : 'Notes')}
                                   </button>
                                 </td>
                                 {isAdmin && (
                                   <td>
                                     <div style={{ display: 'flex', gap: '6px' }}>
-                                      <button className="btn-secondary btn-xs" onClick={() => openUserModal(cust)}>✏️</button>
+                                      <button className="btn-secondary btn-xs" onClick={() => openUserModal(cust)}>Ã¢ÂÂÃ¯Â¸Â</button>
                                       <button
                                         className="btn-secondary btn-xs"
                                         style={{ color: '#f87171', borderColor: 'rgba(248,113,113,0.3)' }}
                                         onClick={async () => {
-                                          if (!await asyncConfirm(language === 'es' ? `¿Eliminar a ${cust.first_name} ${cust.last_name}?` : `Delete ${cust.first_name} ${cust.last_name}?`)) return;
+                                          if (!await asyncConfirm(language === 'es' ? `ÃÂ¿Eliminar a ${cust.first_name} ${cust.last_name}?` : `Delete ${cust.first_name} ${cust.last_name}?`)) return;
                                           try {
                                             await deleteCustomer(cust.id);
                                             triggerReload();
@@ -13368,7 +13406,7 @@ USING (true);`;
                                             if (activeNoteUserId === cust.id) setActiveNoteUserId(null);
                                           } catch { showToast(language === 'es' ? 'Error al eliminar.' : 'Error deleting.', 'error'); }
                                         }}
-                                      >🗑️</button>
+                                      >Ã°ÂÂÂÃ¯Â¸Â</button>
                                     </div>
                                   </td>
                                 )}
@@ -13401,11 +13439,11 @@ USING (true);`;
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                       <div>
                         <div style={{ fontSize: '14px', fontWeight: 700, color: 'var(--text-bright)' }}>
-                          📝 {language === 'es' ? 'Notas de' : 'Notes for'} {activeUser.first_name}
+                          Ã°ÂÂÂ {language === 'es' ? 'Notas de' : 'Notes for'} {activeUser.first_name}
                         </div>
                         <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '2px' }}>{parsedNotes.length} {language === 'es' ? 'entradas' : 'entries'}</div>
                       </div>
-                      <button className="btn-secondary btn-xs" onClick={() => setActiveNoteUserId(null)}>✕</button>
+                      <button className="btn-secondary btn-xs" onClick={() => setActiveNoteUserId(null)}>Ã¢ÂÂ</button>
                     </div>
 
                     {/* Add new note */}
@@ -13432,11 +13470,11 @@ USING (true);`;
                             await upsertCustomer({ ...activeUser, notes: serialized });
                             triggerReload();
                             setUserNoteInput('');
-                            showToast(language === 'es' ? 'Nota añadida.' : 'Note added.', 'success');
+                            showToast(language === 'es' ? 'Nota aÃÂ±adida.' : 'Note added.', 'success');
                           } catch { showToast(language === 'es' ? 'Error al guardar.' : 'Error saving.', 'error'); }
                         }}
                       >
-                        ➕ {language === 'es' ? 'Agregar Nota' : 'Add Note'}
+                        Ã¢ÂÂ {language === 'es' ? 'Agregar Nota' : 'Add Note'}
                       </button>
                     </div>
 
@@ -13444,7 +13482,7 @@ USING (true);`;
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', maxHeight: '400px', overflowY: 'auto', paddingRight: '4px' }}>
                       {parsedNotes.length === 0 ? (
                         <p style={{ color: 'var(--text-muted)', fontSize: '12px', textAlign: 'center', fontStyle: 'italic', margin: 0 }}>
-                          {language === 'es' ? 'Sin notas aún.' : 'No notes yet.'}
+                          {language === 'es' ? 'Sin notas aÃÂºn.' : 'No notes yet.'}
                         </p>
                       ) : parsedNotes.map(note => (
                         <div key={note.id} style={{
@@ -13455,7 +13493,8 @@ USING (true);`;
                           display: 'flex', flexDirection: 'column', gap: '4px'
                         }}>
                           <span style={{ fontSize: '10px', color: 'var(--text-muted)' }}>
-                            📅 {fmt(note.date.split('T')[0])} · {note.date.split('T')[1]?.slice(0, 5) ?? ''}
+                            Ã°ÂÂÂ
+ {fmt(note.date.split('T')[0])} ÃÂ· {note.date.split('T')[1]?.slice(0, 5) ?? ''}
                           </span>
                           <p style={{ fontSize: '13px', color: 'var(--text-bright)', margin: 0, lineHeight: '1.5', whiteSpace: 'pre-wrap' }}>{note.content}</p>
                           <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
@@ -13471,7 +13510,7 @@ USING (true);`;
                                   showToast(language === 'es' ? 'Nota eliminada.' : 'Note deleted.', 'success');
                                 } catch { showToast(language === 'es' ? 'Error al eliminar.' : 'Error deleting.', 'error'); }
                               }}
-                            >🗑️</button>
+                            >Ã°ÂÂÂÃ¯Â¸Â</button>
                           </div>
                         </div>
                       ))}
@@ -13483,10 +13522,35 @@ USING (true);`;
                   <div className="modal-overlay" style={{ zIndex: 1200 }}>
                     <div className="modal-content" style={{ maxWidth: '480px' }}>
                       <div className="modal-header">
-                        <h3>👤 {editingUserId ? (language === 'es' ? 'Editar Usuario' : 'Edit User') : (language === 'es' ? 'Nuevo Usuario' : 'New User')}</h3>
-                        <button className="btn-secondary btn-xs" onClick={() => setUserModalOpen(false)}>✕</button>
+                        <h3>Ã°ÂÂÂ¤ {editingUserId ? (language === 'es' ? 'Editar Usuario' : 'Edit User') : (language === 'es' ? 'Nuevo Usuario' : 'New User')}</h3>
+                        <button className="btn-secondary btn-xs" onClick={() => setUserModalOpen(false)}>Ã¢ÂÂ</button>
                       </div>
                       <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                        <div className="form-group">
+                          <label className="form-label">{language === 'es' ? 'CÃÂ³digo de Usuario' : 'User Code'} *</label>
+                          <div style={{ display: 'flex' }}>
+                            <span style={{ 
+                              background: 'rgba(255,255,255,0.06)', 
+                              border: '1px solid var(--border-color)', 
+                              borderRight: 'none', 
+                              padding: '0 12px', 
+                              display: 'flex', 
+                              alignItems: 'center', 
+                              borderTopLeftRadius: '8px', 
+                              borderBottomLeftRadius: '8px', 
+                              fontSize: '13px', 
+                              color: 'var(--text-muted)',
+                              userSelect: 'none'
+                            }}>US-</span>
+                            <input 
+                              className="form-control" 
+                              placeholder="1001" 
+                              value={userFormCode} 
+                              onChange={e => setUserFormCode(e.target.value.replace(/^US-?/i, ''))} 
+                              style={{ borderTopLeftRadius: 0, borderBottomLeftRadius: 0 }}
+                            />
+                          </div>
+                        </div>
                         <div className="form-grid">
                           <div className="form-group">
                             <label className="form-label">{language === 'es' ? 'Nombre' : 'First Name'} *</label>
@@ -13494,61 +13558,7 @@ USING (true);`;
                           </div>
                           <div className="form-group">
                             <label className="form-label">{language === 'es' ? 'Apellido' : 'Last Name'}</label>
-                            <input className="form-control" value={userFormRole} onChange={e => setUserFormRole(e.target.value)} placeholder="García" />
-                          </div>
-                        </div>
-                        <div className="form-grid">
-                          <div className="form-group">
-                            <label className="form-label">{language === 'es' ? 'Código de Usuario' : 'User Code'}</label>
-                            <div style={{ display: 'flex' }}>
-                              <span style={{ 
-                                background: 'rgba(255,255,255,0.06)', 
-                                border: '1px solid var(--border-color)', 
-                                borderRight: 'none', 
-                                padding: '0 12px', 
-                                display: 'flex', 
-                                alignItems: 'center', 
-                                borderTopLeftRadius: '8px', 
-                                borderBottomLeftRadius: '8px', 
-                                fontSize: '13px', 
-                                color: 'var(--text-muted)',
-                                userSelect: 'none'
-                              }}>US-</span>
-                              <input 
-                                type="text" 
-                                className="form-control" 
-                                value={userFormCode} 
-                                onChange={e => setUserFormCode(e.target.value.replace(/^US-?/i, ''))} 
-                                style={{ height: '38px', fontSize: '13px', borderTopLeftRadius: 0, borderBottomLeftRadius: 0 }}
-                              />
-                            </div>
-                          </div>
-                          <div className="form-group">
-                            <label className="form-label">{t.nationality}</label>
-                            <select
-                              className="form-control"
-                              value={userFormNationality}
-                              onChange={e => setUserFormNationality(e.target.value)}
-                              style={{ width: '100%', height: '38px', fontSize: '13px' }}
-                            >
-                              {userFormNationality && !NATIONALITIES.some(n => n.value === userFormNationality) && (
-                                <option value={userFormNationality}>{userFormNationality}</option>
-                              )}
-                              <optgroup label={language === 'es' ? 'Nacionalidades Populares' : 'Popular Nationalities'}>
-                                {POPULAR_NATIONALITIES.map(n => (
-                                  <option key={`pop-user-${n.value}`} value={n.value}>
-                                    {language === 'es' ? n.labelEs : n.labelEn}
-                                  </option>
-                                ))}
-                              </optgroup>
-                              <optgroup label={language === 'es' ? 'Todas las Nacionalidades' : 'All Nationalities'}>
-                                {sortedNationalities.map(n => (
-                                  <option key={`all-user-${n.value}`} value={n.value}>
-                                    {language === 'es' ? n.labelEs : n.labelEn}
-                                  </option>
-                                ))}
-                              </optgroup>
-                            </select>
+                            <input className="form-control" value={userFormRole} onChange={e => setUserFormRole(e.target.value)} placeholder="GarcÃÂ­a" />
                           </div>
                         </div>
                         <div className="form-group">
@@ -13556,16 +13566,45 @@ USING (true);`;
                           <input className="form-control" type="email" value={userFormEmail} onChange={e => setUserFormEmail(e.target.value)} placeholder="usuario@email.com" />
                         </div>
                         <div className="form-group">
-                          <label className="form-label">{language === 'es' ? 'Teléfono' : 'Phone'}</label>
+                          <label className="form-label">{language === 'es' ? 'TelÃÂ©fono' : 'Phone'}</label>
                           <input className="form-control" value={userFormPhone} onChange={e => setUserFormPhone(e.target.value)} placeholder="+353 87..." />
                         </div>
                         <div className="form-group">
-                          <label className="form-label">{t.referralSource}</label>
+                          <label className="form-label">{language === 'es' ? 'Nacionalidad' : 'Nationality'}</label>
+                          <select
+                            className="form-control"
+                            value={userFormNationality}
+                            onChange={e => setUserFormNationality(e.target.value)}
+                            style={{ width: '100%', height: '42px' }}
+                          >
+                            {userFormNationality && !NATIONALITIES.some(n => n.value === userFormNationality) && (
+                              <option value={userFormNationality}>{userFormNationality}</option>
+                            )}
+
+                            <optgroup label={language === 'es' ? 'Nacionalidades Populares' : 'Popular Nationalities'}>
+                              {POPULAR_NATIONALITIES.map(n => (
+                                <option key={`pop-modal-${n.value}`} value={n.value}>
+                                  {language === 'es' ? n.labelEs : n.labelEn}
+                                </option>
+                              ))}
+                            </optgroup>
+
+                            <optgroup label={language === 'es' ? 'Todas las Nacionalidades' : 'All Nationalities'}>
+                              {sortedNationalities.map(n => (
+                                <option key={`all-modal-${n.value}`} value={n.value}>
+                                  {language === 'es' ? n.labelEs : n.labelEn}
+                                </option>
+                              ))}
+                            </optgroup>
+                          </select>
+                        </div>
+                        <div className="form-group">
+                          <label className="form-label">{language === 'es' ? 'Origen / Referido' : 'Referral Source'}</label>
                           <select 
                             className="form-control" 
                             value={userFormRefType} 
-                            onChange={e => handleUserRefTypeChange(e.target.value)}
-                            style={{ height: '38px' }}
+                            onChange={e => handleUserFormRefTypeChange(e.target.value)}
+                            style={{ height: '42px' }}
                           >
                             <option value="Instagram">Instagram</option>
                             <option value="Web">Web</option>
@@ -13576,30 +13615,30 @@ USING (true);`;
                           </select>
 
                           {userFormRefType === 'WhatsApp Group' && (
-                            <div className="wizard-referral-row" style={{ marginTop: '8px' }}>
+                            <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '8px' }}>
                               <input 
                                 type="text" 
                                 className="form-control" 
                                 value={userFormRefWhatsApp} 
-                                onChange={e => handleUserRefWhatsAppChange(e.target.value)} 
-                                placeholder={language === 'es' ? 'Ej: Repartidores Dublín' : 'E.g.: Dublin Delivery Group'}
+                                onChange={e => handleUserFormRefWhatsAppChange(e.target.value)} 
+                                placeholder={language === 'es' ? 'Ej: Repartidores DublÃÂ­n' : 'E.g.: Dublin Delivery Group'}
                                 style={{ height: '38px', flex: 1 }}
                               />
-                              <label className="form-label" style={{ margin: 0, whiteSpace: 'nowrap', fontSize: '12px', color: 'var(--text-muted)' }}>
+                              <label className="form-label" style={{ margin: 0, whiteSpace: 'nowrap', fontSize: '11px', color: 'var(--text-muted)' }}>
                                 {language === 'es' ? 'Nombre del Grupo de WhatsApp' : 'WhatsApp Group Name'}
                               </label>
                             </div>
                           )}
 
                           {userFormRefType === 'Usuario' && (
-                            <div className="wizard-referral-row" style={{ marginTop: '8px' }}>
+                            <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '8px' }}>
                               <div style={{ position: 'relative', flex: 1 }}>
                                 <input 
                                   type="text" 
                                   className="form-control" 
                                   value={userFormRefUserQuery} 
-                                  onChange={e => handleUserRefUserQueryChange(e.target.value)} 
-                                  placeholder={language === 'es' ? '🔍 Escribe 3 letras para buscar...' : '🔍 Type 3 letters to search...'}
+                                  onChange={e => handleUserFormRefUserQueryChange(e.target.value)} 
+                                  placeholder={language === 'es' ? 'Ã°ÂÂÂ Escribe 3 letras para buscar...' : 'Ã°ÂÂÂ Type 3 letters to search...'}
                                   style={{ height: '38px', width: '100%' }}
                                 />
                                 {userFormRefUserQuery.trim().length >= 3 && (
@@ -13649,25 +13688,19 @@ USING (true);`;
                                   })()
                                 )}
                               </div>
-                              <label className="form-label" style={{ margin: 0, whiteSpace: 'nowrap', fontSize: '12px', color: 'var(--text-muted)' }}>
-                                {language === 'es' ? 'Seleccionar Usuario' : 'Select User'}
-                              </label>
                             </div>
                           )}
 
                           {userFormRefType === 'Otro' && (
-                            <div className="wizard-referral-row" style={{ marginTop: '8px' }}>
+                            <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '8px' }}>
                               <input 
                                 type="text" 
                                 className="form-control" 
                                 value={userFormRefOther} 
-                                onChange={e => handleUserRefOtherChange(e.target.value)} 
-                                placeholder={language === 'es' ? 'Ej: Recomendación de un amigo, cartel publicitario' : 'E.g.: Friend recommendation, billboard'}
+                                onChange={e => handleUserFormRefOtherChange(e.target.value)} 
+                                placeholder={language === 'es' ? 'Ej: RecomendaciÃÂ³n de un amigo' : 'E.g.: Friend recommendation'}
                                 style={{ height: '38px', flex: 1 }}
                               />
-                              <label className="form-label" style={{ margin: 0, whiteSpace: 'nowrap', fontSize: '12px', color: 'var(--text-muted)' }}>
-                                {language === 'es' ? 'Especificar origen / información extra' : 'Specify source / extra info'}
-                              </label>
                             </div>
                           )}
                         </div>
@@ -13686,20 +13719,22 @@ USING (true);`;
                             if (!userFormName.trim()) { showToast(language === 'es' ? 'El nombre es obligatorio.' : 'Name is required.', 'error'); return; }
                             try {
                               const existing = editingUserId ? customers.find(c => c.id === editingUserId) : null;
-                              const finalCode = 'US-' + userFormCode.trim().replace(/^US-?/i, '');
+                              const nextCode = userFormCode.trim() 
+                                ? 'US-' + userFormCode.trim().replace(/^US-?/i, '')
+                                : (existing?.customer_code || `US-${String(customers.length + 1).padStart(3, '0')}`);
                               const initialNotesJson = !existing && userFormNotes.trim()
                                 ? JSON.stringify([{ id: crypto.randomUUID(), date: new Date().toISOString(), content: userFormNotes.trim() }])
                                 : (existing?.notes || '');
                               await upsertCustomer({
                                 id: existing?.id || crypto.randomUUID(),
-                                customer_code: finalCode,
+                                customer_code: nextCode,
                                 first_name: userFormName.trim(),
                                 last_name: userFormRole.trim(),
                                 email: userFormEmail.trim(),
                                 phone: userFormPhone.trim(),
                                 id_document_url: existing?.id_document_url || '',
                                 referral_source: userFormReferral.trim(),
-                                nationality: userFormNationality.trim(),
+                                nationality: userFormNationality || '',
                                 notes: initialNotesJson,
                                 created_at: existing?.created_at || new Date().toISOString(),
                               });
@@ -13709,7 +13744,7 @@ USING (true);`;
                             } catch { showToast(language === 'es' ? 'Error al guardar.' : 'Error saving.', 'error'); }
                           }}
                         >
-                          💾 {t.save}
+                          Ã°ÂÂÂ¾ {t.save}
                         </button>
                       </div>
                     </div>
@@ -13732,13 +13767,13 @@ USING (true);`;
                 <div className="filter-row" style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', gap: '16px', marginBottom: '24px' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
                     <h2 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
-                      📋 {language === 'es' ? 'Tablero de Tareas' : 'Task Board'}
+                      Ã°ÂÂÂ {language === 'es' ? 'Tablero de Tareas' : 'Task Board'}
                     </h2>
                     <button 
                       className="btn-secondary btn-sm"
                       onClick={() => setShowColorConfig(!showColorConfig)}
                     >
-                      🎨 {language === 'es' ? 'Etiquetas de Colores' : 'Color Labels'} {showColorConfig ? '▲' : '▼'}
+                      Ã°ÂÂÂ¨ {language === 'es' ? 'Etiquetas de Colores' : 'Color Labels'} {showColorConfig ? 'Ã¢ÂÂ²' : 'Ã¢ÂÂ¼'}
                     </button>
                   </div>
 
@@ -13760,7 +13795,7 @@ USING (true);`;
                       onChange={e => setNewCardTitle(e.target.value)}
                     />
                     <button type="submit" className="btn-primary">
-                      ➕ {language === 'es' ? 'Crear' : 'Create'}
+                      Ã¢ÂÂ {language === 'es' ? 'Crear' : 'Create'}
                     </button>
                   </form>
                 </div>
@@ -13769,7 +13804,7 @@ USING (true);`;
                 {showColorConfig && (
                   <div className="glass-card" style={{ padding: '20px', marginBottom: '24px', background: 'rgba(255, 255, 255, 0.02)', border: '1px solid rgba(255, 255, 255, 0.08)' }}>
                     <h3 style={{ marginTop: 0, marginBottom: '16px', fontSize: '16px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      🏷️ {language === 'es' ? 'Personalizar Etiquetas de Colores' : 'Customize Color Labels'}
+                      Ã°ÂÂÂ·Ã¯Â¸Â {language === 'es' ? 'Personalizar Etiquetas de Colores' : 'Customize Color Labels'}
                     </h3>
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: '16px' }}>
                       {colorsList.map(c => (
@@ -13787,12 +13822,12 @@ USING (true);`;
                             className="btn-secondary btn-xs"
                             style={{ color: '#ef4444', background: 'rgba(239, 68, 68, 0.05)', border: '1px solid rgba(239, 68, 68, 0.15)', padding: '4px 8px', height: '32px' }}
                             onClick={async () => {
-                              if (await asyncConfirm(language === 'es' ? '¿Eliminar esta etiqueta de color?' : 'Delete this color tag?')) {
+                              if (await asyncConfirm(language === 'es' ? 'ÃÂ¿Eliminar esta etiqueta de color?' : 'Delete this color tag?')) {
                                 handleDeleteColorTag(c);
                               }
                             }}
                           >
-                            ✕
+                            Ã¢ÂÂ
                           </button>
                         </div>
                       ))}
@@ -13801,7 +13836,7 @@ USING (true);`;
                     {/* Form to Add New Tag */}
                     <div style={{ marginTop: '20px', paddingTop: '16px', borderTop: '1px solid rgba(255, 255, 255, 0.06)', display: 'flex', flexWrap: 'wrap', gap: '12px', alignItems: 'center' }}>
                       <h4 style={{ margin: 0, fontSize: '14px', fontWeight: 600 }}>
-                        ✨ {language === 'es' ? 'Nueva Etiqueta:' : 'New Label:'}
+                        Ã¢ÂÂ¨ {language === 'es' ? 'Nueva Etiqueta:' : 'New Label:'}
                       </h4>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                         <input 
@@ -13830,7 +13865,7 @@ USING (true);`;
                             setNewTagColor(nextColor);
                           }}
                         >
-                          ➕ {language === 'es' ? 'Agregar' : 'Add'}
+                          Ã¢ÂÂ {language === 'es' ? 'Agregar' : 'Add'}
                         </button>
                       </div>
                     </div>
@@ -13864,13 +13899,13 @@ USING (true);`;
                                   setEditingCardId(null);
                                 }}
                               >
-                                ✓
+                                Ã¢ÂÂ
                               </button>
                               <button 
                                 className="btn-secondary btn-xs"
                                 onClick={() => setEditingCardId(null)}
                               >
-                                ✕
+                                Ã¢ÂÂ
                               </button>
                             </div>
                           ) : (
@@ -13884,18 +13919,18 @@ USING (true);`;
                                 title={language === 'es' ? 'Haz click para editar' : 'Click to edit'}
                               >
                                 {card.title}
-                                <span style={{ opacity: 0.4, fontSize: '12px' }}>✏️</span>
+                                <span style={{ opacity: 0.4, fontSize: '12px' }}>Ã¢ÂÂÃ¯Â¸Â</span>
                               </h3>
                               <button 
                                 className="btn-secondary btn-xs" 
                                 style={{ color: '#ef4444', background: 'rgba(239, 68, 68, 0.05)', border: '1px solid rgba(239, 68, 68, 0.15)' }}
                                 onClick={async () => {
-                                  if (await asyncConfirm(language === 'es' ? '¿Eliminar tarjeta y todas sus tareas?' : 'Delete card and all its tasks?')) {
+                                  if (await asyncConfirm(language === 'es' ? 'ÃÂ¿Eliminar tarjeta y todas sus tareas?' : 'Delete card and all its tasks?')) {
                                     handleDeleteCard(card.id);
                                   }
                                 }}
                               >
-                                🗑️
+                                Ã°ÂÂÂÃ¯Â¸Â
                               </button>
                             </>
                           )}
@@ -13952,13 +13987,13 @@ USING (true);`;
                                             setEditingTaskId(null);
                                           }}
                                         >
-                                          ✓
+                                          Ã¢ÂÂ
                                         </button>
                                         <button 
                                           className="btn-secondary btn-xs"
                                           onClick={() => setEditingTaskId(null)}
                                         >
-                                          ✕
+                                          Ã¢ÂÂ
                                         </button>
                                       </div>
                                     ) : (
@@ -13990,7 +14025,7 @@ USING (true);`;
                                       onClick={() => handleMoveTask(item, 'up')}
                                       title={language === 'es' ? 'Subir' : 'Move Up'}
                                     >
-                                      ↑
+                                      Ã¢ÂÂ
                                     </button>
                                     <button 
                                       className="btn-secondary btn-xs"
@@ -13999,18 +14034,18 @@ USING (true);`;
                                       onClick={() => handleMoveTask(item, 'down')}
                                       title={language === 'es' ? 'Bajar' : 'Move Down'}
                                     >
-                                      ↓
+                                      Ã¢ÂÂ
                                     </button>
                                     <button 
                                       className="btn-secondary btn-xs"
                                       style={{ padding: '2px 4px', color: '#ef4444', fontSize: '11px' }}
                                       onClick={async () => {
-                                        if (await asyncConfirm(language === 'es' ? '¿Eliminar esta tarea?' : 'Delete this task?')) {
+                                        if (await asyncConfirm(language === 'es' ? 'ÃÂ¿Eliminar esta tarea?' : 'Delete this task?')) {
                                           handleDeleteTask(item.id);
                                         }
                                       }}
                                     >
-                                      ✕
+                                      Ã¢ÂÂ
                                     </button>
                                   </div>
                                 </div>
@@ -14069,7 +14104,7 @@ USING (true);`;
                             }}
                           />
                           <button type="submit" className="btn-primary btn-sm" style={{ padding: '4px 10px' }}>
-                            ➕
+                            Ã¢ÂÂ
                           </button>
                         </form>
                       </div>
@@ -14100,7 +14135,7 @@ USING (true);`;
           return (
             <div className="form-group" style={{ gridColumn: 'span 2', display: 'flex', flexDirection: 'column', gap: '8px', background: 'rgba(255, 255, 255, 0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255, 255, 255, 0.05)', marginTop: '8px' }}>
               <label className="form-label" style={{ fontWeight: 600, display: 'flex', alignItems: 'center', gap: '6px' }}>
-                📍 {language === 'es' ? 'Ubicación de Stock' : 'Stock Location'}
+                Ã°ÂÂÂ {language === 'es' ? 'UbicaciÃÂ³n de Stock' : 'Stock Location'}
               </label>
 
               {prodFormIsGeneric && (
@@ -14133,7 +14168,7 @@ USING (true);`;
                       const qty = prodFormLocDistribution[loc] || 0;
                       return (
                         <div key={loc} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', background: 'rgba(255,255,255,0.02)', padding: '6px 10px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.05)' }}>
-                          <span style={{ fontSize: '13px', color: 'var(--text-bright)', fontWeight: 500 }}>📍 {loc}</span>
+                          <span style={{ fontSize: '13px', color: 'var(--text-bright)', fontWeight: 500 }}>Ã°ÂÂÂ {loc}</span>
                           <input
                             type="number"
                             className="form-control"
@@ -14147,7 +14182,7 @@ USING (true);`;
                               const allowed = Math.max(0, maxDistTotal - othersSum);
                               if (val > allowed) {
                                 val = allowed;
-                                showToast(language === 'es' ? `La cantidad total es ${maxDistTotal}. No podés distribuir más unidades.` : `Total quantity is ${maxDistTotal}. You can't distribute more units.`, 'error');
+                                showToast(language === 'es' ? `La cantidad total es ${maxDistTotal}. No podÃÂ©s distribuir mÃÂ¡s unidades.` : `Total quantity is ${maxDistTotal}. You can't distribute more units.`, 'error');
                               }
                               setProdFormLocDistribution({ ...prodFormLocDistribution, [loc]: val });
                             }}
@@ -14178,7 +14213,7 @@ USING (true);`;
                     value={selectedLocation}
                     onChange={(e) => setSelectedLocation(e.target.value)}
                   >
-                    <option value="">{language === 'es' ? '-- Seleccione ubicación --' : '-- Select location --'}</option>
+                    <option value="">{language === 'es' ? '-- Seleccione ubicaciÃÂ³n --' : '-- Select location --'}</option>
                     {locationsList.map((loc) => (
                       <option key={loc} value={loc}>{loc}</option>
                     ))}
@@ -14191,7 +14226,7 @@ USING (true);`;
                   type="text"
                   className="form-control"
                   style={{ flex: 1, minWidth: '150px' }}
-                  placeholder={language === 'es' ? 'Crear nueva ubicación' : 'Create new location'}
+                  placeholder={language === 'es' ? 'Crear nueva ubicaciÃÂ³n' : 'Create new location'}
                   value={newLocationInput}
                   onChange={(e) => setNewLocationInput(e.target.value)}
                 />
@@ -14216,12 +14251,12 @@ USING (true);`;
                     }
                     setNewLocationInput('');
                     showToast(
-                      language === 'es' ? `Ubicación "${trimmed}" creada.` : `Location "${trimmed}" created.`,
+                      language === 'es' ? `UbicaciÃÂ³n "${trimmed}" creada.` : `Location "${trimmed}" created.`,
                       'success'
                     );
                   }}
                 >
-                  ➕ {language === 'es' ? 'Crear' : 'Create'}
+                  Ã¢ÂÂ {language === 'es' ? 'Crear' : 'Create'}
                 </button>
               </div>
 
@@ -14233,7 +14268,7 @@ USING (true);`;
                   style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px', padding: '4px 8px', fontSize: '11px' }}
                   onClick={() => setShowLocManager(!showLocManager)}
                 >
-                  ⚙️ {showLocManager ? (language === 'es' ? 'Ocultar Administrador' : 'Hide Manager') : (language === 'es' ? 'Editar / Borrar Ubicaciones' : 'Edit / Delete Locations')}
+                  Ã¢ÂÂÃ¯Â¸Â {showLocManager ? (language === 'es' ? 'Ocultar Administrador' : 'Hide Manager') : (language === 'es' ? 'Editar / Borrar Ubicaciones' : 'Edit / Delete Locations')}
                 </button>
                 {showLocManager && (
                   <div style={{ background: 'rgba(255, 255, 255, 0.02)', padding: '8px', borderRadius: '6px', border: '1px solid rgba(255, 255, 255, 0.05)', display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '120px', overflowY: 'auto' }}>
@@ -14264,10 +14299,10 @@ USING (true);`;
                                 if (selectedLocation === loc) {
                                   setSelectedLocation(val);
                                 }
-                                showToast(language === 'es' ? 'Ubicación editada.' : 'Location edited.', 'success');
+                                showToast(language === 'es' ? 'UbicaciÃÂ³n editada.' : 'Location edited.', 'success');
                               }}
                             >
-                              💾
+                              Ã°ÂÂÂ¾
                             </button>
                             <button
                               type="button"
@@ -14275,12 +14310,12 @@ USING (true);`;
                               style={{ height: '24px', width: '24px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px' }}
                               onClick={() => setEditingLocIndex(null)}
                             >
-                              ✕
+                              Ã¢ÂÂ
                             </button>
                           </div>
                         ) : (
                           <>
-                            <span style={{ fontSize: '11px', color: 'var(--text-bright)' }}>📍 {loc}</span>
+                            <span style={{ fontSize: '11px', color: 'var(--text-bright)' }}>Ã°ÂÂÂ {loc}</span>
                             <div style={{ display: 'flex', gap: '2px' }}>
                               <button
                                 type="button"
@@ -14291,25 +14326,25 @@ USING (true);`;
                                   setEditingLocText(loc);
                                 }}
                               >
-                                ✏️
+                                Ã¢ÂÂÃ¯Â¸Â
                               </button>
                               <button
                                 type="button"
                                 className="btn-danger btn-xs"
                                 style={{ padding: '1px 4px', fontSize: '10px', background: 'rgba(239, 68, 68, 0.1)', color: '#ef4444', border: '1px solid rgba(239, 68, 68, 0.2)' }}
                                 onClick={async () => {
-                                  if (await asyncConfirm(language === 'es' ? `¿Estás seguro?` : `Are you sure?`)) {
+                                  if (await asyncConfirm(language === 'es' ? `ÃÂ¿EstÃÂ¡s seguro?` : `Are you sure?`)) {
                                     const updated = locationsList.filter((_, i) => i !== idx);
                                     setLocationsList(updated);
                                     localStorage.setItem('fast_sheep_locations', JSON.stringify(updated));
                                     if (selectedLocation === loc) {
                                       setSelectedLocation('');
                                     }
-                                    showToast(language === 'es' ? 'Ubicación eliminada.' : 'Location deleted.', 'success');
+                                    showToast(language === 'es' ? 'UbicaciÃÂ³n eliminada.' : 'Location deleted.', 'success');
                                   }
                                 }}
                               >
-                                🗑️
+                                Ã°ÂÂÂÃ¯Â¸Â
                               </button>
                             </div>
                           </>
@@ -14328,17 +14363,17 @@ USING (true);`;
             <div className="modal-content" style={{ maxWidth: '650px' }}>
               <div className="modal-header">
                 <h3>{selectedProductId ? t.edit : t.registerItem}</h3>
-                <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+                <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
               </div>
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                 <div className="form-group">
-                  <label className="form-label">{language === 'es' ? 'Categoría' : 'Category'}</label>
+                  <label className="form-label">{language === 'es' ? 'CategorÃÂ­a' : 'Category'}</label>
                   <select className="form-control" value={prodFormCategory} disabled={!!selectedProductId}
                     onChange={e => {
                       const newCatId = e.target.value;
                       setProdFormCategory(newCatId);
 
-                      // If it's a unique category (Bicicleta, Batería, Candado), force generic to false!
+                      // If it's a unique category (Bicicleta, BaterÃÂ­a, Candado), force generic to false!
                       const isUniqueCat = newCatId === catBikeId || newCatId === catBattId || newCatId === catLockId;
                       if (isUniqueCat) {
                         setProdFormIsGeneric(false);
@@ -14455,7 +14490,7 @@ USING (true);`;
                       }} 
                     />
                     <label htmlFor="prodFormIsGeneric" style={{ cursor: 'pointer', fontWeight: 600, color: 'var(--text-bright)', margin: 0, fontSize: '14px' }}>
-                      {language === 'es' ? 'Es un artículo genérico' : 'Is a generic article'}
+                      {language === 'es' ? 'Es un artÃÂ­culo genÃÂ©rico' : 'Is a generic article'}
                     </label>
                   </div>
                 )}
@@ -14483,12 +14518,12 @@ USING (true);`;
                             .map(pf => <option key={pf.id} value={pf.id}>{pf.prefix}</option>)}
                         </select>
                         <button type="button" className="btn-secondary" style={{ padding: '0 12px', minWidth: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={() => setModalType('prefix')} title={language === 'es' ? 'Agregar Prefijo' : 'Add Prefix'}>
-                          ➕
+                          Ã¢ÂÂ
                         </button>
                       </div>
                     </div>
                     <div className="form-group">
-                      <label className="form-label">{language === 'es' ? 'Código / SKU del Lote' : 'Batch Code / SKU'}</label>
+                      <label className="form-label">{language === 'es' ? 'CÃÂ³digo / SKU del Lote' : 'Batch Code / SKU'}</label>
                       <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                         {(() => {
                           const selPrefix = prefixes.find(pf => pf.id === prodFormPrefixId);
@@ -14543,13 +14578,13 @@ USING (true);`;
                             .map(pf => <option key={pf.id} value={pf.id}>{pf.prefix}</option>)}
                         </select>
                         <button type="button" className="btn-secondary" style={{ padding: '0 12px', minWidth: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={() => setModalType('prefix')} title={language === 'es' ? 'Agregar Prefijo' : 'Add Prefix'}>
-                          ➕
+                          Ã¢ÂÂ
                         </button>
                       </div>
                     </div>
 
                     <div className="form-group">
-                      <label className="form-label">{language === 'es' ? 'Código / ID Único' : 'Unique Code / ID'}</label>
+                      <label className="form-label">{language === 'es' ? 'CÃÂ³digo / ID ÃÂnico' : 'Unique Code / ID'}</label>
                       <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                         {(() => {
                           const selPrefix = prefixes.find(pf => pf.id === prodFormPrefixId);
@@ -14580,7 +14615,7 @@ USING (true);`;
                 )}
 
                 <div className="form-group" style={{ marginBottom: '8px' }}>
-                  <label className="form-label">{language === 'es' ? 'Color de Identificación' : 'Identification Color'}</label>
+                  <label className="form-label">{language === 'es' ? 'Color de IdentificaciÃÂ³n' : 'Identification Color'}</label>
                   <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap', background: 'rgba(255,255,255,0.03)', padding: '10px 14px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
                     {[
                       { hex: '#6366f1', name: 'Indigo' },
@@ -14639,33 +14674,33 @@ USING (true);`;
 
                 <div className="form-grid">
                   <div className="form-group">
-                    <label className="form-label">{prodFormIsGeneric ? (language === 'es' ? 'Costo por unidad (€)' : 'Unit Cost (€)') : (language === 'es' ? 'Costo (€)' : 'Acquisition Cost (€)')}</label>
+                    <label className="form-label">{prodFormIsGeneric ? (language === 'es' ? 'Costo por unidad (Ã¢ÂÂ¬)' : 'Unit Cost (Ã¢ÂÂ¬)') : (language === 'es' ? 'Costo (Ã¢ÂÂ¬)' : 'Acquisition Cost (Ã¢ÂÂ¬)')}</label>
                     <input type="number" className="form-control" value={prodFormPricePaid} onChange={e => setProdFormPricePaid(Number(e.target.value))} />
                     <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px', cursor: 'pointer', fontSize: '13px', color: 'var(--text-bright)' }}>
-                      <input type="checkbox" checked={prodFormAddBat} onChange={e => setProdFormAddBat(e.target.checked)} style={{ width: '16px', height: '16px', cursor: 'pointer' }} />
-                      {language === 'es' ? 'Agregar BAT (23% impuestos)' : 'Add BAT (23% tax)'}
-                    </label>
-                    {(prodFormAddBat || prodFormIsGeneric) && (() => {
-                      const base = prodFormPricePaid || 0;
-                      const qty = prodFormQuantity > 0 ? prodFormQuantity : 1;
-                      const bat = prodFormAddBat ? Math.round(base * 0.23 * 100) / 100 : 0;
-                      const unitCost = base + bat;
-                      const purchaseTotal = unitCost * qty;
-                      return (
-                        <div style={{ marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '2px', fontSize: '12px', color: 'var(--text-muted)', background: 'rgba(16, 185, 129, 0.05)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(16, 185, 129, 0.1)' }}>
-                          {prodFormAddBat && (
-                            <>
-                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>{language === 'es' ? 'Coste por unidad' : 'Unit cost'}</span><span>€{base.toLocaleString()}</span></div>
-                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>BAT (23%)</span><span>€{bat.toLocaleString()}</span></div>
-                              <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '3px', marginTop: '2px', color: 'var(--text-bright)', fontWeight: 700 }}>
-                                <span>{prodFormIsGeneric ? (language === 'es' ? 'Total por unidad' : 'Unit total') : 'Total'}</span><span>€{unitCost.toLocaleString()}</span>
-                              </div>
-                            </>
-                          )}
+                    <input type="checkbox" checked={prodFormAddVat} onChange={e => setProdFormAddVat(e.target.checked)} style={{ width: '16px', height: '16px', cursor: 'pointer' }} />
+                    {language === 'es' ? 'Agregar VAT (23% impuestos)' : 'Add VAT (23% tax)'}
+                  </label>
+                  {(prodFormAddVat || prodFormIsGeneric) && (() => {
+                    const base = prodFormPricePaid || 0;
+                    const qty = prodFormQuantity > 0 ? prodFormQuantity : 1;
+                    const vat = prodFormAddVat ? Math.round(base * 0.23 * 100) / 100 : 0;
+                    const unitCost = base + vat;
+                    const purchaseTotal = unitCost * qty;
+                    return (
+                      <div style={{ marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '2px', fontSize: '12px', color: 'var(--text-muted)', background: 'rgba(16, 185, 129, 0.05)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(16, 185, 129, 0.1)' }}>
+                        {prodFormAddVat && (
+                          <>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>{language === 'es' ? 'Coste por unidad' : 'Unit cost'}</span><span>Ã¢ÂÂ¬{base.toLocaleString()}</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>VAT (23%)</span><span>Ã¢ÂÂ¬{vat.toLocaleString()}</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '3px', marginTop: '2px', color: 'var(--text-bright)', fontWeight: 700 }}>
+                              <span>{prodFormIsGeneric ? (language === 'es' ? 'Total por unidad' : 'Unit total') : 'Total'}</span><span>Ã¢ÂÂ¬{unitCost.toLocaleString()}</span>
+                            </div>
+                          </>
+                        )}
                           {prodFormIsGeneric && (
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: prodFormAddBat ? '1px solid rgba(255,255,255,0.08)' : 'none', paddingTop: prodFormAddBat ? '4px' : '0', marginTop: prodFormAddBat ? '2px' : '0' }}>
-                              <span>{language === 'es' ? 'Total de la compra' : 'Total purchase'} ({qty} {language === 'es' ? 'uds' : 'units'} × €{unitCost.toLocaleString()})</span>
-                              <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{purchaseTotal.toLocaleString()}</strong>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: prodFormAddVat ? '1px solid rgba(255,255,255,0.08)' : 'none', paddingTop: prodFormAddVat ? '4px' : '0', marginTop: prodFormAddVat ? '2px' : '0' }}>
+                              <span>{language === 'es' ? 'Total de la compra' : 'Total purchase'} ({qty} {language === 'es' ? 'uds' : 'units'} ÃÂ Ã¢ÂÂ¬{unitCost.toLocaleString()})</span>
+                              <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>Ã¢ÂÂ¬{purchaseTotal.toLocaleString()}</strong>
                             </div>
                           )}
                         </div>
@@ -14673,12 +14708,12 @@ USING (true);`;
                     })()}
                   </div>
                   <div className="form-group">
-                    <label className="form-label">{language === 'es' ? 'Precio de Venta (€)' : 'Sale Price (€)'}</label>
+                    <label className="form-label">{language === 'es' ? 'Precio de Venta (Ã¢ÂÂ¬)' : 'Sale Price (Ã¢ÂÂ¬)'}</label>
                     <input type="number" className="form-control" value={prodFormPriceSold ?? ''} onChange={e => setProdFormPriceSold(e.target.value ? Number(e.target.value) : null)} placeholder={language === 'es' ? 'Opcional' : 'Optional'} />
                   </div>
                   {prodFormCategory === catBikeId && (
                     <div className="form-group">
-                      <label className="form-label">{language === 'es' ? 'Tarifa Semanal Sugerida (€)' : 'Suggested Weekly Rate (€)'}</label>
+                      <label className="form-label">{language === 'es' ? 'Tarifa Semanal Sugerida (Ã¢ÂÂ¬)' : 'Suggested Weekly Rate (Ã¢ÂÂ¬)'}</label>
                       <input type="number" className="form-control" value={prodFormWeeklyRate} onChange={e => setProdFormWeeklyRate(Number(e.target.value))} />
                     </div>
                   )}
@@ -14687,13 +14722,13 @@ USING (true);`;
                 {/* E-Bike specific */}
                 {prodFormCategory === catBikeId && (
                   <div style={{ background: 'rgba(0,0,0,0.1)', padding: '16px', borderRadius: '12px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                    <h4 style={{ color: 'var(--color-primary)' }}>{language === 'es' ? 'Especificaciones Técnicas de E-Bike' : 'E-Bike Technical Specs'}</h4>
+                    <h4 style={{ color: 'var(--color-primary)' }}>{language === 'es' ? 'Especificaciones TÃÂ©cnicas de E-Bike' : 'E-Bike Technical Specs'}</h4>
                     <div className="form-grid">
                       <div className="form-group"><label className="form-label">{t.brand}</label><input type="text" className="form-control" value={prodFormBrand} onChange={e => setProdFormBrand(e.target.value)} /></div>
                       <div className="form-group"><label className="form-label">{t.model}</label><input type="text" className="form-control" value={prodFormModel} onChange={e => setProdFormModel(e.target.value)} /></div>
                       <div className="form-group"><label className="form-label">{t.frameSerial}</label><input type="text" className="form-control" value={prodFormFrame} onChange={e => setProdFormFrame(e.target.value)} /></div>
                       <div className="form-group"><label className="form-label">{language === 'es' ? 'Kilometraje (KM)' : 'Odometer (KM)'}</label><input type="number" className="form-control" value={prodFormOdo} onChange={e => setProdFormOdo(Number(e.target.value))} /></div>
-                      <div className="form-group"><label className="form-label">{language === 'es' ? 'Nº Motor' : 'Motor Number'}</label><input type="text" className="form-control" value={prodFormMotor} onChange={e => setProdFormMotor(e.target.value)} /></div>
+                      <div className="form-group"><label className="form-label">{language === 'es' ? 'NÃÂº Motor' : 'Motor Number'}</label><input type="text" className="form-control" value={prodFormMotor} onChange={e => setProdFormMotor(e.target.value)} /></div>
                       <div className="form-group"><label className="form-label">{t.purchaseDate}</label><input type="date" className="form-control" value={prodFormPurchase} onChange={e => setProdFormPurchase(e.target.value)} /></div>
                       <div className="form-group"><label className="form-label">{t.arrivalDate}</label><input type="date" className="form-control" value={prodFormArrival} onChange={e => setProdFormArrival(e.target.value)} /></div>
                       <div className="form-group">
@@ -14713,7 +14748,7 @@ USING (true);`;
                 {/* Battery specific */}
                 {prodFormCategory === catBattId && (
                   <div style={{ background: 'rgba(0,0,0,0.1)', padding: '16px', borderRadius: '12px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                    <h4 style={{ color: 'var(--color-primary)' }}>{language === 'es' ? 'Especificaciones Técnicas de la Batería' : 'Battery Technical Specs'}</h4>
+                    <h4 style={{ color: 'var(--color-primary)' }}>{language === 'es' ? 'Especificaciones TÃÂ©cnicas de la BaterÃÂ­a' : 'Battery Technical Specs'}</h4>
                     <div className="form-grid">
                       <div className="form-group"><label className="form-label">{t.brand}</label><input type="text" className="form-control" value={prodFormBrand} onChange={e => setProdFormBrand(e.target.value)} /></div>
                       <div className="form-group"><label className="form-label">{t.model}</label><input type="text" className="form-control" value={prodFormModel} onChange={e => setProdFormModel(e.target.value)} /></div>
@@ -14729,7 +14764,7 @@ USING (true);`;
                 {/* Lock specific */}
                 {prodFormCategory === catLockId && (
                   <div style={{ background: 'rgba(0,0,0,0.1)', padding: '16px', borderRadius: '12px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                    <h4 style={{ color: 'var(--color-primary)' }}>{language === 'es' ? 'Especificaciones Técnicas del Candado' : 'Lock Technical Specs'}</h4>
+                    <h4 style={{ color: 'var(--color-primary)' }}>{language === 'es' ? 'Especificaciones TÃÂ©cnicas del Candado' : 'Lock Technical Specs'}</h4>
                     <div className="form-grid">
                       <div className="form-group"><label className="form-label">{t.brand}</label><input type="text" className="form-control" value={prodFormBrand} onChange={e => setProdFormBrand(e.target.value)} /></div>
                       <div className="form-group"><label className="form-label">{t.model}</label><input type="text" className="form-control" value={prodFormModel} onChange={e => setProdFormModel(e.target.value)} /></div>
@@ -14761,17 +14796,17 @@ USING (true);`;
                   return (
                     <div style={{ background: 'rgba(0,0,0,0.1)', padding: '16px', borderRadius: '12px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <h4 style={{ color: 'var(--color-primary)' }}>🧩 {language === 'es' ? 'Campos Personalizados' : 'Custom Fields'}</h4>
+                        <h4 style={{ color: 'var(--color-primary)' }}>Ã°ÂÂ§Â© {language === 'es' ? 'Campos Personalizados' : 'Custom Fields'}</h4>
                         <button type="button" className="btn-secondary btn-xs" onClick={() => {
                           setAddCFTargetCategory(prodFormCategory);
                           setAddCFNewName(''); setAddCFNewType('text');
                           setAddCFSource('product');
                           setAddCFModalOpen(true);
-                        }}>➕ {language === 'es' ? 'Agregar Campo' : 'Add Field'}</button>
+                        }}>Ã¢ÂÂ {language === 'es' ? 'Agregar Campo' : 'Add Field'}</button>
                       </div>
                       {catFields.length === 0 ? (
                         <p style={{ color: 'var(--text-muted)', fontStyle: 'italic', fontSize: '13px', margin: 0 }}>
-                          {language === 'es' ? 'No hay campos personalizados para esta categoría.' : 'No custom fields for this category.'}
+                          {language === 'es' ? 'No hay campos personalizados para esta categorÃÂ­a.' : 'No custom fields for this category.'}
                         </p>
                       ) : (
                         <div className="form-grid">
@@ -14803,7 +14838,7 @@ USING (true);`;
                                     e.currentTarget.style.backgroundColor = 'transparent';
                                   }}
                                   onClick={async () => {
-                                    if (!await asyncConfirm(language === 'es' ? `¿Eliminar el campo "${d.field_name}"? Los valores existentes no se borrarán de los productos.` : `Delete field "${d.field_name}"? Existing values won't be removed from products.`)) return;
+                                    if (!await asyncConfirm(language === 'es' ? `ÃÂ¿Eliminar el campo "${d.field_name}"? Los valores existentes no se borrarÃÂ¡n de los productos.` : `Delete field "${d.field_name}"? Existing values won't be removed from products.`)) return;
                                     try {
                                       await deleteCustomFieldDefinition(d.id);
                                       showToast(language === 'es' ? 'Campo eliminado.' : 'Field deleted.');
@@ -14813,7 +14848,7 @@ USING (true);`;
                                     }
                                   }}
                                 >
-                                  ✕ {language === 'es' ? 'Quitar' : 'Remove'}
+                                  Ã¢ÂÂ {language === 'es' ? 'Quitar' : 'Remove'}
                                 </button>
                               </div>
                               {d.field_type === 'text' && (
@@ -14849,7 +14884,7 @@ USING (true);`;
                                     }} />
                                   </div>
                                   <span style={{ color: 'var(--text-bright)', fontSize: '14px' }}>
-                                    {prodFormCustomValues[d.field_name] ? (language === 'es' ? 'Sí' : 'Yes') : 'No'}
+                                    {prodFormCustomValues[d.field_name] ? (language === 'es' ? 'SÃÂ­' : 'Yes') : 'No'}
                                   </span>
                                 </label>
                               )}
@@ -14863,15 +14898,15 @@ USING (true);`;
 
                 {/* Product Photo Upload (all categories) */}
                 <div style={{ background: 'rgba(0,0,0,0.1)', padding: '16px', borderRadius: '12px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                  <h4 style={{ color: 'var(--color-primary)' }}>{language === 'es' ? '📷 Foto del Producto' : '📷 Product Photo'}</h4>
+                  <h4 style={{ color: 'var(--color-primary)' }}>{language === 'es' ? 'Ã°ÂÂÂ· Foto del Producto' : 'Ã°ÂÂÂ· Product Photo'}</h4>
                   {prodFormImagePreview && (
                     <div style={{ position: 'relative', width: '100%', maxWidth: '280px' }}>
                       <img src={prodFormImagePreview} alt="Product" style={{ width: '100%', borderRadius: '10px', border: '1px solid var(--border-color)' }} />
-                      <button type="button" className="btn-danger btn-xs" style={{ position: 'absolute', top: '6px', right: '6px' }} onClick={() => { setProdFormImagePreview(null); setProdFormImageFile(null); }}>✕</button>
+                      <button type="button" className="btn-danger btn-xs" style={{ position: 'absolute', top: '6px', right: '6px' }} onClick={() => { setProdFormImagePreview(null); setProdFormImageFile(null); }}>Ã¢ÂÂ</button>
                     </div>
                   )}
                   <label style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', padding: '10px 16px', background: 'var(--bg-surface)', border: '1px solid var(--border-color)', borderRadius: '8px', cursor: 'pointer', fontSize: '14px', color: 'var(--text-bright)', transition: 'border-color var(--transition-fast)' }}>
-                    📎 {language === 'es' ? 'Seleccionar Imagen' : 'Select Image'}
+                    Ã°ÂÂÂ {language === 'es' ? 'Seleccionar Imagen' : 'Select Image'}
                     <input type="file" accept="image/jpeg, image/png, image/webp" style={{ display: 'none' }} onChange={async e => {
                       const file = e.target.files?.[0];
                       if (file) {
@@ -14892,7 +14927,7 @@ USING (true);`;
                       : (prodFormIsGeneric ? prodFormSerialNo.trim().toUpperCase() : prodFormSerialNo.trim());
 
                     if (!finalSerial) {
-                      showToast(language === 'es' ? 'El código/ID de inventario es obligatorio.' : 'Inventory code/ID is required.', 'error');
+                      showToast(language === 'es' ? 'El cÃÂ³digo/ID de inventario es obligatorio.' : 'Inventory code/ID is required.', 'error');
                       return;
                     }
 
@@ -14900,7 +14935,7 @@ USING (true);`;
                     if (!prodFormIsGeneric) {
                       const duplicate = products.find(p => p.id !== (prod?.id ?? '') && p.serial_number.toLowerCase() === finalSerial.toLowerCase());
                       if (duplicate) {
-                        showToast(language === 'es' ? `El código "${finalSerial}" ya existe en el inventario.` : `Code "${finalSerial}" already exists in inventory.`, 'error');
+                        showToast(language === 'es' ? `El cÃÂ³digo "${finalSerial}" ya existe en el inventario.` : `Code "${finalSerial}" already exists in inventory.`, 'error');
                         return;
                       }
                     }
@@ -14909,7 +14944,7 @@ USING (true);`;
                     if (prodFormIsGeneric && prodFormUseDistribution) {
                       const distSum = Object.values(prodFormLocDistribution).reduce((a, b) => a + (Number(b) || 0), 0);
                       if (distSum !== prodFormQuantity) {
-                        showToast(language === 'es' ? `Distribuiste ${distSum} de ${prodFormQuantity} unidades. Asigná todas antes de guardar.` : `You distributed ${distSum} of ${prodFormQuantity} units. Assign them all before saving.`, 'error');
+                        showToast(language === 'es' ? `Distribuiste ${distSum} de ${prodFormQuantity} unidades. AsignÃÂ¡ todas antes de guardar.` : `You distributed ${distSum} of ${prodFormQuantity} units. Assign them all before saving.`, 'error');
                         return;
                       }
                     }
@@ -14925,15 +14960,15 @@ USING (true);`;
                         imageUrl = await uploadProductImage(productId, prodFormImageFile);
                       } catch (imgErr) {
                         console.error('Error uploading image:', imgErr);
-                        showToast(language === 'es' ? 'Error al subir imagen. El producto se guardará sin foto.' : 'Image upload failed. Product saved without photo.', 'error');
+                        showToast(language === 'es' ? 'Error al subir imagen. El producto se guardarÃÂ¡ sin foto.' : 'Image upload failed. Product saved without photo.', 'error');
                       }
                     } else if (!prodFormImagePreview) {
                       imageUrl = null;
                     }
 
-                    // BAT (23% tax): the input holds the base cost; the stored price_paid includes the tax.
-                    const batAmount = prodFormAddBat ? Math.round(prodFormPricePaid * 0.23 * 100) / 100 : 0;
-                    const effectiveCost = prodFormPricePaid + batAmount;
+                    // VAT (23% tax): the input holds the base cost; the stored price_paid includes the tax.
+                    const vatAmount = prodFormAddVat ? Math.round(prodFormPricePaid * 0.23 * 100) / 100 : 0;
+                    const effectiveCost = prodFormPricePaid + vatAmount;
                     const newProdBase = {
                       model_id: prodFormModelId || prod?.model_id || null,
                       serial_number: finalSerial,
@@ -14953,7 +14988,7 @@ USING (true);`;
                       purchase_date: prodFormPurchase || null, arrival_date: prodFormArrival || null,
                       key_number: prodFormKey || null,
                       factory_claim: prodFormClaim, factory_claim_notes: prodFormClaimNotes || null,
-                      maintenance_status: prod?.maintenance_status ?? 'Al día',
+                      maintenance_status: prod?.maintenance_status ?? 'Al dÃÂ­a',
                       last_service_date: prod?.last_service_date ?? null,
                       last_service_location: prod?.last_service_location ?? null,
                       next_service_date: prod?.next_service_date ?? null,
@@ -14965,8 +15000,8 @@ USING (true);`;
                       custom_field_values: {
                         ...prodFormCustomValues,
                         is_generic: prodFormIsGeneric,
-                        bat_applied: prodFormAddBat,
-                        cost_base: prodFormAddBat ? prodFormPricePaid : null,
+                        vat_applied: prodFormAddVat,
+                        cost_base: prodFormAddVat ? prodFormPricePaid : null,
                         location: selectedLocation || null,
                         location_date: selectedLocation ? selectedLocationDate : null,
                         assembly_date: prodFormAssembly || null,
@@ -14987,7 +15022,7 @@ USING (true);`;
                         });
                       }
                       
-                      const locationName = selectedLocation || 'Almacén Central';
+                      const locationName = selectedLocation || 'AlmacÃÂ©n Central';
                       const qty = prodFormQuantity > 0 ? prodFormQuantity : 1;
                       
                       if (Object.keys(finalDist).length === 0) {
@@ -15009,7 +15044,7 @@ USING (true);`;
                         id: prod?.id || productId,
                         custom_field_values: {
                           ...newProdBase.custom_field_values,
-                          location: mainLocation || 'Almacén Central',
+                          location: mainLocation || 'AlmacÃÂ©n Central',
                           location_date: selectedLocation ? selectedLocationDate : null,
                           location_distribution: finalDist
                         }
@@ -15041,8 +15076,8 @@ USING (true);`;
                   }
                 }}>
                   {prodFormSubmitting 
-                    ? (language === 'es' ? '⏳ Guardando...' : '⏳ Saving...') 
-                    : `💾 ${t.save}`}
+                    ? (language === 'es' ? 'Ã¢ÂÂ³ Guardando...' : 'Ã¢ÂÂ³ Saving...') 
+                    : `Ã°ÂÂÂ¾ ${t.save}`}
                 </button>
               </div>
             </div>
@@ -15093,15 +15128,15 @@ USING (true);`;
           <div className="modal-overlay">
             <div className="modal-content" style={{ maxWidth: '650px', width: '90%' }}>
               <div className="modal-header">
-                <h3>💶 {t.markSold}</h3>
-                <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+                <h3>Ã°ÂÂÂ¶ {t.markSold}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
               </div>
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px', maxHeight: '80vh', overflowY: 'auto', paddingRight: '4px' }}>
                 
                 {/* 1. SELECCION DE PRODUCTOS */}
                 <div style={{ background: 'rgba(255, 255, 255, 0.03)', padding: '16px', borderRadius: '12px', border: '1px solid rgba(255, 255, 255, 0.05)' }}>
                   <h4 style={{ margin: '0 0 12px 0', fontSize: '15px', display: 'flex', justifySelf: 'stretch', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span>📦 {language === 'es' ? 'Productos a Vender' : 'Products to Sell'}</span>
+                    <span>Ã°ÂÂÂ¦ {language === 'es' ? 'Productos a Vender' : 'Products to Sell'}</span>
                     <span className="badge status-available">{soldProducts.length}</span>
                   </h4>
                   
@@ -15111,7 +15146,7 @@ USING (true);`;
                         <div>
                           <strong style={{ color: 'var(--color-primary)' }}>{p.serial_number}</strong> - {p.name}
                           <span style={{ marginLeft: '8px', color: 'var(--text-muted)', fontSize: '12px' }}>
-                            (Coste: €{p.price_paid})
+                            (Coste: Ã¢ÂÂ¬{p.price_paid})
                           </span>
                           {(() => {
                             const isGeneric = isProductGeneric(p);
@@ -15136,7 +15171,7 @@ USING (true);`;
                             return (
                               <div style={{ marginTop: '6px', display: 'flex', alignItems: 'center', gap: '6px' }}>
                                 <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-                                  📍 {language === 'es' ? 'Vender desde:' : 'Sell from:'}
+                                  Ã°ÂÂÂ {language === 'es' ? 'Vender desde:' : 'Sell from:'}
                                 </span>
                                 <select
                                   className="form-control"
@@ -15177,31 +15212,7 @@ USING (true);`;
                             }}
                           />
                           {soldProducts.length > 1 && (
-                            <button className="btn-xs btn-secondary" style={{ color: '#ef4444', padding: '2px 6px', height: '26px' }} onClick={async () => {
-                              if (p.category_id === catLockId) {
-                                const bikeId = p.custom_field_values?.associated_bike_id as string;
-                                if (bikeId && soldProducts.some(item => item.id === bikeId)) {
-                                  const msg = language === 'es'
-                                    ? '¿Deseas desvincular el candado de la bicicleta para vender la bicicleta sola?'
-                                    : 'Do you want to unlink the lock from the bike to sell the bike alone?';
-                                  if (!window.confirm(msg)) {
-                                    return;
-                                  }
-                                  try {
-                                    const updatedLock = {
-                                      ...p,
-                                      custom_field_values: {
-                                        ...p.custom_field_values,
-                                        associated_bike_id: undefined
-                                      }
-                                    };
-                                    await upsertProduct(updatedLock);
-                                    triggerReload();
-                                  } catch (err) {
-                                    console.error('Error unlinking lock from sold list:', err);
-                                  }
-                                }
-                              }
+                            <button className="btn-xs btn-secondary" style={{ color: '#ef4444', padding: '2px 6px', height: '26px' }} onClick={() => {
                               const filtered = soldProducts.filter(item => item.id !== p.id);
                               setSoldProducts(filtered);
                               setSoldProductPrices(prev => {
@@ -15211,16 +15222,16 @@ USING (true);`;
                                 setSoldFormPrice(newSum);
                                 return next;
                               });
-                            }}>✕</button>
+                            }}>Ã¢ÂÂ</button>
                           )}
                         </div>
                       </div>
                     ))}
                   </div>
 
-                  {/* Agregar más productos */}
+                  {/* Agregar mÃÂ¡s productos */}
                   <div className="form-group" style={{ position: 'relative', margin: 0 }}>
-                    <label className="form-label" style={{ fontSize: '12px' }}>{language === 'es' ? '➕ Agregar otro producto a esta venta' : '➕ Add another product to this sale'}</label>
+                    <label className="form-label" style={{ fontSize: '12px' }}>{language === 'es' ? 'Ã¢ÂÂ Agregar otro producto a esta venta' : 'Ã¢ÂÂ Add another product to this sale'}</label>
                     <input 
                       type="text" 
                       className="form-control" 
@@ -15246,12 +15257,12 @@ USING (true);`;
                                 return next;
                               });
                               const pDist = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
-                              const pLoc = pDist ? Object.entries(pDist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central' : (p.custom_field_values?.location as string || 'Almacén Central');
+                              const pLoc = pDist ? Object.entries(pDist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'AlmacÃÂ©n Central' : (p.custom_field_values?.location as string || 'AlmacÃÂ©n Central');
                               setSoldProductLocations(prev => ({ ...prev, [p.id]: pLoc }));
                             }}
                           >
                             <span><strong>{p.serial_number}</strong> - {p.name}</span>
-                            <span style={{ color: 'var(--color-primary)', fontWeight: 600 }}>€{p.price_sold ?? (p.price_paid ? Math.round(p.price_paid * 1.5) : 500)}</span>
+                            <span style={{ color: 'var(--color-primary)', fontWeight: 600 }}>Ã¢ÂÂ¬{p.price_sold ?? (p.price_paid ? Math.round(p.price_paid * 1.5) : 500)}</span>
                           </div>
                         ))}
                       </div>
@@ -15262,7 +15273,7 @@ USING (true);`;
                 {/* 2. DATOS COMUNES */}
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
                   <div className="form-group">
-                    <label className="form-label">{t.salePrice} Total (€)</label>
+                    <label className="form-label">{t.salePrice} Total (Ã¢ÂÂ¬)</label>
                     <input 
                       type="number" 
                       className="form-control" 
@@ -15279,11 +15290,11 @@ USING (true);`;
 
                 {/* 3. IDIOMA EMAIL */}
                 <div className="form-group">
-                  <label className="form-label">🌐 {language === 'es' ? 'Idioma del Correo' : 'Email Language'}</label>
+                  <label className="form-label">Ã°ÂÂÂ {language === 'es' ? 'Idioma del Correo' : 'Email Language'}</label>
                   <div style={{ display: 'flex', gap: '20px', marginTop: '4px' }}>
                     <label style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}>
                       <input type="radio" checked={soldEmailLang === 'es'} onChange={() => setSoldEmailLang('es')} />
-                      Español (ES)
+                      EspaÃÂ±ol (ES)
                     </label>
                     <label style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}>
                       <input type="radio" checked={soldEmailLang === 'en'} onChange={() => setSoldEmailLang('en')} />
@@ -15291,7 +15302,7 @@ USING (true);`;
                     </label>
                     <label style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}>
                       <input type="radio" checked={soldEmailLang === 'pt'} onChange={() => setSoldEmailLang('pt')} />
-                      Português (PT)
+                      PortuguÃÂªs (PT)
                     </label>
                   </div>
                 </div>
@@ -15299,7 +15310,7 @@ USING (true);`;
                 {/* 4. FORMA DE PAGO */}
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
                   <div className="form-group" style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
-                    <label className="form-label" style={{ fontWeight: 600, marginBottom: '8px' }}>💳 {language === 'es' ? 'Forma de Pago' : 'Payment Type'}</label>
+                    <label className="form-label" style={{ fontWeight: 600, marginBottom: '8px' }}>Ã°ÂÂÂ³ {language === 'es' ? 'Forma de Pago' : 'Payment Type'}</label>
                     <div style={{ display: 'flex', gap: '24px' }}>
                       <label style={{ fontSize: '15px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px' }}>
                         <input 
@@ -15309,7 +15320,7 @@ USING (true);`;
                           onChange={() => setSoldPaymentType('contado')}
                           style={{ scale: '1.2' }} 
                         />
-                        💶 {language === 'es' ? 'De Contado' : 'Cash'}
+                        Ã°ÂÂÂ¶ {language === 'es' ? 'De Contado' : 'Cash'}
                       </label>
                       <label style={{ fontSize: '15px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px' }}>
                         <input 
@@ -15319,13 +15330,14 @@ USING (true);`;
                           onChange={() => setSoldPaymentType('financiado')}
                           style={{ scale: '1.2' }} 
                         />
-                        📅 {language === 'es' ? 'Financiado' : 'Financed'}
+                        Ã°ÂÂÂ
+ {language === 'es' ? 'Financiado' : 'Financed'}
                       </label>
                     </div>
                   </div>
 
                   <div className="form-group" style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
-                    <label className="form-label" style={{ fontWeight: 600, marginBottom: '8px' }}>💵 {language === 'es' ? 'Recibido Vía' : 'Received Via'}</label>
+                    <label className="form-label" style={{ fontWeight: 600, marginBottom: '8px' }}>Ã°ÂÂÂµ {language === 'es' ? 'Recibido VÃÂ­a' : 'Received Via'}</label>
                     <div style={{ display: 'flex', gap: '24px' }}>
                       <label style={{ fontSize: '15px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px' }}>
                         <input 
@@ -15335,7 +15347,7 @@ USING (true);`;
                           onChange={() => setSoldReceivedVia('efectivo')}
                           style={{ scale: '1.2' }} 
                         />
-                        💵 {language === 'es' ? 'Efectivo' : 'Cash'}
+                        Ã°ÂÂÂµ {language === 'es' ? 'Efectivo' : 'Cash'}
                       </label>
                       <label style={{ fontSize: '15px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px' }}>
                         <input 
@@ -15345,7 +15357,7 @@ USING (true);`;
                           onChange={() => setSoldReceivedVia('transferencia')}
                           style={{ scale: '1.2' }} 
                         />
-                        🏦 {language === 'es' ? 'Transferencia' : 'Transfer'}
+                        Ã°ÂÂÂ¦ {language === 'es' ? 'Transferencia' : 'Transfer'}
                       </label>
                     </div>
                   </div>
@@ -15355,19 +15367,19 @@ USING (true);`;
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', background: soldPaymentType === 'financiado' ? 'rgba(139, 92, 246, 0.04)' : 'rgba(255, 255, 255, 0.02)', padding: '16px', borderRadius: '12px', border: soldPaymentType === 'financiado' ? '1px solid rgba(139, 92, 246, 0.15)' : '1px solid var(--border-color)' }}>
                   
                   <strong style={{ color: 'var(--text-bright)' }}>
-                    👤 {soldPaymentType === 'financiado' 
+                    Ã°ÂÂÂ¤ {soldPaymentType === 'financiado' 
                       ? (language === 'es' ? 'Datos del Cliente (Obligatorios)' : 'Customer Details (Required)')
-                      : (language === 'es' ? 'Datos del Cliente (Opcional - para enviar correo de confirmación)' : 'Customer Details (Optional - for email confirmation)')}
+                      : (language === 'es' ? 'Datos del Cliente (Opcional - para enviar correo de confirmaciÃÂ³n)' : 'Customer Details (Optional - for email confirmation)')}
                   </strong>
 
                   {/* AUTOCOMPLETE / CLIENT SEARCH */}
                   <div className="form-group" style={{ position: 'relative', margin: 0 }}>
-                    <label className="form-label" style={{ fontWeight: 600 }}>🔍 {language === 'es' ? 'Buscar Cliente Registrado' : 'Search Registered Customer'}</label>
+                    <label className="form-label" style={{ fontWeight: 600 }}>Ã°ÂÂÂ {language === 'es' ? 'Buscar Cliente Registrado' : 'Search Registered Customer'}</label>
                     <div style={{ display: 'flex', gap: '8px' }}>
                       <input 
                         type="text" 
                         className="form-control" 
-                        placeholder={language === 'es' ? 'Buscar por nombre, email o teléfono...' : 'Search by name, email or phone...'}
+                        placeholder={language === 'es' ? 'Buscar por nombre, email o telÃÂ©fono...' : 'Search by name, email or phone...'}
                         value={soldCustomerSearch}
                         onChange={e => setSoldCustomerSearch(e.target.value)}
                       />
@@ -15400,7 +15412,7 @@ USING (true);`;
                             }}
                           >
                             <strong>{c.first_name} {c.last_name}</strong>
-                            <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>✉️ {c.email} | 📞 {c.phone}</span>
+                            <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Ã¢ÂÂÃ¯Â¸Â {c.email} | Ã°ÂÂÂ {c.phone}</span>
                           </div>
                         ))}
                       </div>
@@ -15422,7 +15434,7 @@ USING (true);`;
                       <input type="email" className="form-control" value={soldCustomerEmail} onChange={e => setSoldCustomerEmail(e.target.value)} disabled={!!soldCustomerId} />
                     </div>
                     <div className="form-group">
-                      <label className="form-label">{language === 'es' ? 'Teléfono' : 'Phone'}</label>
+                      <label className="form-label">{language === 'es' ? 'TelÃÂ©fono' : 'Phone'}</label>
                       <input type="text" className="form-control" value={soldCustomerPhone} onChange={e => setSoldCustomerPhone(e.target.value)} disabled={!!soldCustomerId} />
                     </div>
                   </div>
@@ -15432,11 +15444,11 @@ USING (true);`;
                     <>
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '12px' }}>
                         <div className="form-group">
-                          <label className="form-label">💶 {language === 'es' ? 'Monto Entrada' : 'Down Payment'}</label>
+                          <label className="form-label">Ã°ÂÂÂ¶ {language === 'es' ? 'Monto Entrada' : 'Down Payment'}</label>
                           <input type="number" className="form-control" value={soldDownPayment} onChange={e => setSoldDownPayment(Number(e.target.value))} />
                         </div>
                         <div className="form-group">
-                          <label className="form-label">🔢 {language === 'es' ? 'Cantidad Cuotas' : 'Installments'}</label>
+                          <label className="form-label">Ã°ÂÂÂ¢ {language === 'es' ? 'Cantidad Cuotas' : 'Installments'}</label>
                           <input
                             type="number"
                             className="form-control"
@@ -15447,7 +15459,8 @@ USING (true);`;
                           />
                         </div>
                         <div className="form-group">
-                          <label className="form-label">📅 {language === 'es' ? 'Frecuencia' : 'Frequency'}</label>
+                          <label className="form-label">Ã°ÂÂÂ
+ {language === 'es' ? 'Frecuencia' : 'Frequency'}</label>
                           <div style={{ display: 'flex', gap: '12px', marginTop: '6px' }}>
                             <label style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', fontSize: '13px' }}>
                               <input type="radio" checked={soldFrequency === 'semanal'} onChange={() => setSoldFrequency('semanal')} />
@@ -15463,13 +15476,13 @@ USING (true);`;
 
                       {/* PLAN SUMMARY */}
                       <div style={{ background: 'rgba(139, 92, 246, 0.1)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(139, 92, 246, 0.2)', fontSize: '13px', lineHeight: '1.5' }}>
-                        <strong style={{ color: '#a78bfa', display: 'block', marginBottom: '4px' }}>📊 {language === 'es' ? 'Resumen del Financiamiento' : 'Financing Plan Summary'}</strong>
-                        <div>• {language === 'es' ? 'Total Venta' : 'Total Sale'}: <strong>€{soldFormPrice}</strong></div>
-                        <div>• {language === 'es' ? 'Entrada (Hoy)' : 'Down Payment (Today)'}: <strong>€{soldDownPayment}</strong></div>
-                        <div>• {language === 'es' ? 'Monto a Financiar' : 'Financed Balance'}: <strong>€{totalFinanced}</strong></div>
-                        <div>• {language === 'es' ? 'Cuotas' : 'Installments'}: <strong>{soldInstallments} cuotas de €{installmentAmount}</strong> ({soldFrequency === 'semanal' ? 'semanal' : 'mensual'} sin interés)</div>
+                        <strong style={{ color: '#a78bfa', display: 'block', marginBottom: '4px' }}>Ã°ÂÂÂ {language === 'es' ? 'Resumen del Financiamiento' : 'Financing Plan Summary'}</strong>
+                        <div>Ã¢ÂÂ¢ {language === 'es' ? 'Total Venta' : 'Total Sale'}: <strong>Ã¢ÂÂ¬{soldFormPrice}</strong></div>
+                        <div>Ã¢ÂÂ¢ {language === 'es' ? 'Entrada (Hoy)' : 'Down Payment (Today)'}: <strong>Ã¢ÂÂ¬{soldDownPayment}</strong></div>
+                        <div>Ã¢ÂÂ¢ {language === 'es' ? 'Monto a Financiar' : 'Financed Balance'}: <strong>Ã¢ÂÂ¬{totalFinanced}</strong></div>
+                        <div>Ã¢ÂÂ¢ {language === 'es' ? 'Cuotas' : 'Installments'}: <strong>{soldInstallments} cuotas de Ã¢ÂÂ¬{installmentAmount}</strong> ({soldFrequency === 'semanal' ? 'semanal' : 'mensual'} sin interÃÂ©s)</div>
                         {firstInstallmentDate && (
-                          <div>• {language === 'es' ? 'Primer Vencimiento' : 'First Due Date'}: <strong style={{ color: '#f59e0b' }}>{firstInstallmentDate}</strong></div>
+                          <div>Ã¢ÂÂ¢ {language === 'es' ? 'Primer Vencimiento' : 'First Due Date'}: <strong style={{ color: '#f59e0b' }}>{firstInstallmentDate}</strong></div>
                         )}
                       </div>
                     </>
@@ -15482,7 +15495,7 @@ USING (true);`;
                   onClick={async () => {
                     if (soldPaymentType === 'financiado') {
                       if (!soldCustomerFirstName.trim() || !soldCustomerPhone.trim() || !soldCustomerEmail.trim()) {
-                        showToast(language === 'es' ? 'Por favor complete los datos obligatorios del cliente (Nombre, Email, Teléfono).' : 'Please fill in required customer details (Name, Email, Phone).', 'error');
+                        showToast(language === 'es' ? 'Por favor complete los datos obligatorios del cliente (Nombre, Email, TelÃÂ©fono).' : 'Please fill in required customer details (Name, Email, Phone).', 'error');
                         return;
                       }
                     }
@@ -15509,8 +15522,8 @@ USING (true);`;
                             referral_source: soldPaymentType === 'financiado' ? 'Financiamiento Modal' : 'Venta de Contado',
                             id_document_url: '',
                             notes: soldPaymentType === 'financiado' 
-                              ? 'Cliente registrado automáticamente durante venta financiada.'
-                              : 'Cliente registrado automáticamente durante venta de contado.',
+                              ? 'Cliente registrado automÃÂ¡ticamente durante venta financiada.'
+                              : 'Cliente registrado automÃÂ¡ticamente durante venta de contado.',
                             created_at: new Date().toISOString()
                           };
                           await upsertCustomer(newCust);
@@ -15560,7 +15573,7 @@ USING (true);`;
                         const actualUnitPrice = soldProductPrices[p.id] ?? p.price_sold ?? (p.price_paid ? Math.round(p.price_paid * 1.5) : 500);
                         const statusToSet = soldPaymentType === 'financiado' ? 'Financiada' : 'Vendida';
                         const isGeneric = isProductGeneric(p);
-                        const selectedLoc = soldProductLocations[p.id] || 'Almacén Central';
+                        const selectedLoc = soldProductLocations[p.id] || 'AlmacÃÂ©n Central';
                         const dist = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
                         const totalQty = dist ? Object.values(dist).reduce((a, b) => a + b, 0) : 0;
 
@@ -15634,7 +15647,7 @@ USING (true);`;
                                 ...targetProduct,
                                 custom_field_values: { 
                                   ...targetProduct.custom_field_values, 
-                                  location: mainLocation || 'Almacén Central',
+                                  location: mainLocation || 'AlmacÃÂ©n Central',
                                   location_distribution: updatedDist 
                                 }
                               });
@@ -15685,7 +15698,7 @@ USING (true);`;
                           // Standard non-generic (unique item)
                           if (dist && totalQty > 1) {
                             const splitId = crypto.randomUUID();
-                            const mainLoc = Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central';
+                            const mainLoc = Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'AlmacÃÂ©n Central';
                             
                             await applyUpsert({
                               ...p,
@@ -15786,8 +15799,8 @@ USING (true);`;
                           const bikeSerials = soldProducts.map(p => p.serial_number).join(', ');
                           const reminderEvent = {
                             id: crypto.randomUUID(),
-                            title: `💳 Cuota 1/${soldInstallments}: ${soldCustomerFirstName} ${soldCustomerLastName}`,
-                            description: `Vencimiento de la primera cuota del financiamiento por la compra de: ${bikeSerials}. Monto: €${installmentAmount}.`,
+                            title: `Ã°ÂÂÂ³ Cuota 1/${soldInstallments}: ${soldCustomerFirstName} ${soldCustomerLastName}`,
+                            description: `Vencimiento de la primera cuota del financiamiento por la compra de: ${bikeSerials}. Monto: Ã¢ÂÂ¬${installmentAmount}.`,
                             event_date: firstInstallmentDate,
                             remind_one_week: true,
                             remind_one_day: true,
@@ -15812,8 +15825,8 @@ USING (true);`;
 
                       showToast(
                         soldPaymentType === 'financiado' 
-                          ? '¡Venta financiada registrada con éxito!' 
-                          : '¡Venta de contado registrada con éxito!',
+                          ? 'ÃÂ¡Venta financiada registrada con ÃÂ©xito!' 
+                          : 'ÃÂ¡Venta de contado registrada con ÃÂ©xito!',
                         'success'
                       );
                       triggerReload();
@@ -15827,8 +15840,8 @@ USING (true);`;
                   }}
                 >
                   {soldSubmitting 
-                    ? (language === 'es' ? '⏳ Registrando...' : '⏳ Registering...') 
-                    : `💶 ${language === 'es' ? 'Confirmar Venta' : 'Confirm Sale'}`}
+                    ? (language === 'es' ? 'Ã¢ÂÂ³ Registrando...' : 'Ã¢ÂÂ³ Registering...') 
+                    : `Ã°ÂÂÂ¶ ${language === 'es' ? 'Confirmar Venta' : 'Confirm Sale'}`}
                 </button>
               </div>
             </div>
@@ -15856,27 +15869,27 @@ USING (true);`;
           <div className="modal-overlay">
             <div className="modal-content" style={{ maxWidth: '600px', width: '95%' }}>
               <div className="modal-header">
-                <h3>💳 {language === 'es' ? 'Detalles del Financiamiento' : 'Financing Plan Details'}</h3>
-                <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+                <h3>Ã°ÂÂÂ³ {language === 'es' ? 'Detalles del Financiamiento' : 'Financing Plan Details'}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
               </div>
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px', maxHeight: '75vh', overflowY: 'auto' }}>
                 
                 {/* 1. PRODUCT & CLIENT SUMMARY */}
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', background: 'rgba(255,255,255,0.03)', padding: '16px', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.05)' }}>
                   <div>
-                    <h4 style={{ margin: '0 0 8px 0', color: '#a78bfa' }}>📦 {language === 'es' ? 'Producto' : 'Product'}</h4>
+                    <h4 style={{ margin: '0 0 8px 0', color: '#a78bfa' }}>Ã°ÂÂÂ¦ {language === 'es' ? 'Producto' : 'Product'}</h4>
                     <div><strong>{prod.serial_number}</strong> - {prod.name}</div>
                     <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
-                      {language === 'es' ? 'Coste' : 'Acq. Cost'}: €{prod.price_paid} | {language === 'es' ? 'Precio venta' : 'Sale Price'}: €{prod.price_sold}
+                      {language === 'es' ? 'Coste' : 'Acq. Cost'}: Ã¢ÂÂ¬{prod.price_paid} | {language === 'es' ? 'Precio venta' : 'Sale Price'}: Ã¢ÂÂ¬{prod.price_sold}
                     </div>
                   </div>
                   <div>
-                    <h4 style={{ margin: '0 0 8px 0', color: '#a78bfa' }}>👤 {language === 'es' ? 'Cliente' : 'Customer'}</h4>
+                    <h4 style={{ margin: '0 0 8px 0', color: '#a78bfa' }}>Ã°ÂÂÂ¤ {language === 'es' ? 'Cliente' : 'Customer'}</h4>
                     {cust ? (
                       <>
                         <div><strong>{cust.first_name} {cust.last_name}</strong></div>
-                        <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>✉️ {cust.email}</div>
-                        <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>📞 {cust.phone}</div>
+                        <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>Ã¢ÂÂÃ¯Â¸Â {cust.email}</div>
+                        <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Ã°ÂÂÂ {cust.phone}</div>
                       </>
                     ) : (
                       <div style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>Sin cliente asociado</div>
@@ -15888,7 +15901,7 @@ USING (true);`;
                 {plan && (
                   <div style={{ background: 'rgba(139, 92, 246, 0.08)', padding: '16px', borderRadius: '12px', border: '1px solid rgba(139, 92, 246, 0.2)' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                      <span style={{ fontWeight: 'bold', color: '#a78bfa' }}>📊 {language === 'es' ? 'Progreso de Pagos' : 'Payment Progress'}</span>
+                      <span style={{ fontWeight: 'bold', color: '#a78bfa' }}>Ã°ÂÂÂ {language === 'es' ? 'Progreso de Pagos' : 'Payment Progress'}</span>
                       <strong style={{ color: '#a78bfa' }}>{paidPayments} / {totalPayments} {language === 'es' ? 'cuotas pagadas' : 'installments paid'}</strong>
                     </div>
                     <div style={{ width: '100%', height: '8px', background: 'rgba(255,255,255,0.1)', borderRadius: '4px', overflow: 'hidden', marginBottom: '12px' }}>
@@ -15896,17 +15909,18 @@ USING (true);`;
                     </div>
                     
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 16px', fontSize: '13px' }}>
-                      <div>• {language === 'es' ? 'Total Venta' : 'Total Sale'}: <strong>€{sale?.total_amount}</strong></div>
-                      <div>• {language === 'es' ? 'Monto Financiado' : 'Financed Amount'}: <strong>€{plan.total_financed}</strong></div>
-                      <div>• {language === 'es' ? 'Entrada Pagada' : 'Down Payment Paid'}: <strong>€{sale?.down_payment}</strong></div>
-                      <div>• {language === 'es' ? 'Monto de Cuota' : 'Installment Amount'}: <strong>€{plan.installment_amount} ({plan.payment_frequency === 'semanal' ? 'Semanal' : 'Mensual'})</strong></div>
+                      <div>Ã¢ÂÂ¢ {language === 'es' ? 'Total Venta' : 'Total Sale'}: <strong>Ã¢ÂÂ¬{sale?.total_amount}</strong></div>
+                      <div>Ã¢ÂÂ¢ {language === 'es' ? 'Monto Financiado' : 'Financed Amount'}: <strong>Ã¢ÂÂ¬{plan.total_financed}</strong></div>
+                      <div>Ã¢ÂÂ¢ {language === 'es' ? 'Entrada Pagada' : 'Down Payment Paid'}: <strong>Ã¢ÂÂ¬{sale?.down_payment}</strong></div>
+                      <div>Ã¢ÂÂ¢ {language === 'es' ? 'Monto de Cuota' : 'Installment Amount'}: <strong>Ã¢ÂÂ¬{plan.installment_amount} ({plan.payment_frequency === 'semanal' ? 'Semanal' : 'Mensual'})</strong></div>
                     </div>
                   </div>
                 )}
 
                 {/* 3. INSTALLMENTS LIST */}
                 <div>
-                  <h4 style={{ margin: '0 0 12px 0', fontSize: '15px' }}>📅 {language === 'es' ? 'Calendario de Cuotas' : 'Installment Schedule'}</h4>
+                  <h4 style={{ margin: '0 0 12px 0', fontSize: '15px' }}>Ã°ÂÂÂ
+ {language === 'es' ? 'Calendario de Cuotas' : 'Installment Schedule'}</h4>
                   {payments.length === 0 ? (
                     <div style={{ color: 'var(--text-muted)', fontStyle: 'italic', textAlign: 'center', padding: '16px' }}>No hay cuotas registradas para este plan.</div>
                   ) : (
@@ -15943,13 +15957,15 @@ USING (true);`;
                                 {language === 'es' ? 'Cuota' : 'Installment'} {p.installment_number}
                               </span>
                               <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
-                                📅 {language === 'es' ? 'Vencimiento' : 'Due'}: {p.due_date}
-                                {p.paid_date && ` | ✅ ${language === 'es' ? 'Pagado el' : 'Paid on'}: ${p.paid_date}${p.received_via ? ` (${p.received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''}`}
+                                Ã°ÂÂÂ
+ {language === 'es' ? 'Vencimiento' : 'Due'}: {p.due_date}
+                                {p.paid_date && ` | Ã¢ÂÂ
+ ${language === 'es' ? 'Pagado el' : 'Paid on'}: ${p.paid_date}${p.received_via ? ` (${p.received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''}`}
                               </span>
                             </div>
                             
                             <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                              <span style={{ fontWeight: 'bold', fontSize: '14px', marginRight: '4px' }}>€{p.amount}</span>
+                              <span style={{ fontWeight: 'bold', fontSize: '14px', marginRight: '4px' }}>Ã¢ÂÂ¬{p.amount}</span>
                               <span className={`badge ${p.status === 'Pagada' ? 'status-available' : isOverdue ? 'status-lost' : 'status-maintenance'}`} style={{ fontSize: '11px' }}>
                                 {p.status === 'Pagada' 
                                   ? (language === 'es' ? 'Pagada' : 'Paid') 
@@ -15978,9 +15994,9 @@ USING (true);`;
                       }}
                       style={{ background: '#8b5cf6', borderColor: '#a78bfa', display: 'flex', alignItems: 'center', gap: '8px', width: '100%', justifyContent: 'center', padding: '12px' }}
                     >
-                      🪙 {language === 'es' 
-                        ? `Cobrar Cuota ${nextPending.installment_number} (€${nextPending.amount})` 
-                        : `Collect Installment ${nextPending.installment_number} (€${nextPending.amount})`}
+                      Ã°ÂÂªÂ {language === 'es' 
+                        ? `Cobrar Cuota ${nextPending.installment_number} (Ã¢ÂÂ¬${nextPending.amount})` 
+                        : `Collect Installment ${nextPending.installment_number} (Ã¢ÂÂ¬${nextPending.amount})`}
                     </button>
                   </div>
                 )}
@@ -16006,7 +16022,7 @@ USING (true);`;
           <div className="modal-overlay">
             <div className="modal-content" style={{ maxWidth: '400px', width: '95%' }}>
               <div className="modal-header">
-                <h3>🪙 {language === 'es' ? 'Cobrar Cuota' : 'Collect Installment'}</h3>
+                <h3>Ã°ÂÂªÂ {language === 'es' ? 'Cobrar Cuota' : 'Collect Installment'}</h3>
                 <button className="btn-secondary btn-xs" onClick={() => {
                   if (cameFromFinancingDetails) {
                     setModalType('financingDetails');
@@ -16014,23 +16030,23 @@ USING (true);`;
                     setModalType(null);
                     setPayInstallmentProduct(null);
                   }
-                }}>✕</button>
+                }}>Ã¢ÂÂ</button>
               </div>
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                 <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)', fontSize: '14px' }}>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                    <div><strong>{language === 'es' ? 'Bicicleta / Artículo:' : 'Bike / Item:'}</strong> {prod.serial_number} - {prod.name}</div>
+                    <div><strong>{language === 'es' ? 'Bicicleta / ArtÃÂ­culo:' : 'Bike / Item:'}</strong> {prod.serial_number} - {prod.name}</div>
                     <div>
                       <strong>{language === 'es' ? 'Cuota:' : 'Installment:'}</strong> {nextPending.installment_number} / {plan?.num_installments}
                     </div>
                     <div>
-                      <strong>{language === 'es' ? 'Monto:' : 'Amount:'}</strong> €{nextPending.amount}
+                      <strong>{language === 'es' ? 'Monto:' : 'Amount:'}</strong> Ã¢ÂÂ¬{nextPending.amount}
                     </div>
                   </div>
                 </div>
 
                 <div className="form-group" style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
-                  <label className="form-label" style={{ fontWeight: 600, marginBottom: '8px' }}>💵 {language === 'es' ? 'Recibido Vía' : 'Received Via'}</label>
+                  <label className="form-label" style={{ fontWeight: 600, marginBottom: '8px' }}>Ã°ÂÂÂµ {language === 'es' ? 'Recibido VÃÂ­a' : 'Received Via'}</label>
                   <div style={{ display: 'flex', gap: '24px' }}>
                     <label style={{ fontSize: '15px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px' }}>
                       <input 
@@ -16040,7 +16056,7 @@ USING (true);`;
                         onChange={() => setPayInstallmentReceivedVia('efectivo')}
                         style={{ scale: '1.2' }} 
                       />
-                      💵 {language === 'es' ? 'Efectivo' : 'Cash'}
+                      Ã°ÂÂÂµ {language === 'es' ? 'Efectivo' : 'Cash'}
                     </label>
                     <label style={{ fontSize: '15px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px' }}>
                       <input 
@@ -16050,7 +16066,7 @@ USING (true);`;
                         onChange={() => setPayInstallmentReceivedVia('transferencia')}
                         style={{ scale: '1.2' }} 
                       />
-                      🏦 {language === 'es' ? 'Transferencia' : 'Transfer'}
+                      Ã°ÂÂÂ¦ {language === 'es' ? 'Transferencia' : 'Transfer'}
                     </label>
                   </div>
                 </div>
@@ -16076,7 +16092,8 @@ USING (true);`;
                     }
                     triggerReload();
                   }}>
-                    ✅ {language === 'es' ? 'Confirmar Pago' : 'Confirm Payment'}
+                    Ã¢ÂÂ
+ {language === 'es' ? 'Confirmar Pago' : 'Confirm Payment'}
                   </button>
                 </div>
               </div>
@@ -16094,8 +16111,8 @@ USING (true);`;
           <div className="modal-overlay">
             <div className="modal-content">
               <div className="modal-header">
-                <h3>🔄 {t.returnBike}: {bike?.serial_number}</h3>
-                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setReturnRentalId(null); }}>✕</button>
+                <h3>Ã°ÂÂÂ {t.returnBike}: {bike?.serial_number}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setReturnRentalId(null); }}>Ã¢ÂÂ</button>
               </div>
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                 <div className="form-grid">
@@ -16110,15 +16127,15 @@ USING (true);`;
                 </div>
                 <div className="form-group">
                   <label className="form-label">{t.damageReport}</label>
-                  <textarea className="form-control" rows={3} placeholder={language === 'es' ? 'Describe daños si los hay...' : 'Describe any damages...'} value={returnFormDamage} onChange={e => setReturnFormDamage(e.target.value)} />
+                  <textarea className="form-control" rows={3} placeholder={language === 'es' ? 'Describe daÃÂ±os si los hay...' : 'Describe any damages...'} value={returnFormDamage} onChange={e => setReturnFormDamage(e.target.value)} />
                 </div>
 
                 {/* Return Photos Upload */}
                 <div className="form-group">
                   <label className="form-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span>📸 {language === 'es' ? 'Fotos de Devolución:' : 'Return Photos:'}</span>
+                    <span>Ã°ÂÂÂ¸ {language === 'es' ? 'Fotos de DevoluciÃÂ³n:' : 'Return Photos:'}</span>
                     <label className="btn-secondary btn-xs" style={{ cursor: 'pointer', margin: 0, padding: '4px 8px', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                      ➕ {language === 'es' ? 'Agregar fotos' : 'Add photos'}
+                      Ã¢ÂÂ {language === 'es' ? 'Agregar fotos' : 'Add photos'}
                       <input 
                         type="file" 
                         multiple 
@@ -16151,7 +16168,7 @@ USING (true);`;
                               setReturnPhotoPreviews(prev => prev.filter((_, i) => i !== idx));
                               setReturnPhotos(prev => prev.filter((_, i) => i !== idx));
                             }}
-                          >✕</button>
+                          >Ã¢ÂÂ</button>
                         </div>
                       ))}
                     </div>
@@ -16168,7 +16185,7 @@ USING (true);`;
                       // 1. Upload photos if there are any selected
                       let returnPhotoUrls: string[] = [];
                       if (returnPhotos.length > 0) {
-                        showToast(language === 'es' ? 'Subiendo fotos de devolución...' : 'Uploading return photos...');
+                        showToast(language === 'es' ? 'Subiendo fotos de devoluciÃÂ³n...' : 'Uploading return photos...');
                         const uploadPromises = returnPhotos.map(file => uploadRentalPhoto(rental.id, file));
                         returnPhotoUrls = await Promise.all(uploadPromises);
                       }
@@ -16197,7 +16214,7 @@ USING (true);`;
                         await upsertProduct({ 
                           ...bike, 
                           status: 'Disponible', 
-                          maintenance_status: returnFormDamage ? 'Requiere Service' : 'Al día', 
+                          maintenance_status: returnFormDamage ? 'Requiere Service' : 'Al dÃÂ­a', 
                           odometer: returnFormOdo,
                           odometer_last_updated: new Date().toISOString().split('T')[0]
                         });
@@ -16207,19 +16224,6 @@ USING (true);`;
                       const itemUpdates = rItems.map(item => {
                         const prod = products.find(p => p.id === item.product_id);
                         if (prod && prod.status === 'Rentada') {
-                          if (prod.category_id === catLockId) {
-                            const keep = prod.custom_field_values?.keep_associated;
-                            const updatedLock = {
-                              ...prod,
-                              status: 'Disponible' as const,
-                              custom_field_values: {
-                                ...prod.custom_field_values,
-                                associated_bike_id: keep ? prod.custom_field_values?.associated_bike_id : undefined,
-                                keep_associated: keep ? true : undefined
-                              }
-                            };
-                            return upsertProduct(updatedLock);
-                          }
                           return upsertProduct({ ...prod, status: 'Disponible' });
                         }
                         return Promise.resolve();
@@ -16232,18 +16236,20 @@ USING (true);`;
                       triggerReload(); 
                       setModalType(null); 
                       setReturnRentalId(null);
-                      showToast(`Devolución de ${bike?.serial_number} registrada.`, 'success');
+                      showToast(`DevoluciÃÂ³n de ${bike?.serial_number} registrada.`, 'success');
                     } catch (err) {
-                      console.error('Error durante la devolución:', err);
-                      showToast('Error al registrar devolución.', 'error');
+                      console.error('Error durante la devoluciÃÂ³n:', err);
+                      showToast('Error al registrar devoluciÃÂ³n.', 'error');
                     } finally {
                       setIsUploadingReturnPhotos(false);
                     }
                   }}
                 >
                   {isUploadingReturnPhotos 
-                    ? (language === 'es' ? '⌛ Guardando...' : '⌛ Saving...') 
-                    : (language === 'es' ? '✅ Confirmar Devolución' : '✅ Confirm Return')}
+                    ? (language === 'es' ? 'Ã¢ÂÂ Guardando...' : 'Ã¢ÂÂ Saving...') 
+                    : (language === 'es' ? 'Ã¢ÂÂ
+ Confirmar DevoluciÃÂ³n' : 'Ã¢ÂÂ
+ Confirm Return')}
                 </button>
               </div>
             </div>
@@ -16265,8 +16271,8 @@ USING (true);`;
           <div className="modal-overlay">
             <div className="modal-content" style={{ maxWidth: '400px' }}>
               <div className="modal-header">
-                <h3>💵 {language === 'es' ? 'Registrar Pago' : 'Register Payment'}</h3>
-                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setPayFormRentalId(null); }}>✕</button>
+                <h3>Ã°ÂÂÂµ {language === 'es' ? 'Registrar Pago' : 'Register Payment'}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setPayFormRentalId(null); }}>Ã¢ÂÂ</button>
               </div>
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                 
@@ -16283,7 +16289,7 @@ USING (true);`;
                       }} 
                       style={{ width: '16px', height: '16px', accentColor: 'var(--color-primary)', cursor: 'pointer' }}
                     />
-                    {rentLabel} (€{rental.rental_rate})
+                    {rentLabel} (Ã¢ÂÂ¬{rental.rental_rate})
                   </label>
                   <label className="form-checkbox" style={{ margin: 0, fontWeight: payFormType === 'other' ? 'bold' : 'normal', display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
                     <input 
@@ -16300,7 +16306,7 @@ USING (true);`;
                 {/* Amount Field (only shown/enabled for other payment) */}
                 {payFormType === 'other' && (
                   <div className="form-group">
-                    <label className="form-label">{language === 'es' ? 'Monto (€)' : 'Amount (€)'}</label>
+                    <label className="form-label">{language === 'es' ? 'Monto (Ã¢ÂÂ¬)' : 'Amount (Ã¢ÂÂ¬)'}</label>
                     <input 
                       type="number" 
                       className="form-control" 
@@ -16326,7 +16332,7 @@ USING (true);`;
 
                 {/* Received Via Payment Method */}
                 <div className="form-group" style={{ marginBottom: '16px' }}>
-                  <label className="form-label" style={{ fontWeight: 600 }}>💵 {language === 'es' ? 'Recibido Vía' : 'Received Via'}</label>
+                  <label className="form-label" style={{ fontWeight: 600 }}>Ã°ÂÂÂµ {language === 'es' ? 'Recibido VÃÂ­a' : 'Received Via'}</label>
                   <div style={{ display: 'flex', gap: '20px', marginTop: '4px' }}>
                     <label style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}>
                       <input 
@@ -16335,7 +16341,7 @@ USING (true);`;
                         checked={payFormReceivedVia === 'efectivo'} 
                         onChange={() => setPayFormReceivedVia('efectivo')} 
                       />
-                      💵 {language === 'es' ? 'Efectivo' : 'Cash'}
+                      Ã°ÂÂÂµ {language === 'es' ? 'Efectivo' : 'Cash'}
                     </label>
                     <label style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}>
                       <input 
@@ -16344,7 +16350,7 @@ USING (true);`;
                         checked={payFormReceivedVia === 'transferencia'} 
                         onChange={() => setPayFormReceivedVia('transferencia')} 
                       />
-                      🏦 {language === 'es' ? 'Transferencia' : 'Bank Transfer'}
+                      Ã°ÂÂÂ¦ {language === 'es' ? 'Transferencia' : 'Bank Transfer'}
                     </label>
                   </div>
                 </div>
@@ -16379,7 +16385,8 @@ USING (true);`;
                   } catch {
                     showToast(language === 'es' ? 'Error al registrar pago.' : 'Error logging payment.', 'error');
                   }
-                }}>✅ {language === 'es' ? 'Confirmar Pago' : 'Confirm Payment'}</button>
+                }}>Ã¢ÂÂ
+ {language === 'es' ? 'Confirmar Pago' : 'Confirm Payment'}</button>
               </div>
             </div>
           </div>
@@ -16392,15 +16399,15 @@ USING (true);`;
         <div className="modal-overlay" style={{ zIndex: 1200 }}>
           <div className="modal-content" style={{ maxWidth: '440px', maxHeight: '90vh', overflowY: 'auto' }}>
             <div className="modal-header">
-              <h3>💸 {language === 'es' ? 'Agregar Gasto' : 'Add Expense'}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setIsAddExpenseModalOpen(false)}>✕</button>
+              <h3>Ã°ÂÂÂ¸ {language === 'es' ? 'Agregar Gasto' : 'Add Expense'}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => setIsAddExpenseModalOpen(false)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               
               {/* Category Select + Manage Categories button */}
               <div className="form-group">
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                  <label className="form-label" style={{ margin: 0 }}>📂 {language === 'es' ? 'Categoría' : 'Category'}</label>
+                  <label className="form-label" style={{ margin: 0 }}>Ã°ÂÂÂ {language === 'es' ? 'CategorÃÂ­a' : 'Category'}</label>
                   <button 
                     type="button" 
                     className="btn-secondary btn-xs" 
@@ -16412,7 +16419,7 @@ USING (true);`;
                     }}
                     style={{ fontSize: '11px', padding: '2px 8px' }}
                   >
-                    ⚙️ {language === 'es' ? 'Gestionar Categorías' : 'Manage Categories'}
+                    Ã¢ÂÂÃ¯Â¸Â {language === 'es' ? 'Gestionar CategorÃÂ­as' : 'Manage Categories'}
                   </button>
                 </div>
                 <select 
@@ -16430,7 +16437,7 @@ USING (true);`;
 
               {/* Expense Name */}
               <div className="form-group">
-                <label className="form-label">📝 {language === 'es' ? 'Nombre / Concepto del Gasto' : 'Expense Description'}</label>
+                <label className="form-label">Ã°ÂÂÂ {language === 'es' ? 'Nombre / Concepto del Gasto' : 'Expense Description'}</label>
                 <input 
                   type="text" 
                   className="form-control" 
@@ -16442,7 +16449,7 @@ USING (true);`;
 
               {/* Expense Amount */}
               <div className="form-group">
-                <label className="form-label">💶 {language === 'es' ? 'Monto (€)' : 'Amount (€)'}</label>
+                <label className="form-label">Ã°ÂÂÂ¶ {language === 'es' ? 'Monto (Ã¢ÂÂ¬)' : 'Amount (Ã¢ÂÂ¬)'}</label>
                 <input 
                   type="number" 
                   step="0.01"
@@ -16455,7 +16462,8 @@ USING (true);`;
 
               {/* Expense Date */}
               <div className="form-group">
-                <label className="form-label">📅 {language === 'es' ? 'Fecha' : 'Date'}</label>
+                <label className="form-label">Ã°ÂÂÂ
+ {language === 'es' ? 'Fecha' : 'Date'}</label>
                 <input 
                   type="date" 
                   className="form-control" 
@@ -16489,7 +16497,7 @@ USING (true);`;
                       return;
                     }
                     if (!expenseFormCategoryId) {
-                      showToast(language === 'es' ? 'Selecciona una categoría.' : 'Select a category.', 'error');
+                      showToast(language === 'es' ? 'Selecciona una categorÃÂ­a.' : 'Select a category.', 'error');
                       return;
                     }
 
@@ -16503,7 +16511,7 @@ USING (true);`;
 
                     setOtherExpenses(prev => [...prev, newExp]);
                     setIsAddExpenseModalOpen(false);
-                    showToast(language === 'es' ? 'Gasto agregado con éxito.' : 'Expense added successfully.', 'success');
+                    showToast(language === 'es' ? 'Gasto agregado con ÃÂ©xito.' : 'Expense added successfully.', 'success');
                   }}
                 >
                   {language === 'es' ? 'Agregar Gasto' : 'Add Expense'}
@@ -16515,13 +16523,13 @@ USING (true);`;
         </div>
       )}
 
-      {/* MODAL: Gestionar Categorías de Gastos */}
+      {/* MODAL: Gestionar CategorÃÂ­as de Gastos */}
       {isManageCategoriesModalOpen && (
         <div className="modal-overlay" style={{ zIndex: 1300 }}>
           <div className="modal-content" style={{ maxWidth: '420px', maxHeight: '85vh', overflowY: 'auto' }}>
             <div className="modal-header">
-              <h3>📂 {language === 'es' ? 'Gestionar Categorías' : 'Manage Categories'}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setIsManageCategoriesModalOpen(false)}>✕</button>
+              <h3>Ã°ÂÂÂ {language === 'es' ? 'Gestionar CategorÃÂ­as' : 'Manage Categories'}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => setIsManageCategoriesModalOpen(false)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               
@@ -16529,8 +16537,8 @@ USING (true);`;
               <div style={{ background: 'rgba(255,255,255,0.02)', padding: '16px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
                 <h4 style={{ margin: '0 0 12px 0', fontSize: '14px', fontWeight: 600 }}>
                   {editingCategoryId 
-                    ? (language === 'es' ? '📝 Editar Categoría' : '📝 Edit Category')
-                    : (language === 'es' ? '➕ Nueva Categoría' : '➕ New Category')}
+                    ? (language === 'es' ? 'Ã°ÂÂÂ Editar CategorÃÂ­a' : 'Ã°ÂÂÂ Edit Category')
+                    : (language === 'es' ? 'Ã¢ÂÂ Nueva CategorÃÂ­a' : 'Ã¢ÂÂ New Category')}
                 </h4>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
                   <div className="form-group">
@@ -16545,7 +16553,7 @@ USING (true);`;
                   </div>
                   <div className="form-group">
                     <label className="form-label" style={{ fontSize: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                      {language === 'es' ? 'Color de Categoría' : 'Category Color'}
+                      {language === 'es' ? 'Color de CategorÃÂ­a' : 'Category Color'}
                       <input 
                         type="color" 
                         value={categoryFormColor} 
@@ -16561,7 +16569,7 @@ USING (true);`;
                       style={{ flex: 1 }}
                       onClick={() => {
                         if (!categoryFormName.trim()) {
-                          showToast(language === 'es' ? 'Escribe un nombre para la categoría.' : 'Enter category name.', 'error');
+                          showToast(language === 'es' ? 'Escribe un nombre para la categorÃÂ­a.' : 'Enter category name.', 'error');
                           return;
                         }
                         
@@ -16573,7 +16581,7 @@ USING (true);`;
                               : c
                           ));
                           setEditingCategoryId(null);
-                          showToast(language === 'es' ? 'Categoría actualizada.' : 'Category updated.', 'success');
+                          showToast(language === 'es' ? 'CategorÃÂ­a actualizada.' : 'Category updated.', 'success');
                         } else {
                           // Add category
                           const newCat = {
@@ -16583,14 +16591,14 @@ USING (true);`;
                           };
                           setExpenseCategories(prev => [...prev, newCat]);
                           setExpenseFormCategoryId(newCat.id);
-                          showToast(language === 'es' ? 'Categoría creada.' : 'Category created.', 'success');
+                          showToast(language === 'es' ? 'CategorÃÂ­a creada.' : 'Category created.', 'success');
                         }
                         setCategoryFormName('');
                       }}
                     >
                       {editingCategoryId 
                         ? (language === 'es' ? 'Guardar Cambios' : 'Save Changes')
-                        : (language === 'es' ? 'Crear Categoría' : 'Create Category')}
+                        : (language === 'es' ? 'Crear CategorÃÂ­a' : 'Create Category')}
                     </button>
                     {editingCategoryId && (
                       <button 
@@ -16610,7 +16618,7 @@ USING (true);`;
 
               {/* Categories list */}
               <div>
-                <h4 style={{ margin: '0 0 10px 0', fontSize: '13px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Categorías Existentes' : 'Existing Categories'}</h4>
+                <h4 style={{ margin: '0 0 10px 0', fontSize: '13px', color: 'var(--text-muted)' }}>{language === 'es' ? 'CategorÃÂ­as Existentes' : 'Existing Categories'}</h4>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '200px', overflowY: 'auto' }}>
                   {expenseCategories.map(cat => (
                     <div 
@@ -16629,7 +16637,7 @@ USING (true);`;
                           }}
                           style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: '13px' }}
                         >
-                          ✏️
+                          Ã¢ÂÂÃ¯Â¸Â
                         </button>
                         {/* Delete */}
                         <button 
@@ -16637,17 +16645,17 @@ USING (true);`;
                           onClick={async () => {
                             const isUsed = otherExpenses.some(e => e.categoryId === cat.id);
                             if (isUsed) {
-                              showToast(language === 'es' ? 'No puedes eliminar esta categoría porque tiene gastos asociados.' : 'Cannot delete category with associated expenses.', 'error');
+                              showToast(language === 'es' ? 'No puedes eliminar esta categorÃÂ­a porque tiene gastos asociados.' : 'Cannot delete category with associated expenses.', 'error');
                               return;
                             }
-                            if (await asyncConfirm(language === 'es' ? `¿Seguro que deseas eliminar la categoría "${cat.name}"?` : `Are you sure you want to delete category "${cat.name}"?`)) {
+                            if (await asyncConfirm(language === 'es' ? `ÃÂ¿Seguro que deseas eliminar la categorÃÂ­a "${cat.name}"?` : `Are you sure you want to delete category "${cat.name}"?`)) {
                               setExpenseCategories(prev => prev.filter(c => c.id !== cat.id));
-                              showToast(language === 'es' ? 'Categoría eliminada.' : 'Category deleted.', 'success');
+                              showToast(language === 'es' ? 'CategorÃÂ­a eliminada.' : 'Category deleted.', 'success');
                             }
                           }}
                           style={{ background: 'none', border: 'none', color: '#ff4d4d', cursor: 'pointer', fontSize: '13px' }}
                         >
-                          🗑️
+                          Ã°ÂÂÂÃ¯Â¸Â
                         </button>
                       </div>
                     </div>
@@ -16675,20 +16683,20 @@ USING (true);`;
         <div className="modal-overlay" style={{ zIndex: 1100 }}>
           <div className="modal-content" style={{ maxWidth: '480px', maxHeight: '90vh', overflowY: 'auto' }}>
             <div className="modal-header">
-              <h3>⚡ {language === 'es' ? 'Editar Detalles del Alquiler' : 'Edit Rental Details'}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setEditRentalModalOpen(false)}>✕</button>
+              <h3>Ã¢ÂÂ¡ {language === 'es' ? 'Editar Detalles del Alquiler' : 'Edit Rental Details'}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => setEditRentalModalOpen(false)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               
               {/* Odometer Start */}
               <div className="form-group">
-                <label className="form-label">🚲 {language === 'es' ? 'Kilometraje Inicial (km)' : 'Starting Odometer (km)'}</label>
+                <label className="form-label">Ã°ÂÂÂ² {language === 'es' ? 'Kilometraje Inicial (km)' : 'Starting Odometer (km)'}</label>
                 <input type="number" className="form-control" value={editRentalOdometer} onChange={e => setEditRentalOdometer(e.target.value ? Number(e.target.value) : '')} />
               </div>
 
               {/* Batteries Selector */}
               <div className="form-group" style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
-                <label className="form-label" style={{ fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px' }}>🔋 {language === 'es' ? 'Baterías Asignadas' : 'Assigned Batteries'}</label>
+                <label className="form-label" style={{ fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px' }}>Ã°ÂÂÂ {language === 'es' ? 'BaterÃÂ­as Asignadas' : 'Assigned Batteries'}</label>
                 {(() => {
                   const assignedBatteries = editRentalBatteryIds.map(id => products.find(p => p.id === id)).filter(Boolean) as Product[];
                   const availableBatteries = products.filter(p => p.category_id === catBattId && p.status === 'Disponible' && !editRentalBatteryIds.includes(p.id));
@@ -16696,14 +16704,14 @@ USING (true);`;
                     <>
                       {assignedBatteries.length === 0 ? (
                         <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '8px' }}>
-                          {language === 'es' ? 'Ninguna batería asignada.' : 'No batteries assigned.'}
+                          {language === 'es' ? 'Ninguna baterÃÂ­a asignada.' : 'No batteries assigned.'}
                         </p>
                       ) : (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '8px' }}>
                           {assignedBatteries.map(bat => (
                             <div key={bat.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(255,255,255,0.05)', padding: '6px 10px', borderRadius: '4px' }}>
-                              <span style={{ fontSize: '13px' }}><strong>{bat.serial_number}</strong> — {bat.name}</span>
-                              <button type="button" onClick={() => setEditRentalBatteryIds(prev => prev.filter(id => id !== bat.id))} style={{ background: 'none', border: 'none', color: '#ff4d4d', cursor: 'pointer', fontSize: '14px' }}>✕</button>
+                              <span style={{ fontSize: '13px' }}><strong>{bat.serial_number}</strong> Ã¢ÂÂ {bat.name}</span>
+                              <button type="button" onClick={() => setEditRentalBatteryIds(prev => prev.filter(id => id !== bat.id))} style={{ background: 'none', border: 'none', color: '#ff4d4d', cursor: 'pointer', fontSize: '14px' }}>Ã¢ÂÂ</button>
                             </div>
                           ))}
                         </div>
@@ -16715,14 +16723,14 @@ USING (true);`;
                             setEditRentalBatteryIds(prev => [...prev, val]);
                           }
                         }}>
-                          <option value="">{language === 'es' ? '➕ Agregar batería de stock...' : '➕ Add battery from stock...'}</option>
+                          <option value="">{language === 'es' ? 'Ã¢ÂÂ Agregar baterÃÂ­a de stock...' : 'Ã¢ÂÂ Add battery from stock...'}</option>
                           {availableBatteries.map(bat => (
-                            <option key={bat.id} value={bat.id}>{bat.serial_number} — {bat.name}</option>
+                            <option key={bat.id} value={bat.id}>{bat.serial_number} Ã¢ÂÂ {bat.name}</option>
                           ))}
                         </select>
                       ) : (
                         <p style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-                          {language === 'es' ? 'No hay baterías disponibles en stock.' : 'No batteries available in stock.'}
+                          {language === 'es' ? 'No hay baterÃÂ­as disponibles en stock.' : 'No batteries available in stock.'}
                         </p>
                       )}
                     </>
@@ -16732,7 +16740,7 @@ USING (true);`;
 
               {/* Lock Selector */}
               <div className="form-group" style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
-                <label className="form-label" style={{ fontWeight: 'bold' }}>🔒 {language === 'es' ? 'Candado Asignado' : 'Assigned Lock'}</label>
+                <label className="form-label" style={{ fontWeight: 'bold' }}>Ã°ÂÂÂ {language === 'es' ? 'Candado Asignado' : 'Assigned Lock'}</label>
                 {(() => {
                   const currentLockProduct = editRentalLockId ? products.find(p => p.id === editRentalLockId) : null;
                   const availableLocks = products.filter(p => p.category_id === catLockId && p.status === 'Disponible' && p.id !== editRentalLockId);
@@ -16740,10 +16748,10 @@ USING (true);`;
                     <select className="form-control" value={editRentalLockId} onChange={e => setEditRentalLockId(e.target.value)}>
                       <option value="">{language === 'es' ? 'Ninguno' : 'None'}</option>
                       {currentLockProduct && (
-                        <option value={currentLockProduct.id}>{currentLockProduct.serial_number} — {currentLockProduct.name} ({language === 'es' ? 'Actual' : 'Current'})</option>
+                        <option value={currentLockProduct.id}>{currentLockProduct.serial_number} Ã¢ÂÂ {currentLockProduct.name} ({language === 'es' ? 'Actual' : 'Current'})</option>
                       )}
                       {availableLocks.map(lk => (
-                        <option key={lk.id} value={lk.id}>{lk.serial_number} — {lk.name}</option>
+                        <option key={lk.id} value={lk.id}>{lk.serial_number} Ã¢ÂÂ {lk.name}</option>
                       ))}
                     </select>
                   );
@@ -16752,7 +16760,7 @@ USING (true);`;
 
               {/* Kit Accessories Selector */}
               <div className="form-group" style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
-                <label className="form-label" style={{ fontWeight: 'bold' }}>🎒 {language === 'es' ? 'Artículos del Kit' : 'Kit Accessories'}</label>
+                <label className="form-label" style={{ fontWeight: 'bold' }}>Ã°ÂÂÂ {language === 'es' ? 'ArtÃÂ­culos del Kit' : 'Kit Accessories'}</label>
                 {(() => {
                   const assignedKitItems = editRentalKitProductIds.map(id => products.find(p => p.id === id)).filter(Boolean) as Product[];
                   const availableKitItems = products.filter(p => p.category_id !== catBikeId && p.category_id !== catBattId && p.category_id !== catLockId && p.status === 'Disponible' && !editRentalKitProductIds.includes(p.id));
@@ -16760,14 +16768,14 @@ USING (true);`;
                     <>
                       {assignedKitItems.length === 0 ? (
                         <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '8px' }}>
-                          {language === 'es' ? 'Ningún accesorio del kit asignado.' : 'No kit accessories assigned.'}
+                          {language === 'es' ? 'NingÃÂºn accesorio del kit asignado.' : 'No kit accessories assigned.'}
                         </p>
                       ) : (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '8px' }}>
                           {assignedKitItems.map(item => (
                             <div key={item.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(255,255,255,0.05)', padding: '6px 10px', borderRadius: '4px' }}>
-                              <span style={{ fontSize: '13px' }}><strong>{item.serial_number}</strong> — {item.name}</span>
-                              <button type="button" onClick={() => setEditRentalKitProductIds(prev => prev.filter(id => id !== item.id))} style={{ background: 'none', border: 'none', color: '#ff4d4d', cursor: 'pointer', fontSize: '14px' }}>✕</button>
+                              <span style={{ fontSize: '13px' }}><strong>{item.serial_number}</strong> Ã¢ÂÂ {item.name}</span>
+                              <button type="button" onClick={() => setEditRentalKitProductIds(prev => prev.filter(id => id !== item.id))} style={{ background: 'none', border: 'none', color: '#ff4d4d', cursor: 'pointer', fontSize: '14px' }}>Ã¢ÂÂ</button>
                             </div>
                           ))}
                         </div>
@@ -16779,9 +16787,9 @@ USING (true);`;
                             setEditRentalKitProductIds(prev => [...prev, val]);
                           }
                         }}>
-                          <option value="">{language === 'es' ? '➕ Agregar artículo de stock...' : '➕ Add accessory from stock...'}</option>
+                          <option value="">{language === 'es' ? 'Ã¢ÂÂ Agregar artÃÂ­culo de stock...' : 'Ã¢ÂÂ Add accessory from stock...'}</option>
                           {availableKitItems.map(item => (
-                            <option key={item.id} value={item.id}>{item.serial_number} — {item.name}</option>
+                            <option key={item.id} value={item.id}>{item.serial_number} Ã¢ÂÂ {item.name}</option>
                           ))}
                         </select>
                       ) : (
@@ -16797,7 +16805,7 @@ USING (true);`;
               {/* Kit Details custom text */}
               <div className="form-group">
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
-                  <label className="form-label">{language === 'es' ? 'Detalles del Kit (Descripción)' : 'Kit Details (Description)'}</label>
+                  <label className="form-label">{language === 'es' ? 'Detalles del Kit (DescripciÃÂ³n)' : 'Kit Details (Description)'}</label>
                   <button type="button" onClick={() => {
                     const items: string[] = [];
                     editRentalBatteryIds.forEach(id => {
@@ -16812,9 +16820,9 @@ USING (true);`;
                       const p = products.find(prod => prod.id === id);
                       if (p) items.push(`${p.serial_number} (${p.name})`);
                     });
-                    setEditRentalKitDetails(items.length > 0 ? items.join(', ') : 'Casco, Soporte móvil, Cargador rápido');
+                    setEditRentalKitDetails(items.length > 0 ? items.join(', ') : 'Casco, Soporte mÃÂ³vil, Cargador rÃÂ¡pido');
                   }} className="btn-secondary btn-xs" style={{ fontSize: '10px', padding: '2px 6px', display: 'flex', alignItems: 'center', gap: '2px' }}>
-                    🪄 {language === 'es' ? 'Auto-generar' : 'Auto-generate'}
+                    Ã°ÂÂªÂ {language === 'es' ? 'Auto-generar' : 'Auto-generate'}
                   </button>
                 </div>
                 <textarea className="form-control" rows={2} value={editRentalKitDetails} onChange={e => setEditRentalKitDetails(e.target.value)} />
@@ -16899,7 +16907,7 @@ USING (true);`;
                     showToast('Error al actualizar alquiler', 'error');
                   }
                 }}>
-                  💾 {language === 'es' ? 'Guardar Cambios' : 'Save Changes'}
+                  Ã°ÂÂÂ¾ {language === 'es' ? 'Guardar Cambios' : 'Save Changes'}
                 </button>
               </div>
 
@@ -16913,25 +16921,25 @@ USING (true);`;
         <div className="modal-overlay" style={{ zIndex: 1100 }}>
           <div className="modal-content" style={{ maxWidth: '520px' }}>
             <div className="modal-header">
-              <h3>🛠️ {language === 'es' ? 'Costo de Mantenimiento' : 'Maintenance Cost'}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+              <h3>Ã°ÂÂÂ Ã¯Â¸Â {language === 'es' ? 'Costo de Mantenimiento' : 'Maintenance Cost'}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div className="form-group">
-                <label className="form-label">{language === 'es' ? 'Costo de mantenimiento (€)' : 'Maintenance cost (€)'}</label>
+                <label className="form-label">{language === 'es' ? 'Costo de mantenimiento (Ã¢ÂÂ¬)' : 'Maintenance cost (Ã¢ÂÂ¬)'}</label>
                 <input type="number" className="form-control" value={maintExpenseFormCost} onChange={e => setMaintExpenseFormCost(e.target.value ? Number(e.target.value) : '')} />
               </div>
               <div className="form-group">
-                <label className="form-label">{language === 'es' ? 'Descripción del arreglo' : 'Repair detail/note'}</label>
+                <label className="form-label">{language === 'es' ? 'DescripciÃÂ³n del arreglo' : 'Repair detail/note'}</label>
                 <textarea className="form-control" rows={3} value={maintExpenseFormDesc} onChange={e => setMaintExpenseFormDesc(e.target.value)} />
               </div>
 
               {/* Maintenance Photos Upload */}
               <div className="form-group">
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
-                  <label className="form-label">{language === 'es' ? '📸 Fotos de Mantenimiento (Opcional)' : '📸 Maintenance Photos (Optional)'}</label>
+                  <label className="form-label">{language === 'es' ? 'Ã°ÂÂÂ¸ Fotos de Mantenimiento (Opcional)' : 'Ã°ÂÂÂ¸ Maintenance Photos (Optional)'}</label>
                   <label className="btn-secondary btn-xs" style={{ cursor: 'pointer', margin: 0, padding: '4px 8px', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                    ➕ {language === 'es' ? 'Agregar fotos' : 'Add photos'}
+                    Ã¢ÂÂ {language === 'es' ? 'Agregar fotos' : 'Add photos'}
                     <input 
                       type="file" 
                       multiple 
@@ -16969,7 +16977,7 @@ USING (true);`;
                             setMaintPhotoPreviews(prev => prev.filter((_, i) => i !== idx));
                             setMaintPhotos(prev => prev.filter((_, i) => i !== idx));
                           }}
-                        >✕</button>
+                        >Ã¢ÂÂ</button>
                       </div>
                     ))}
                   </div>
@@ -17018,8 +17026,8 @@ USING (true);`;
                 }}
               >
                 {isUploadingMaintPhotos 
-                  ? (language === 'es' ? '⌛ Guardando...' : '⌛ Saving...') 
-                  : `💾 ${t.save}`}
+                  ? (language === 'es' ? 'Ã¢ÂÂ Guardando...' : 'Ã¢ÂÂ Saving...') 
+                  : `Ã°ÂÂÂ¾ ${t.save}`}
               </button>
             </div>
           </div>
@@ -17031,8 +17039,8 @@ USING (true);`;
         <div className="modal-overlay" style={{ zIndex: 1100 }}>
           <div className="modal-content" style={{ maxWidth: '450px' }}>
             <div className="modal-header">
-              <h3>📝 {language === 'es' ? `Notas: ${activeNoteProduct.serial_number}` : `Notes: ${activeNoteProduct.serial_number}`}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setActiveNoteProduct(null); }}>✕</button>
+              <h3>Ã°ÂÂÂ {language === 'es' ? `Notas: ${activeNoteProduct.serial_number}` : `Notes: ${activeNoteProduct.serial_number}`}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setActiveNoteProduct(null); }}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div className="form-group">
@@ -17042,7 +17050,7 @@ USING (true);`;
                   rows={6} 
                   value={productNotesText} 
                   onChange={e => setProductNotesText(e.target.value)}
-                  placeholder={language === 'es' ? 'Escribe observaciones aquí...' : 'Write notes here...'}
+                  placeholder={language === 'es' ? 'Escribe observaciones aquÃÂ­...' : 'Write notes here...'}
                 />
               </div>
               <button 
@@ -17059,7 +17067,7 @@ USING (true);`;
                   }
                 }}
               >
-                💾 {t.save}
+                Ã°ÂÂÂ¾ {t.save}
               </button>
             </div>
           </div>
@@ -17071,13 +17079,10 @@ USING (true);`;
         const bike = selectedProductId ? products.find(p => p.id === selectedProductId) : null;
         if (!bike) return null;
 
-        const stats = calculateProductROI(bike.id, products, categories, rentals, rentalItems, payments, expenses, records);
-        const totalRevenues = stats ? stats.totalPaid + (bike.status === 'Vendida' ? (bike.price_sold || 0) : 0) : 0;
-        const totalExpenses = stats ? stats.cost + stats.totalExp : 0;
-        const netProfit = totalRevenues - totalExpenses;
+        const totalCost = selectedBikeHistory.reduce((sum, item) => sum + (item.cost || 0), 0);
         const lastService = bike.last_service_date || '-';
         const currentOdometer = bike.odometer || 0;
-        const status = bike.maintenance_status || 'Al día';
+        const status = bike.maintenance_status || 'Al dÃÂ­a';
 
         const formatDateDMYY = (dateStr?: string) => {
           if (!dateStr || dateStr === '-') return dateStr || '-';
@@ -17094,9 +17099,9 @@ USING (true);`;
             <div className="modal-content" style={{ maxWidth: '750px', width: '90%' }}>
               <div className="modal-header" style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.08)', paddingBottom: '12px' }}>
                 <h3 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  📂 {t.maintHistory}: <span style={{ color: 'var(--color-primary)' }}>{bike.serial_number}</span> — {bike.name}
+                  Ã°ÂÂÂ {t.maintHistory}: <span style={{ color: 'var(--color-primary)' }}>{bike.serial_number}</span> Ã¢ÂÂ {bike.name}
                 </h3>
-                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedProductId(null); }}>✕</button>
+                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedProductId(null); setShowBikeUsers(false); }}>Ã¢ÂÂ</button>
               </div>
 
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '20px', marginTop: '15px' }}>
@@ -17109,17 +17114,15 @@ USING (true);`;
                   </div>
                   <div style={{ background: 'rgba(255, 255, 255, 0.03)', border: '1px solid rgba(255, 255, 255, 0.06)', padding: '12px', borderRadius: '10px', textAlign: 'center' }}>
                     <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px 0' }}>{t.status}</p>
-                    <span className={`badge ${status === 'Al día' ? 'status-available' : status === 'En Taller' ? 'status-maintenance' : 'status-lost'}`} style={{ fontSize: '11px', display: 'inline-block', marginTop: '2px' }}>
-                      {status === 'Al día' ? (language === 'es' ? '🟢 Al día' : '🟢 Good')
-                       : status === 'En Taller' ? (language === 'es' ? '🟡 En Taller' : '🟡 In Shop')
-                       : (language === 'es' ? '🔴 Req. Service' : '🔴 Service Due')}
+                    <span className={`badge ${status === 'Al dÃÂ­a' ? 'status-available' : status === 'En Taller' ? 'status-maintenance' : 'status-lost'}`} style={{ fontSize: '11px', display: 'inline-block', marginTop: '2px' }}>
+                      {status === 'Al dÃÂ­a' ? (language === 'es' ? 'Ã°ÂÂÂ¢ Al dÃÂ­a' : 'Ã°ÂÂÂ¢ Good')
+                       : status === 'En Taller' ? (language === 'es' ? 'Ã°ÂÂÂ¡ En Taller' : 'Ã°ÂÂÂ¡ In Shop')
+                       : (language === 'es' ? 'Ã°ÂÂÂ´ Req. Service' : 'Ã°ÂÂÂ´ Service Due')}
                     </span>
                   </div>
                   <div style={{ background: 'rgba(255, 255, 255, 0.03)', border: '1px solid rgba(255, 255, 255, 0.06)', padding: '12px', borderRadius: '10px', textAlign: 'center' }}>
                     <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px 0' }}>{t.totalInvested}</p>
-                    <p style={{ fontSize: '16px', fontWeight: 'bold', color: netProfit >= 0 ? '#10b981' : '#ef4444', margin: 0 }}>
-                      {netProfit >= 0 ? '+' : '-'}€{Math.abs(netProfit)}
-                    </p>
+                    <p style={{ fontSize: '16px', fontWeight: 'bold', color: 'var(--color-primary)', margin: 0 }}>Ã¢ÂÂ¬{totalCost}</p>
                   </div>
                   <div style={{ background: 'rgba(255, 255, 255, 0.03)', border: '1px solid rgba(255, 255, 255, 0.06)', padding: '12px', borderRadius: '10px', textAlign: 'center' }}>
                     <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px 0' }}>{t.lastService}</p>
@@ -17127,8 +17130,15 @@ USING (true);`;
                   </div>
                 </div>
 
-                {/* Action button to schedule service */}
-                <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                {/* Action buttons */}
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
+                  <button
+                    className="btn-secondary"
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', padding: '8px 16px', fontSize: '13px' }}
+                    onClick={() => setShowBikeUsers(v => !v)}
+                  >
+                    Ã°ÂÂÂ¥ {language === 'es' ? 'Usuarios' : 'Users'}
+                  </button>
                   <button
                     className="btn-primary"
                     style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', padding: '8px 16px', fontSize: '13px' }}
@@ -17136,14 +17146,68 @@ USING (true);`;
                       openServiceModal(bike.id);
                     }}
                   >
-                    📅 {t.programService}
+                    Ã°ÂÂÂ
+ {t.programService}
                   </button>
                 </div>
+
+                {/* Riders who used this bike (only rentals already returned) */}
+                {showBikeUsers && (() => {
+                  const returnedRentals = rentals
+                    .filter(r => r.bike_id === bike.id && r.status === 'Inactivo')
+                    .sort((a, b) => (b.end_date || b.scheduled_return_date || '').localeCompare(a.end_date || a.scheduled_return_date || ''));
+                  return (
+                    <div style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: '10px', padding: '12px' }}>
+                      <h4 style={{ color: 'var(--text-bright)', margin: '0 0 10px', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '14px' }}>
+                        Ã°ÂÂÂ¥ {language === 'es' ? 'Usuarios que usaron esta bicicleta' : 'Riders who used this bike'}
+                      </h4>
+                      {returnedRentals.length === 0 ? (
+                        <p style={{ color: 'var(--text-muted)', fontSize: '13px', margin: 0, fontStyle: 'italic' }}>
+                          {language === 'es' ? 'AÃÂºn no hay usuarios con devoluciÃÂ³n registrada.' : 'No riders with a recorded return yet.'}
+                        </p>
+                      ) : (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '260px', overflowY: 'auto', paddingRight: '4px' }}>
+                          {returnedRentals.map(r => {
+                            const c = customers.find(cu => cu.id === r.customer_id);
+                            const returnDate = r.end_date || r.scheduled_return_date;
+                            return (
+                              <button
+                                key={r.id}
+                                onClick={() => {
+                                  setActiveCustomerId(r.customer_id);
+                                  setProfileRentalId(r.id);
+                                  setShowBikeUsers(false);
+                                  setModalType(null);
+                                  setSelectedProductId(null);
+                                  setShowRentalWizard(false);
+                                  setCurrentTab('rental_wizard');
+                                }}
+                                style={{
+                                  display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px',
+                                  background: 'rgba(0,0,0,0.15)', border: '1px solid rgba(255,255,255,0.06)',
+                                  borderRadius: '8px', padding: '10px 14px', cursor: 'pointer', textAlign: 'left',
+                                  color: 'var(--text-bright)', width: '100%'
+                                }}
+                              >
+                                <span style={{ fontSize: '13px', fontWeight: 600 }}>
+                                  Ã°ÂÂÂ¤ {c ? `${c.first_name} ${c.last_name}` : (language === 'es' ? 'Cliente eliminado' : 'Deleted customer')}
+                                </span>
+                                <span style={{ fontSize: '12px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+                                  Ã°ÂÂÂ {language === 'es' ? 'Devuelta:' : 'Returned:'} {formatDateDMYY(returnDate)}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 {/* Chronological Timeline */}
                 <div style={{ marginTop: '10px' }}>
                   <h4 style={{ color: 'var(--text-bright)', marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '14px' }}>
-                    📜 {language === 'es' ? 'Historial Cronológico' : 'Chronological Logs'}
+                    Ã°ÂÂÂ {language === 'es' ? 'Historial CronolÃÂ³gico' : 'Chronological Logs'}
                   </h4>
 
                   {selectedBikeHistory.length === 0 ? (
@@ -17161,13 +17225,6 @@ USING (true);`;
                               item.type === 'service' ? 'var(--color-primary)' 
                               : item.type === 'expense' ? 'var(--color-accent)' 
                               : item.type === 'rental_start' ? '#6366f1' 
-                              : item.type === 'rental_end' ? '#3b82f6'
-                              : item.type === 'purchase' ? '#10b981'
-                              : item.type === 'arrival' ? '#f59e0b'
-                              : item.type === 'assembly' ? '#ec4899'
-                              : item.type === 'sale' ? '#8b5cf6'
-                              : item.type === 'note' ? '#6b7280'
-                              : item.type === 'lock_link' ? '#06b6d4'
                               : '#3b82f6'
                             }`,
                             borderRadius: '8px',
@@ -17179,7 +17236,8 @@ USING (true);`;
                         >
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '6px' }}>
                             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                              <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>📅 {formatDateDMYY(item.date)}</span>
+                              <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Ã°ÂÂÂ
+ {formatDateDMYY(item.date)}</span>
                               <span
                                 className="badge"
                                 style={{
@@ -17188,53 +17246,25 @@ USING (true);`;
                                   background: item.type === 'service' ? 'rgba(239, 131, 35, 0.15)' 
                                             : item.type === 'expense' ? 'rgba(16, 185, 129, 0.15)' 
                                             : item.type === 'rental_start' ? 'rgba(99, 102, 241, 0.15)' 
-                                            : item.type === 'rental_end' ? 'rgba(59, 130, 246, 0.15)'
-                                            : item.type === 'purchase' ? 'rgba(16, 185, 129, 0.15)'
-                                            : item.type === 'arrival' ? 'rgba(245, 158, 11, 0.15)'
-                                            : item.type === 'assembly' ? 'rgba(236, 72, 153, 0.15)'
-                                            : item.type === 'sale' ? 'rgba(139, 92, 246, 0.15)'
-                                            : item.type === 'note' ? 'rgba(107, 114, 128, 0.15)'
-                                            : item.type === 'lock_link' ? 'rgba(6, 182, 212, 0.15)'
                                             : 'rgba(59, 130, 246, 0.15)',
                                   color: item.type === 'service' ? 'var(--color-primary)' 
                                        : item.type === 'expense' ? 'var(--color-accent)' 
                                        : item.type === 'rental_start' ? '#818cf8' 
-                                       : item.type === 'rental_end' ? '#60a5fa'
-                                       : item.type === 'purchase' ? '#34d399'
-                                       : item.type === 'arrival' ? '#fbbf24'
-                                       : item.type === 'assembly' ? '#f472b6'
-                                       : item.type === 'sale' ? '#a78bfa'
-                                       : item.type === 'note' ? '#9ca3af'
-                                       : item.type === 'lock_link' ? '#22d3ee'
                                        : '#60a5fa',
                                   border: item.type === 'service' ? '1px solid rgba(239, 131, 35, 0.2)' 
                                         : item.type === 'expense' ? '1px solid rgba(16, 185, 129, 0.2)' 
                                         : item.type === 'rental_start' ? '1px solid rgba(99, 102, 241, 0.2)' 
-                                        : item.type === 'rental_end' ? '1px solid rgba(59, 130, 246, 0.2)'
-                                        : item.type === 'purchase' ? '1px solid rgba(16, 185, 129, 0.2)'
-                                        : item.type === 'arrival' ? '1px solid rgba(245, 158, 11, 0.2)'
-                                        : item.type === 'assembly' ? '1px solid rgba(236, 72, 153, 0.2)'
-                                        : item.type === 'sale' ? '1px solid rgba(139, 92, 246, 0.2)'
-                                        : item.type === 'note' ? '1px solid rgba(107, 114, 128, 0.2)'
-                                        : item.type === 'lock_link' ? '1px solid rgba(6, 182, 212, 0.2)'
                                         : '1px solid rgba(59, 130, 246, 0.2)'
                                 }}
                               >
                                 {item.type === 'service' ? t.serviceType 
                                  : item.type === 'expense' ? t.expenseType 
-                                 : item.type === 'rental_start' ? (language === 'es' ? '🚀 Alquiler (Inicio)' : '🚀 Rented (Start)') 
-                                 : item.type === 'rental_end' ? (language === 'es' ? '🔄 Devolución (Fin)' : '🔄 Returned (End)')
-                                 : item.type === 'purchase' ? (language === 'es' ? '🛒 Compra' : '🛒 Purchase')
-                                 : item.type === 'arrival' ? (language === 'es' ? '📦 Arribo' : '📦 Arrival')
-                                 : item.type === 'assembly' ? (language === 'es' ? '🔧 Armado' : '🔧 Assembly')
-                                 : item.type === 'sale' ? (language === 'es' ? '💰 Venta' : '💰 Sale')
-                                 : item.type === 'note' ? (language === 'es' ? '📝 Bitácora' : '📝 Notes')
-                                 : item.type === 'lock_link' ? (language === 'es' ? '🔗 Candado' : '🔗 Lock')
-                                 : (language === 'es' ? '📈 Estado' : '📈 Status')}
+                                 : item.type === 'rental_start' ? (language === 'es' ? 'Ã°ÂÂÂ Alquiler (Inicio)' : 'Ã°ÂÂÂ Rented (Start)') 
+                                 : (language === 'es' ? 'Ã°ÂÂÂ DevoluciÃÂ³n (Fin)' : 'Ã°ÂÂÂ Returned (End)')}
                               </span>
                             </div>
                             {item.cost !== undefined && (
-                              <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{item.cost}</strong>
+                              <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>Ã¢ÂÂ¬{item.cost}</strong>
                             )}
                           </div>
 
@@ -17244,13 +17274,13 @@ USING (true);`;
                           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px', fontSize: '11px', color: 'var(--text-muted)', borderTop: '1px solid rgba(255, 255, 255, 0.04)', paddingTop: '6px' }}>
                             {item.type === 'service' && (
                               <>
-                                {item.performedBy && <span>👷 {t.performedBy}: <strong>{item.performedBy}</strong></span>}
-                                {item.location && <span>📍 {t.location}: <strong>{item.location}</strong></span>}
+                                {item.performedBy && <span>Ã°ÂÂÂ· {t.performedBy}: <strong>{item.performedBy}</strong></span>}
+                                {item.location && <span>Ã°ÂÂÂ {t.location}: <strong>{item.location}</strong></span>}
                               </>
                             )}
                             {item.type === 'expense' && (
                               <>
-                                {item.customerName && <span>🛵 {t.associatedRider}: <strong>{item.customerName}</strong></span>}
+                                {item.customerName && <span>Ã°ÂÂÂµ {t.associatedRider}: <strong>{item.customerName}</strong></span>}
                                 {item.photos && item.photos.length > 0 && (
                                   <div style={{ display: 'flex', gap: '6px', alignItems: 'center', width: '100%', marginTop: '4px' }}>
                                     {item.photos.map((url: string, pIdx: number) => (
@@ -17270,10 +17300,10 @@ USING (true);`;
                                         }}
                                         onClick={() => {
                                           setLightboxUrl(url);
-                                          setLightboxTitle(language === 'es' ? `Foto Reparación ${pIdx + 1}` : `Repair Photo ${pIdx + 1}`);
+                                          setLightboxTitle(language === 'es' ? `Foto ReparaciÃÂ³n ${pIdx + 1}` : `Repair Photo ${pIdx + 1}`);
                                         }}
                                       >
-                                        👁️ {language === 'es' ? `Foto ${pIdx + 1}` : `Photo ${pIdx + 1}`}
+                                        Ã°ÂÂÂÃ¯Â¸Â {language === 'es' ? `Foto ${pIdx + 1}` : `Photo ${pIdx + 1}`}
                                       </button>
                                     ))}
                                   </div>
@@ -17282,7 +17312,7 @@ USING (true);`;
                             )}
                             {(item.type === 'rental_start' || item.type === 'rental_end') && (
                               <>
-                                {item.customerName && <span>🛵 {t.associatedRider}: <strong>{item.customerName}</strong></span>}
+                                {item.customerName && <span>Ã°ÂÂÂµ {t.associatedRider}: <strong>{item.customerName}</strong></span>}
                               </>
                             )}
                           </div>
@@ -17341,7 +17371,7 @@ USING (true);`;
               ...prod,
               custom_field_values: {
                 ...prod.custom_field_values,
-                location: mainLocation || 'Almacén Central',
+                location: mainLocation || 'AlmacÃÂ©n Central',
                 location_date: selectedLocationDate,
                 location_distribution: updatedDist,
               }
@@ -17353,7 +17383,7 @@ USING (true);`;
             setTransferTo('');
             setTransferQty(1);
             showToast(
-              language === 'es' ? 'Transferencia realizada con éxito.' : 'Transfer completed successfully.',
+              language === 'es' ? 'Transferencia realizada con ÃÂ©xito.' : 'Transfer completed successfully.',
               'success'
             );
           } catch (err) {
@@ -17376,12 +17406,12 @@ USING (true);`;
             setSelectedProductId(null);
             setSelectedLocation('');
             showToast(
-              language === 'es' ? 'Ubicación actualizada con éxito.' : 'Location updated successfully.',
+              language === 'es' ? 'UbicaciÃÂ³n actualizada con ÃÂ©xito.' : 'Location updated successfully.',
               'success'
             );
           } catch (err: any) {
             showToast(
-              language === 'es' ? 'Error al guardar la ubicación.' : 'Error saving location.',
+              language === 'es' ? 'Error al guardar la ubicaciÃÂ³n.' : 'Error saving location.',
               'error'
             );
           }
@@ -17398,7 +17428,7 @@ USING (true);`;
           setSelectedLocation(trimmed);
           setNewLocationInput('');
           showToast(
-            language === 'es' ? `Ubicación "${trimmed}" creada.` : `Location "${trimmed}" created.`,
+            language === 'es' ? `UbicaciÃÂ³n "${trimmed}" creada.` : `Location "${trimmed}" created.`,
             'success'
           );
         };
@@ -17410,16 +17440,16 @@ USING (true);`;
               <div className="modal-content" style={{ maxWidth: '520px', width: '90%' }}>
                 <div className="modal-header" style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.08)', paddingBottom: '12px' }}>
                   <h3 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    📦 {language === 'es' ? 'Distribución de Inventario' : 'Inventory Distribution'}: <span style={{ color: 'var(--color-primary)' }}>{prod.name}</span>
+                    Ã°ÂÂÂ¦ {language === 'es' ? 'DistribuciÃÂ³n de Inventario' : 'Inventory Distribution'}: <span style={{ color: 'var(--color-primary)' }}>{prod.name}</span>
                   </h3>
-                  <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedProductId(null); }}>✕</button>
+                  <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedProductId(null); }}>Ã¢ÂÂ</button>
                 </div>
 
                 <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px', marginTop: '15px' }}>
                   {/* Current Stock Distribution list */}
                   <div style={{ background: 'rgba(255, 255, 255, 0.02)', padding: '16px', borderRadius: '12px', border: '1px solid rgba(255, 255, 255, 0.06)', display: 'flex', flexDirection: 'column', gap: '8px' }}>
                     <h4 style={{ color: 'var(--text-bright)', fontSize: '13px', margin: '0 0 6px 0', fontWeight: 600 }}>
-                      📍 {language === 'es' ? 'Ubicaciones Actuales' : 'Current Locations'} ({totalQty} {language === 'es' ? 'unidades' : 'units'})
+                      Ã°ÂÂÂ {language === 'es' ? 'Ubicaciones Actuales' : 'Current Locations'} ({totalQty} {language === 'es' ? 'unidades' : 'units'})
                     </h4>
                     {Object.entries(dist).length === 0 ? (
                       <p style={{ color: 'var(--text-muted)', fontStyle: 'italic', fontSize: '12px', margin: 0 }}>
@@ -17428,7 +17458,7 @@ USING (true);`;
                     ) : (
                       Object.entries(dist).map(([locName, qty]) => (
                         <div key={locName} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(255, 255, 255, 0.02)', padding: '8px 12px', borderRadius: '6px' }}>
-                          <span style={{ fontSize: '13px', color: 'var(--text-bright)', fontWeight: 500 }}>📍 {locName}</span>
+                          <span style={{ fontSize: '13px', color: 'var(--text-bright)', fontWeight: 500 }}>Ã°ÂÂÂ {locName}</span>
                           <span className="badge status-available" style={{ fontSize: '11px', fontWeight: 'bold' }}>{qty} {language === 'es' ? 'unidades' : 'units'}</span>
                         </div>
                       ))
@@ -17438,7 +17468,7 @@ USING (true);`;
                   {/* Transfer Form Section */}
                   <div style={{ background: 'rgba(255, 255, 255, 0.01)', border: '1px solid rgba(255, 255, 255, 0.05)', padding: '16px', borderRadius: '12px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
                     <h4 style={{ color: 'var(--color-primary)', fontSize: '13px', margin: 0, fontWeight: 600, display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      🔄 {language === 'es' ? 'Transferir Unidades' : 'Transfer Units'}
+                      Ã°ÂÂÂ {language === 'es' ? 'Transferir Unidades' : 'Transfer Units'}
                     </h4>
 
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
@@ -17485,14 +17515,14 @@ USING (true);`;
                     {/* New Location Generator within Transfer Modal */}
                     <div style={{ background: 'rgba(255, 255, 255, 0.02)', padding: '10px', borderRadius: '8px', border: '1px dashed rgba(255, 255, 255, 0.08)' }}>
                       <label style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'block', marginBottom: '6px' }}>
-                        {language === 'es' ? '¿Crear nueva ubicación de destino?' : 'Create a new destination location?'}
+                        {language === 'es' ? 'ÃÂ¿Crear nueva ubicaciÃÂ³n de destino?' : 'Create a new destination location?'}
                       </label>
                       <div style={{ display: 'flex', gap: '6px' }}>
                         <input
                           type="text"
                           className="custom-input"
                           style={{ flex: 1, height: '30px', fontSize: '12px' }}
-                          placeholder={language === 'es' ? 'Ej: Almacén Norte' : 'E.g. North Warehouse'}
+                          placeholder={language === 'es' ? 'Ej: AlmacÃÂ©n Norte' : 'E.g. North Warehouse'}
                           value={newLocationInput}
                           onChange={(e) => setNewLocationInput(e.target.value)}
                         />
@@ -17510,10 +17540,10 @@ USING (true);`;
                             }
                             setTransferTo(trimmed);
                             setNewLocationInput('');
-                            showToast(language === 'es' ? `Ubicación "${trimmed}" creada.` : `Location "${trimmed}" created.`, 'success');
+                            showToast(language === 'es' ? `UbicaciÃÂ³n "${trimmed}" creada.` : `Location "${trimmed}" created.`, 'success');
                           }}
                         >
-                          ➕
+                          Ã¢ÂÂ
                         </button>
                       </div>
                     </div>
@@ -17559,7 +17589,7 @@ USING (true);`;
                     {t.cancel}
                   </button>
                   <button className="btn-primary" onClick={handleTransfer} disabled={!transferFrom || !transferTo || transferQty <= 0}>
-                    🔄 {language === 'es' ? 'Transferir' : 'Transfer'}
+                    Ã°ÂÂÂ {language === 'es' ? 'Transferir' : 'Transfer'}
                   </button>
                 </div>
               </div>
@@ -17572,15 +17602,15 @@ USING (true);`;
             <div className="modal-content" style={{ maxWidth: '500px', width: '90%' }}>
               <div className="modal-header" style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.08)', paddingBottom: '12px' }}>
                 <h3 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  📍 {language === 'es' ? 'Registrar Ubicación' : 'Register Location'}: <span style={{ color: 'var(--color-primary)' }}>{prod.serial_number}</span>
+                  Ã°ÂÂÂ {language === 'es' ? 'Registrar UbicaciÃÂ³n' : 'Register Location'}: <span style={{ color: 'var(--color-primary)' }}>{prod.serial_number}</span>
                 </h3>
-                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedProductId(null); }}>✕</button>
+                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedProductId(null); }}>Ã¢ÂÂ</button>
               </div>
 
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px', marginTop: '15px' }}>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                   <label style={{ fontSize: '13px', color: 'var(--text-bright)', fontWeight: 500 }}>
-                    {language === 'es' ? 'Seleccionar Ubicación' : 'Select Location'}
+                    {language === 'es' ? 'Seleccionar UbicaciÃÂ³n' : 'Select Location'}
                   </label>
                   <div style={{ display: 'flex', gap: '8px' }}>
                     <select
@@ -17589,7 +17619,7 @@ USING (true);`;
                       value={selectedLocation}
                       onChange={(e) => setSelectedLocation(e.target.value)}
                     >
-                      <option value="">{language === 'es' ? '-- Seleccione ubicación --' : '-- Select location --'}</option>
+                      <option value="">{language === 'es' ? '-- Seleccione ubicaciÃÂ³n --' : '-- Select location --'}</option>
                       {locationsList.map((loc) => (
                         <option key={loc} value={loc}>{loc}</option>
                       ))}
@@ -17599,7 +17629,7 @@ USING (true);`;
 
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', background: 'rgba(255, 255, 255, 0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255, 255, 255, 0.05)' }}>
                   <label style={{ fontSize: '12px', color: 'var(--text-muted)', fontWeight: 500 }}>
-                    {language === 'es' ? '¿No encuentras la ubicación? Crea una nueva:' : 'Can\'t find the location? Create a new one:'}
+                    {language === 'es' ? 'ÃÂ¿No encuentras la ubicaciÃÂ³n? Crea una nueva:' : 'Can\'t find the location? Create a new one:'}
                   </label>
                   <div style={{ display: 'flex', gap: '8px' }}>
                     <input
@@ -17615,7 +17645,7 @@ USING (true);`;
                       style={{ height: '36px', padding: '0 16px', whiteSpace: 'nowrap' }}
                       onClick={handleAddLocation}
                     >
-                      ➕ {language === 'es' ? 'Crear' : 'Create'}
+                      Ã¢ÂÂ {language === 'es' ? 'Crear' : 'Create'}
                     </button>
                   </div>
                 </div>
@@ -17640,7 +17670,7 @@ USING (true);`;
                     style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }}
                     onClick={() => setShowLocManager(!showLocManager)}
                   >
-                    ⚙️ {showLocManager ? (language === 'es' ? 'Ocultar Administrador de Ubicaciones' : 'Hide Location Manager') : (language === 'es' ? 'Gestionar / Borrar Ubicaciones' : 'Manage / Delete Locations')}
+                    Ã¢ÂÂÃ¯Â¸Â {showLocManager ? (language === 'es' ? 'Ocultar Administrador de Ubicaciones' : 'Hide Location Manager') : (language === 'es' ? 'Gestionar / Borrar Ubicaciones' : 'Manage / Delete Locations')}
                   </button>
 
                   {showLocManager && (
@@ -17677,10 +17707,10 @@ USING (true);`;
                                     if (selectedLocation === loc) {
                                       setSelectedLocation(val);
                                     }
-                                    showToast(language === 'es' ? 'Ubicación editada.' : 'Location edited.', 'success');
+                                    showToast(language === 'es' ? 'UbicaciÃÂ³n editada.' : 'Location edited.', 'success');
                                   }}
                                 >
-                                  💾
+                                  Ã°ÂÂÂ¾
                                 </button>
                                 <button
                                   type="button"
@@ -17688,12 +17718,12 @@ USING (true);`;
                                   style={{ height: '28px', width: '28px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
                                   onClick={() => setEditingLocIndex(null)}
                                 >
-                                  ✕
+                                  Ã¢ÂÂ
                                 </button>
                               </div>
                             ) : (
                               <>
-                                <span style={{ fontSize: '13px', color: 'var(--text-bright)' }}>📍 {loc}</span>
+                                <span style={{ fontSize: '13px', color: 'var(--text-bright)' }}>Ã°ÂÂÂ {loc}</span>
                                 <div style={{ display: 'flex', gap: '4px' }}>
                                   <button
                                     type="button"
@@ -17704,25 +17734,25 @@ USING (true);`;
                                       setEditingLocText(loc);
                                     }}
                                   >
-                                    ✏️
+                                    Ã¢ÂÂÃ¯Â¸Â
                                   </button>
                                   <button
                                     type="button"
                                     className="btn-danger btn-xs"
                                     style={{ padding: '2px 6px', fontSize: '11px', background: 'rgba(239, 68, 68, 0.1)', color: '#ef4444', border: '1px solid rgba(239, 68, 68, 0.2)' }}
                                     onClick={async () => {
-                                      if (await asyncConfirm(language === 'es' ? `¿Estás seguro de que quieres borrar la ubicación "${loc}"?` : `Are you sure you want to delete the location "${loc}"?`)) {
+                                      if (await asyncConfirm(language === 'es' ? `ÃÂ¿EstÃÂ¡s seguro de que quieres borrar la ubicaciÃÂ³n "${loc}"?` : `Are you sure you want to delete the location "${loc}"?`)) {
                                         const updated = locationsList.filter((_, i) => i !== idx);
                                         setLocationsList(updated);
                                         localStorage.setItem('fast_sheep_locations', JSON.stringify(updated));
                                         if (selectedLocation === loc) {
                                           setSelectedLocation('');
                                         }
-                                        showToast(language === 'es' ? 'Ubicación eliminada.' : 'Location deleted.', 'success');
+                                        showToast(language === 'es' ? 'UbicaciÃÂ³n eliminada.' : 'Location deleted.', 'success');
                                       }
                                     }}
                                   >
-                                    🗑️
+                                    Ã°ÂÂÂÃ¯Â¸Â
                                   </button>
                                 </div>
                               </>
@@ -17748,173 +17778,6 @@ USING (true);`;
         );
       })()}
 
-      {/* MODAL: Link Lock to Bike */}
-      {modalType === 'linkLockToBike' && (() => {
-        const lock = selectedProductId ? products.find(p => p.id === selectedProductId) : null;
-        if (!lock) return null;
-
-        // Get already linked bikes (1-to-1 association strict check)
-        const linkedBikeIds = new Set(
-          products
-            .filter(p => p.category_id === catLockId && p.custom_field_values?.associated_bike_id)
-            .map(p => p.custom_field_values.associated_bike_id as string)
-        );
-
-        // Filter active bikes that do not have any lock linked
-        const availableBikes = products.filter(p => {
-          const isActive = p.category_id === catBikeId && p.status !== 'Vendida' && p.status !== 'Perdida' && p.status !== 'Robada' && p.status !== 'Perdida/Garda';
-          const isNotLinked = !linkedBikeIds.has(p.id);
-          const matchesQuery = !linkBikeSearchQuery.trim() || 
-            `${p.name} ${p.serial_number} ${p.notes || ''}`.toLowerCase().includes(linkBikeSearchQuery.toLowerCase());
-          return isActive && isNotLinked && matchesQuery;
-        }).sort((a, b) => a.name.localeCompare(b.name));
-
-        const handleSave = async (bikeId: string) => {
-          try {
-            const updatedLock = {
-              ...lock,
-              custom_field_values: {
-                ...lock.custom_field_values,
-                associated_bike_id: bikeId
-              }
-            };
-            await upsertProduct(updatedLock);
-            triggerReload();
-            setModalType(null);
-            setSelectedProductId(null);
-            setLinkBikeSearchQuery('');
-            showToast(language === 'es' ? 'Candado vinculado correctamente.' : 'Lock linked successfully.', 'success');
-          } catch (err) {
-            console.error('Error linking lock:', err);
-            showToast(language === 'es' ? 'Error al vincular el candado.' : 'Error linking the lock.', 'error');
-          }
-        };
-
-        return (
-          <div className="modal-overlay" style={{ zIndex: 1200 }} onClick={() => { setModalType(null); setSelectedProductId(null); setLinkBikeSearchQuery(''); }}>
-            <div className="modal-content" style={{ maxWidth: '500px', padding: '24px' }} onClick={e => e.stopPropagation()}>
-              <div className="modal-header">
-                <h3>🔗 {language === 'es' ? 'Vincular Candado a Bicicleta' : 'Link Lock to Bike'}</h3>
-                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedProductId(null); setLinkBikeSearchQuery(''); }}>✕</button>
-              </div>
-              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                <p style={{ fontSize: '13px', color: 'var(--text-muted)', margin: 0 }}>
-                  {language === 'es' 
-                    ? `Selecciona la bicicleta a la que deseas vincular el candado "${lock.name}" (${lock.serial_number}).` 
-                    : `Select the bike to link the lock "${lock.name}" (${lock.serial_number}) to.`
-                  }
-                </p>
-                <input
-                  type="text"
-                  className="form-control"
-                  placeholder={language === 'es' ? '🔍 Buscar por serial o nombre...' : '🔍 Search by serial or name...'}
-                  value={linkBikeSearchQuery}
-                  onChange={e => setLinkBikeSearchQuery(e.target.value)}
-                  style={{ height: '38px' }}
-                />
-                <div style={{ maxHeight: '250px', overflowY: 'auto', border: '1px solid var(--border-color)', borderRadius: '8px', padding: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                  {availableBikes.length === 0 ? (
-                    <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '16px', fontSize: '13px', fontStyle: 'italic' }}>
-                      {language === 'es' ? 'No hay bicicletas activas disponibles sin candado.' : 'No available active bikes without locks.'}
-                    </div>
-                  ) : availableBikes.map(bike => (
-                    <div 
-                      key={bike.id} 
-                      style={{ 
-                        display: 'flex', 
-                        alignItems: 'center', 
-                        justifyContent: 'space-between', 
-                        padding: '10px 12px', 
-                        background: 'rgba(255, 255, 255, 0.02)', 
-                        border: '1px solid rgba(255, 255, 255, 0.05)', 
-                        borderRadius: '8px',
-                        transition: 'background 0.2s'
-                      }}
-                      onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.06)'}
-                      onMouseLeave={e => e.currentTarget.style.background = 'rgba(255, 255, 255, 0.02)'}
-                    >
-                      <div>
-                        <strong style={{ color: 'var(--text-bright)', fontSize: '13px' }}>{bike.name}</strong>
-                        <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{bike.serial_number} · Status: {bike.status}</div>
-                      </div>
-                      <button className="btn-primary btn-xs" onClick={() => handleSave(bike.id)}>
-                        {language === 'es' ? 'Vincular' : 'Link'}
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-              <div className="modal-footer" style={{ marginTop: '16px' }}>
-                <button className="btn-secondary" onClick={() => { setModalType(null); setSelectedProductId(null); setLinkBikeSearchQuery(''); }}>
-                  {t.cancel}
-                </button>
-              </div>
-            </div>
-          </div>
-        );
-      })()}
-
-      {/* MODAL: Confirm Unlink Lock */}
-      {modalType === 'confirmUnlinkLock' && (() => {
-        const lock = selectedProductId ? products.find(p => p.id === selectedProductId) : null;
-        if (!lock) return null;
-        const bikeId = lock.custom_field_values?.associated_bike_id as string;
-        const bike = products.find(p => p.id === bikeId);
-
-        const handleUnlink = async () => {
-          try {
-            const updatedLock = {
-              ...lock,
-              custom_field_values: {
-                ...lock.custom_field_values,
-                associated_bike_id: undefined
-              }
-            };
-            await upsertProduct(updatedLock);
-            triggerReload();
-            setModalType(null);
-            setSelectedProductId(null);
-            showToast(language === 'es' ? 'Candado desvinculado correctamente.' : 'Lock unlinked successfully.', 'success');
-          } catch (err) {
-            console.error('Error unlinking lock:', err);
-            showToast(language === 'es' ? 'Error al desvincular el candado.' : 'Error unlinking the lock.', 'error');
-          }
-        };
-
-        return (
-          <div className="modal-overlay" style={{ zIndex: 1200 }} onClick={() => { setModalType(null); setSelectedProductId(null); }}>
-            <div className="modal-content" style={{ maxWidth: '450px', padding: '24px' }} onClick={e => e.stopPropagation()}>
-              <div className="modal-header">
-                <h3>🔗 {language === 'es' ? 'Desvincular Candado' : 'Unlink Lock'}</h3>
-                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedProductId(null); }}>✕</button>
-              </div>
-              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-                <p style={{ fontSize: '13px', color: 'var(--text-bright)', margin: 0 }}>
-                  {language === 'es'
-                    ? `¿Estás seguro de que deseas desvincular el candado "${lock.name}" de la bicicleta "${bike ? bike.name : 'desconocida'}"?`
-                    : `Are you sure you want to unlink the lock "${lock.name}" from the bike "${bike ? bike.name : 'unknown'}"?`
-                  }
-                </p>
-                <p style={{ fontSize: '12px', color: 'var(--text-muted)', margin: 0 }}>
-                  {language === 'es'
-                    ? 'Esta acción eliminará la asociación permanente entre ambos artículos.'
-                    : 'This action will remove the permanent association between both items.'
-                  }
-                </p>
-              </div>
-              <div className="modal-footer" style={{ marginTop: '16px' }}>
-                <button className="btn-secondary" onClick={() => { setModalType(null); setSelectedProductId(null); }}>
-                  {t.cancel}
-                </button>
-                <button className="btn-primary" style={{ background: '#f87171', borderColor: '#f87171' }} onClick={handleUnlink}>
-                  {language === 'es' ? 'Desvincular' : 'Unlink'}
-                </button>
-              </div>
-            </div>
-          </div>
-        );
-      })()}
-
       {/* MODAL: Change Product Condition */}
       {modalType === 'changeCondition' && (() => {
         const prod = selectedProductId ? products.find(p => p.id === selectedProductId) : null;
@@ -17925,8 +17788,8 @@ USING (true);`;
             value: 'nuevo',
             labelEs: 'Nuevo',
             labelEn: 'New',
-            icon: '✨',
-            descEs: 'Artículo sin uso, recién salido de caja.',
+            icon: 'Ã¢ÂÂ¨',
+            descEs: 'ArtÃÂ­culo sin uso, reciÃÂ©n salido de caja.',
             descEn: 'Unused item, fresh out of the box.',
             color: '#6366f1',
             bg: 'rgba(99, 102, 241, 0.08)',
@@ -17936,8 +17799,8 @@ USING (true);`;
             value: 'bueno',
             labelEs: 'Bueno',
             labelEn: 'Good',
-            icon: '🟢',
-            descEs: 'Buen estado mecánico y estético, listo para rodar.',
+            icon: 'Ã°ÂÂÂ¢',
+            descEs: 'Buen estado mecÃÂ¡nico y estÃÂ©tico, listo para rodar.',
             descEn: 'Good mechanical and aesthetic state, ready to roll.',
             color: '#10b981',
             bg: 'rgba(16, 185, 129, 0.08)',
@@ -17947,8 +17810,8 @@ USING (true);`;
             value: 'regular',
             labelEs: 'Regular',
             labelEn: 'Regular',
-            icon: '🟡',
-            descEs: 'Presenta desgastes estéticos menores o requiere revisión pronto.',
+            icon: 'Ã°ÂÂÂ¡',
+            descEs: 'Presenta desgastes estÃÂ©ticos menores o requiere revisiÃÂ³n pronto.',
             descEn: 'Minor aesthetic wear, or requires service soon.',
             color: '#f59e0b',
             bg: 'rgba(245, 158, 11, 0.08)',
@@ -17958,7 +17821,7 @@ USING (true);`;
             value: 'para venta',
             labelEs: 'Para Venta',
             labelEn: 'For Sale',
-            icon: '🟣',
+            icon: 'Ã°ÂÂÂ£',
             descEs: 'Destinado a venta.',
             descEn: 'Destined for sale.',
             color: '#a855f7',
@@ -17973,8 +17836,8 @@ USING (true);`;
               value: 'no funciona',
               labelEs: 'No funciona',
               labelEn: 'Broken / Not Working',
-              icon: '❌',
-              descEs: 'La batería no carga o está completamente inoperativa.',
+              icon: 'Ã¢ÂÂ',
+              descEs: 'La baterÃÂ­a no carga o estÃÂ¡ completamente inoperativa.',
               descEn: 'The battery does not charge or is completely inoperative.',
               color: '#ef4444',
               bg: 'rgba(239, 68, 68, 0.08)',
@@ -17984,8 +17847,8 @@ USING (true);`;
               value: 'funciona mal',
               labelEs: 'Funciona Mal',
               labelEn: 'Malfunctioning',
-              icon: '⚠️',
-              descEs: 'Carga incompleta, se descarga rápido o falla intermitentemente.',
+              icon: 'Ã¢ÂÂ Ã¯Â¸Â',
+              descEs: 'Carga incompleta, se descarga rÃÂ¡pido o falla intermitentemente.',
               descEn: 'Incomplete charge, discharges quickly, or fails intermittently.',
               color: '#f59e0b',
               bg: 'rgba(245, 158, 11, 0.08)',
@@ -17995,8 +17858,8 @@ USING (true);`;
               value: 'reclamada',
               labelEs: 'Reclamada',
               labelEn: 'Claimed / Warranty',
-              icon: '🛡️',
-              descEs: 'En proceso de reclamo de garantía o soporte del fabricante.',
+              icon: 'Ã°ÂÂÂ¡Ã¯Â¸Â',
+              descEs: 'En proceso de reclamo de garantÃÂ­a o soporte del fabricante.',
               descEn: 'Under warranty claim or manufacturer support process.',
               color: '#3b82f6',
               bg: 'rgba(59, 130, 246, 0.08)',
@@ -18019,12 +17882,12 @@ USING (true);`;
             setModalType(null);
             setSelectedProductId(null);
             showToast(
-              language === 'es' ? 'Condición actualizada con éxito.' : 'Condition updated successfully.',
+              language === 'es' ? 'CondiciÃÂ³n actualizada con ÃÂ©xito.' : 'Condition updated successfully.',
               'success'
             );
           } catch (err: any) {
             showToast(
-              language === 'es' ? 'Error al guardar la condición.' : 'Error saving condition.',
+              language === 'es' ? 'Error al guardar la condiciÃÂ³n.' : 'Error saving condition.',
               'error'
             );
           }
@@ -18035,15 +17898,15 @@ USING (true);`;
             <div className="modal-content" style={{ maxWidth: '520px', width: '90%' }}>
               <div className="modal-header" style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.08)', paddingBottom: '12px' }}>
                 <h3 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  ⚙️ {t.changeCondition}: <span style={{ color: 'var(--color-primary)' }}>{prod.serial_number}</span>
+                  Ã¢ÂÂÃ¯Â¸Â {t.changeCondition}: <span style={{ color: 'var(--color-primary)' }}>{prod.serial_number}</span>
                 </h3>
-                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedProductId(null); }}>✕</button>
+                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedProductId(null); }}>Ã¢ÂÂ</button>
               </div>
 
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px', marginTop: '15px' }}>
                 <p style={{ margin: 0, fontSize: '13px', color: 'var(--text-muted)' }}>
                   {language === 'es' 
-                    ? `Elige la condición física y funcional actual para ${prod.name}:` 
+                    ? `Elige la condiciÃÂ³n fÃÂ­sica y funcional actual para ${prod.name}:` 
                     : `Choose the current physical and functional condition for ${prod.name}:`
                   }
                 </p>
@@ -18136,7 +17999,7 @@ USING (true);`;
                     width: '36px', height: '36px', borderRadius: '10px',
                     background: 'linear-gradient(135deg, #10b981, #059669)',
                     display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '18px'
-                  }}>🛠️</div>
+                  }}>Ã°ÂÂÂ Ã¯Â¸Â</div>
                   <div>
                     <h3 style={{ margin: 0, fontSize: '17px', fontWeight: 700 }}>
                       {language === 'es' ? `Modificaciones: ${prod.name}` : `Modifications: ${prod.name}`}
@@ -18150,7 +18013,7 @@ USING (true);`;
                   className="btn-secondary btn-xs"
                   onClick={() => setModalType(null)}
                   style={{ padding: '4px 8px', fontSize: '14px' }}
-                >✕</button>
+                >Ã¢ÂÂ</button>
               </div>
 
               {/* Content Body */}
@@ -18160,14 +18023,14 @@ USING (true);`;
                   /* Database Error: Means the database table doesn't exist yet! */
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                     <div className="glass-card" style={{ border: '1px solid rgba(239, 68, 68, 0.2)', background: 'rgba(239, 68, 68, 0.05)', padding: '16px', display: 'flex', gap: '12px' }}>
-                      <span style={{ fontSize: '24px', flexShrink: 0 }}>⚠️</span>
+                      <span style={{ fontSize: '24px', flexShrink: 0 }}>Ã¢ÂÂ Ã¯Â¸Â</span>
                       <div>
                         <h4 style={{ margin: '0 0 6px 0', color: '#f87171', fontSize: '14px', fontWeight: 600 }}>
                           {language === 'es' ? 'Tabla de modificaciones no configurada' : 'Modifications table not configured'}
                         </h4>
                         <p style={{ margin: 0, fontSize: '13px', color: 'var(--text-bright)', lineHeight: '1.5' }}>
                           {language === 'es' 
-                            ? 'Para llevar el registro de modificaciones, primero debes crear la tabla en tu base de datos de Supabase. Copia el siguiente código SQL y ejecútalo en la pestaña "SQL Editor" de tu panel de Supabase.'
+                            ? 'Para llevar el registro de modificaciones, primero debes crear la tabla en tu base de datos de Supabase. Copia el siguiente cÃÂ³digo SQL y ejecÃÂºtalo en la pestaÃÂ±a "SQL Editor" de tu panel de Supabase.'
                             : 'To track modifications, you first need to create the table in your Supabase database. Copy the SQL code below and execute it in the "SQL Editor" tab of your Supabase dashboard.'}
                         </p>
                       </div>
@@ -18190,7 +18053,8 @@ USING (true);`;
                           borderColor: 'rgba(255, 255, 255, 0.15)'
                         }}
                       >
-                        {sqlModsCopied ? '✅ ' : '📋 '}
+                        {sqlModsCopied ? 'Ã¢ÂÂ
+ ' : 'Ã°ÂÂÂ '}
                         {sqlModsCopied 
                           ? (language === 'es' ? 'Copiado' : 'Copied') 
                           : (language === 'es' ? 'Copiar SQL' : 'Copy SQL')}
@@ -18209,7 +18073,8 @@ USING (true);`;
                         whiteSpace: 'pre-wrap',
                         wordBreak: 'break-all'
                       }}>
-                        {`CREATE TABLE public.bike_modifications (...);\n-- (Haz clic en Copiar SQL para obtener el script completo)`}
+                        {`CREATE TABLE public.bike_modifications (...);\
+-- (Haz clic en Copiar SQL para obtener el script completo)`}
                       </pre>
                     </div>
 
@@ -18219,7 +18084,7 @@ USING (true);`;
                         onClick={() => fetchModifications(prod.id)}
                         style={{ padding: '8px 16px', fontSize: '13px' }}
                       >
-                        🔄 {language === 'es' ? 'Verificar Conexión' : 'Verify Connection'}
+                        Ã°ÂÂÂ {language === 'es' ? 'Verificar ConexiÃÂ³n' : 'Verify Connection'}
                       </button>
                     </div>
                   </div>
@@ -18231,12 +18096,12 @@ USING (true);`;
                     <form onSubmit={handleAddModification} style={{ display: 'flex', gap: '12px', alignItems: 'flex-end', flexWrap: 'wrap' }}>
                       <div className="form-group" style={{ margin: 0, flex: '2 1 250px' }}>
                         <label className="form-label">
-                          {language === 'es' ? 'Descripción de la Modificación' : 'Modification Description'}
+                          {language === 'es' ? 'DescripciÃÂ³n de la ModificaciÃÂ³n' : 'Modification Description'}
                         </label>
                         <input
                           type="text"
                           className="form-control"
-                          placeholder={language === 'es' ? 'Ej: Se cambió el asiento por uno de gel impermeable' : 'E.g.: Changed seat to waterproof gel seat'}
+                          placeholder={language === 'es' ? 'Ej: Se cambiÃÂ³ el asiento por uno de gel impermeable' : 'E.g.: Changed seat to waterproof gel seat'}
                           value={modDescriptionInput}
                           onChange={e => setModDescriptionInput(e.target.value)}
                           disabled={modsLoading}
@@ -18266,14 +18131,14 @@ USING (true);`;
                         disabled={modsLoading || !modDescriptionInput.trim() || !modDateInput.trim()}
                         style={{ height: '38px', padding: '0 16px', display: 'flex', alignItems: 'center', justifyContent: 'center', whiteSpace: 'nowrap' }}
                       >
-                        {modsLoading ? '⏳' : '➕'} {language === 'es' ? 'Registrar' : 'Log'}
+                        {modsLoading ? 'Ã¢ÂÂ³' : 'Ã¢ÂÂ'} {language === 'es' ? 'Registrar' : 'Log'}
                       </button>
                     </form>
 
                     {/* History list */}
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                       <h4 style={{ margin: 0, fontSize: '13px', fontWeight: 600, color: 'var(--text-bright)', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                        📋 {language === 'es' ? 'Historial de Registro' : 'Log History'}
+                        Ã°ÂÂÂ {language === 'es' ? 'Historial de Registro' : 'Log History'}
                         <span style={{ fontSize: '11px', color: 'var(--text-muted)', fontWeight: 'normal' }}>
                           ({bikeModifications.length} {language === 'es' ? 'registros' : 'records'})
                         </span>
@@ -18284,8 +18149,8 @@ USING (true);`;
                           <thead>
                             <tr>
                               <th style={{ width: '100px' }}>{language === 'es' ? 'Fecha' : 'Date'}</th>
-                              <th>{language === 'es' ? 'Modificación Realizada' : 'Modification Performed'}</th>
-                              <th style={{ width: '60px', textAlign: 'center' }}>{language === 'es' ? 'Acción' : 'Action'}</th>
+                              <th>{language === 'es' ? 'ModificaciÃÂ³n Realizada' : 'Modification Performed'}</th>
+                              <th style={{ width: '60px', textAlign: 'center' }}>{language === 'es' ? 'AcciÃÂ³n' : 'Action'}</th>
                             </tr>
                           </thead>
                           <tbody>
@@ -18293,17 +18158,18 @@ USING (true);`;
                               <tr>
                                 <td colSpan={3} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '32px', fontStyle: 'italic', fontSize: '13px' }}>
                                   {language === 'es' 
-                                    ? 'No hay modificaciones registradas todavía para esta bicicleta.'
+                                    ? 'No hay modificaciones registradas todavÃÂ­a para esta bicicleta.'
                                     : 'No modifications logged yet for this bicycle.'}
                                 </td>
                               </tr>
                             ) : (
                               bikeModifications.map(row => {
-                                const fmtDate = row.modification_date ? row.modification_date.split('-').reverse().join('/') : '—';
+                                const fmtDate = row.modification_date ? row.modification_date.split('-').reverse().join('/') : 'Ã¢ÂÂ';
                                 return (
                                   <tr key={row.id}>
                                     <td style={{ fontSize: '12px', fontWeight: 600, color: '#f59e0b', whiteSpace: 'nowrap' }}>
-                                      📅 {fmtDate}
+                                      Ã°ÂÂÂ
+ {fmtDate}
                                     </td>
                                     <td style={{ fontSize: '13px', color: 'var(--text-bright)', whiteSpace: 'normal', wordBreak: 'break-word', lineHeight: '1.4' }}>
                                       {row.description}
@@ -18315,7 +18181,7 @@ USING (true);`;
                                         onClick={() => handleDeleteModification(row.id)}
                                         title={language === 'es' ? 'Eliminar Registro' : 'Delete Record'}
                                       >
-                                        🗑️
+                                        Ã°ÂÂÂÃ¯Â¸Â
                                       </button>
                                     </td>
                                   </tr>
@@ -18355,15 +18221,15 @@ USING (true);`;
             <div className="modal-header">
               <h3>
                 {servFormRecordId
-                  ? (language === 'es' ? '🔍 Detalle' : '🔍 Detail')
-                  : (language === 'es' ? '🔧 Registrar Entrada a Taller' : '🔧 Register Garage Entry')
+                  ? (language === 'es' ? 'Ã°ÂÂÂ Detalle' : 'Ã°ÂÂÂ Detail')
+                  : (language === 'es' ? 'Ã°ÂÂÂ§ Registrar Entrada a Taller' : 'Ã°ÂÂÂ§ Register Garage Entry')
                 }
               </h3>
-              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div className="form-group">
-                <label className="form-label">{language === 'es' ? 'Vehículo o Batería' : 'Vehicle or Battery'}</label>
+                <label className="form-label">{language === 'es' ? 'VehÃÂ­culo o BaterÃÂ­a' : 'Vehicle or Battery'}</label>
                 <select className="form-control" value={servFormBikeId} onChange={e => setServFormBikeId(e.target.value)}>
                   <option value="">{language === 'es' ? '-- Seleccionar --' : '-- Select --'}</option>
                   {products
@@ -18373,14 +18239,14 @@ USING (true);`;
                       
                       // If creating a new record, exclude items already in workshop or requiring service
                       if (!servFormRecordId) {
-                        return p.maintenance_status === 'Al día';
+                        return p.maintenance_status === 'Al dÃÂ­a';
                       }
                       
                       // If editing, allow showing the current item even if it requires service or is in shop
-                      return p.maintenance_status === 'Al día' || p.id === servFormBikeId;
+                      return p.maintenance_status === 'Al dÃÂ­a' || p.id === servFormBikeId;
                     })
                     .map(p => (
-                      <option key={p.id} value={p.id}>({p.category_id === catBikeId ? 'Bike' : 'Batt'}) {p.serial_number} — {p.name}</option>
+                      <option key={p.id} value={p.id}>({p.category_id === catBikeId ? 'Bike' : 'Batt'}) {p.serial_number} Ã¢ÂÂ {p.name}</option>
                     ))}
                 </select>
               </div>
@@ -18388,7 +18254,7 @@ USING (true);`;
                 <div className="form-group"><label className="form-label">{language === 'es' ? 'Fecha del Service' : 'Service Date'}</label><input type="date" className="form-control" value={servFormDate} onChange={e => setServFormDate(e.target.value)} /></div>
                 <div className="form-group"><label className="form-label">{t.serviceLocation}</label><input type="text" className="form-control" value={servFormLoc} onChange={e => setServFormLoc(e.target.value)} /></div>
                 <div className="form-group"><label className="form-label">{t.performedBy}</label><input type="text" className="form-control" value={servFormBy} onChange={e => setServFormBy(e.target.value)} /></div>
-                <div className="form-group"><label className="form-label">{t.serviceCost} (€)</label><input type="number" className="form-control" value={servFormCost} onChange={e => setServFormCost(Number(e.target.value))} /></div>
+                <div className="form-group"><label className="form-label">{t.serviceCost} (Ã¢ÂÂ¬)</label><input type="number" className="form-control" value={servFormCost} onChange={e => setServFormCost(Number(e.target.value))} /></div>
               </div>
               <div className="form-group">
                 <label className="form-label">{t.serviceDescription}</label>
@@ -18406,7 +18272,7 @@ USING (true);`;
                 )}
               </div>
               <button className="btn-primary" onClick={async () => {
-                if (!servFormBikeId) { showToast(language === 'es' ? 'Selecciona una bicicleta o batería.' : 'Select a bicycle or battery.', 'error'); return; }
+                if (!servFormBikeId) { showToast(language === 'es' ? 'Selecciona una bicicleta o baterÃÂ­a.' : 'Select a bicycle or battery.', 'error'); return; }
                 try {
                   const recId = servFormRecordId ?? crypto.randomUUID();
                   const newRec: MaintenanceRecord = { 
@@ -18440,7 +18306,8 @@ USING (true);`;
                   await upsertEvent({
                     id: mainEvId,
                     title: `[Service] ${bikeSerial}`,
-                    description: `${servFormDesc}\nService ID: ${recId}`,
+                    description: `${servFormDesc}\
+Service ID: ${recId}`,
                     event_date: servFormDate,
                     remind_one_week: servFormRemindWeek,
                     remind_one_day: servFormRemindDay,
@@ -18456,7 +18323,9 @@ USING (true);`;
                     await upsertEvent({
                       id: customEvId,
                       title: `[Service] ${bikeSerial}`,
-                      description: `${language === 'es' ? 'Recordatorio personalizado' : 'Custom reminder'}\n${servFormDesc}\nService ID: ${recId}`,
+                      description: `${language === 'es' ? 'Recordatorio personalizado' : 'Custom reminder'}\
+${servFormDesc}\
+Service ID: ${recId}`,
                       event_date: servFormRemindCustomDate,
                       remind_one_week: false,
                       remind_one_day: true,
@@ -18469,11 +18338,11 @@ USING (true);`;
                   
                   triggerReload(); 
                   setModalType(null); 
-                  showToast(language === 'es' ? 'Información de service guardada.' : 'Service details saved.', 'success');
+                  showToast(language === 'es' ? 'InformaciÃÂ³n de service guardada.' : 'Service details saved.', 'success');
                 } catch { 
                   showToast(language === 'es' ? 'Error al guardar service.' : 'Error saving service details.', 'error'); 
                 }
-              }}>💾 {language === 'es' ? 'Guardar' : 'Save'}</button>
+              }}>Ã°ÂÂÂ¾ {language === 'es' ? 'Guardar' : 'Save'}</button>
             </div>
           </div>
         </div>
@@ -18487,8 +18356,9 @@ USING (true);`;
           <div className="modal-overlay">
             <div className="modal-content" style={{ maxWidth: '450px' }}>
               <div className="modal-header">
-                <h3>📅 {language === 'es' ? `Eventos del ${formattedDate}` : `Events for ${formattedDate}`}</h3>
-                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedDayEventsDate(null); }}>✕</button>
+                <h3>Ã°ÂÂÂ
+ {language === 'es' ? `Eventos del ${formattedDate}` : `Events for ${formattedDate}`}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedDayEventsDate(null); }}>Ã¢ÂÂ</button>
               </div>
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', maxHeight: '300px', overflowY: 'auto' }}>
@@ -18563,7 +18433,7 @@ USING (true);`;
                     openEventModal(selectedDayEventsDate);
                   }}
                 >
-                  ➕ {language === 'es' ? 'Agendar Nuevo Evento' : 'Schedule New Event'}
+                  Ã¢ÂÂ {language === 'es' ? 'Agendar Nuevo Evento' : 'Schedule New Event'}
                 </button>
               </div>
             </div>
@@ -18578,8 +18448,9 @@ USING (true);`;
           <div className="modal-overlay">
             <div className="modal-content">
               <div className="modal-header">
-                <h3>📅 {isCompleted ? (language === 'es' ? 'Ver Evento (Completado)' : 'View Event (Completed)') : t.addEvent}</h3>
-                <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+                <h3>Ã°ÂÂÂ
+ {isCompleted ? (language === 'es' ? 'Ver Evento (Completado)' : 'View Event (Completed)') : t.addEvent}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
               </div>
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                 <div className="form-group">
@@ -18604,7 +18475,7 @@ USING (true);`;
                   </div>
                 </div>
                 <div className="form-group">
-                  <label className="form-label">{language === 'es' ? 'Descripción' : 'Description'}</label>
+                  <label className="form-label">{language === 'es' ? 'DescripciÃÂ³n' : 'Description'}</label>
                   <textarea className="form-control" rows={3} value={evFormDesc} onChange={e => setEvFormDesc(e.target.value)} disabled={isCompleted} />
                 </div>
                 
@@ -18623,11 +18494,11 @@ USING (true);`;
                     justifyContent: 'center',
                     gap: '8px'
                   }}>
-                    🔒 {language === 'es' ? 'Este evento está completado y es de solo lectura.' : 'This event is completed and is read-only.'}
+                    Ã°ÂÂÂ {language === 'es' ? 'Este evento estÃÂ¡ completado y es de solo lectura.' : 'This event is completed and is read-only.'}
                   </div>
                 ) : (
                   <button className="btn-primary" onClick={async () => {
-                    if (!evFormTitle) { showToast('El título es obligatorio.', 'error'); return; }
+                    if (!evFormTitle) { showToast('El tÃÂ­tulo es obligatorio.', 'error'); return; }
                     try {
                       const ev: CompanyEvent = { 
                         id: selectedEventId ?? crypto.randomUUID(), 
@@ -18645,7 +18516,7 @@ USING (true);`;
                     } catch { 
                       showToast('Error al guardar evento.', 'error'); 
                     }
-                  }}>💾 {t.save}</button>
+                  }}>Ã°ÂÂÂ¾ {t.save}</button>
                 )}
               </div>
             </div>
@@ -18658,17 +18529,17 @@ USING (true);`;
         <div className="modal-overlay">
           <div className="modal-content">
             <div className="modal-header">
-              <h3>💬 {editingLeadId ? (language === 'es' ? 'Editar Lead CRM' : 'Edit CRM Lead') : (language === 'es' ? 'Nuevo Lead CRM' : 'New CRM Lead')}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+              <h3>Ã°ÂÂÂ¬ {editingLeadId ? (language === 'es' ? 'Editar Lead CRM' : 'Edit CRM Lead') : (language === 'es' ? 'Nuevo Lead CRM' : 'New CRM Lead')}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div className="form-group"><label className="form-label">{language === 'es' ? 'Nombre Completo' : 'Full Name'}</label><input type="text" className="form-control" value={leadFormName} onChange={e => setLeadFormName(e.target.value)} /></div>
               <div className="form-grid">
                 <div className="form-group"><label className="form-label">Email</label><input type="email" className="form-control" value={leadFormEmail} onChange={e => setLeadFormEmail(e.target.value)} /></div>
-                <div className="form-group"><label className="form-label">{language === 'es' ? 'Teléfono' : 'Phone'}</label><input type="text" className="form-control" placeholder="+353..." value={leadFormPhone} onChange={e => setLeadFormPhone(e.target.value)} /></div>
+                <div className="form-group"><label className="form-label">{language === 'es' ? 'TelÃÂ©fono' : 'Phone'}</label><input type="text" className="form-control" placeholder="+353..." value={leadFormPhone} onChange={e => setLeadFormPhone(e.target.value)} /></div>
               </div>
               <div className="form-group">
-                <label className="form-label">{language === 'es' ? 'Categoría del Lead' : 'Lead Category'}</label>
+                <label className="form-label">{language === 'es' ? 'CategorÃÂ­a del Lead' : 'Lead Category'}</label>
                 <div style={{ display: 'flex', gap: '8px' }}>
                   <select 
                     className="form-control" 
@@ -18676,7 +18547,7 @@ USING (true);`;
                     onChange={e => setLeadFormCategoryId(e.target.value)}
                     style={{ flex: 1 }}
                   >
-                    <option value="">-- {language === 'es' ? 'Sin Categoría' : 'No Category'} --</option>
+                    <option value="">-- {language === 'es' ? 'Sin CategorÃÂ­a' : 'No Category'} --</option>
                     {leadCats.map(cat => (
                       <option key={cat.id} value={cat.id}>
                         {language === 'es' ? (cat.name_es || cat.name_en) : (cat.name_en || cat.name_es)}
@@ -18687,22 +18558,22 @@ USING (true);`;
                     type="button"
                     className="btn-secondary"
                     style={{ padding: '0 12px', fontSize: '16px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-                    title={language === 'es' ? 'Crear nueva categoría' : 'Create new category'}
+                    title={language === 'es' ? 'Crear nueva categorÃÂ­a' : 'Create new category'}
                     onClick={async () => {
-                      const name = prompt(language === 'es' ? 'Nombre de la nueva categoría del lead:' : 'Name of the new lead category:');
+                      const name = prompt(language === 'es' ? 'Nombre de la nueva categorÃÂ­a del lead:' : 'Name of the new lead category:');
                       if (!name || !name.trim()) return;
                       try {
                         const newCat = await insertLeadCategory(name.trim(), name.trim());
                         const refreshed = await getLeadCategories();
                         setLeadCats(refreshed);
                         setLeadFormCategoryId(newCat.id);
-                        showToast(language === 'es' ? 'Categoría creada con éxito.' : 'Category created successfully.', 'success');
+                        showToast(language === 'es' ? 'CategorÃÂ­a creada con ÃÂ©xito.' : 'Category created successfully.', 'success');
                       } catch (err: any) {
-                        showToast(language === 'es' ? 'Error al crear la categoría.' : 'Failed to create category.', 'error');
+                        showToast(language === 'es' ? 'Error al crear la categorÃÂ­a.' : 'Failed to create category.', 'error');
                       }
                     }}
                   >
-                    ➕
+                    Ã¢ÂÂ
                   </button>
                 </div>
               </div>
@@ -18716,7 +18587,7 @@ USING (true);`;
                       checked={leadFormHasReminder} 
                       onChange={e => setLeadFormHasReminder(e.target.checked)} 
                     />
-                    🔔 {language === 'es' ? 'Programar Recordatorio de Seguimiento' : 'Schedule Follow-up Reminder'}
+                    Ã°ÂÂÂ {language === 'es' ? 'Programar Recordatorio de Seguimiento' : 'Schedule Follow-up Reminder'}
                   </label>
                   {leadFormHasReminder && (
                     <div className="form-grid" style={{ marginTop: '4px' }}>
@@ -18731,7 +18602,7 @@ USING (true);`;
                         />
                       </div>
                       <div className="form-group">
-                        <label className="form-label">{language === 'es' ? 'Acción de Seguimiento' : 'Follow-up Action'}</label>
+                        <label className="form-label">{language === 'es' ? 'AcciÃÂ³n de Seguimiento' : 'Follow-up Action'}</label>
                         <input 
                           type="text" 
                           className="form-control" 
@@ -18781,7 +18652,7 @@ USING (true);`;
                       const reminderEvent: CompanyEvent = {
                         id: leadId, // deterministic ID matching the lead ID
                         title: `Seguimiento: ${leadFormName}`,
-                        description: `Acción: ${leadFormReminderAction || 'Seguimiento Lead'}`,
+                        description: `AcciÃÂ³n: ${leadFormReminderAction || 'Seguimiento Lead'}`,
                         event_date: leadFormReminderDate,
                         remind_one_week: false,
                         remind_one_day: true,
@@ -18809,7 +18680,7 @@ USING (true);`;
                   console.error("Error upserting lead:", err);
                   showToast(language === 'es' ? `Error: ${err.message || 'No se pudo guardar el lead.'}` : `Error: ${err.message || 'Failed to save lead.'}`, 'error');
                 }
-              }}>💾 {editingLeadId ? (language === 'es' ? 'Guardar Cambios' : 'Save Changes') : (language === 'es' ? 'Registrar Lead' : 'Register Lead')}</button>
+              }}>Ã°ÂÂÂ¾ {editingLeadId ? (language === 'es' ? 'Guardar Cambios' : 'Save Changes') : (language === 'es' ? 'Registrar Lead' : 'Register Lead')}</button>
             </div>
           </div>
         </div>
@@ -18828,8 +18699,9 @@ USING (true);`;
             <div className="modal-overlay">
               <div className="modal-content" style={{ maxWidth: '600px' }}>
                 <div className="modal-header">
-                  <h3>📅 {language === 'es' ? `Seguimiento: ${lead.name}` : `Follow-up: ${lead.name}`}</h3>
-                  <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+                  <h3>Ã°ÂÂÂ
+ {language === 'es' ? `Seguimiento: ${lead.name}` : `Follow-up: ${lead.name}`}</h3>
+                  <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
                 </div>
                 <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                   
@@ -18840,22 +18712,22 @@ USING (true);`;
                       style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px', background: isAddingNote ? 'rgba(99, 102, 241, 0.2)' : '' }} 
                       onClick={() => { setIsAddingNote(prev => !prev); setIsAddingReminder(false); }}
                     >
-                      ➕ {language === 'es' ? 'Agregar Nota' : 'Add Note'}
+                      Ã¢ÂÂ {language === 'es' ? 'Agregar Nota' : 'Add Note'}
                     </button>
                     <button 
                       className="btn-secondary btn-sm" 
                       style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px', background: isAddingReminder ? 'rgba(99, 102, 241, 0.2)' : '' }} 
                       onClick={() => { setIsAddingReminder(prev => !prev); setIsAddingNote(false); }}
                     >
-                      ⏰ {language === 'es' ? 'Agregar Recordatorio' : 'Add Reminder'}
+                      Ã¢ÂÂ° {language === 'es' ? 'Agregar Recordatorio' : 'Add Reminder'}
                     </button>
                   </div>
 
                   {/* Add Note Section (Drawer) */}
                   {isAddingNote && (
                     <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                      <label className="form-label" style={{ fontWeight: 'bold' }}>✍️ {language === 'es' ? 'Nueva Nota' : 'New Note'}</label>
-                      <textarea className="form-control" rows={3} placeholder={language === 'es' ? 'Escribe aquí la nota de seguimiento...' : 'Write follow-up note here...'} value={newFollowUpNote} onChange={e => setNewFollowUpNote(e.target.value)} />
+                      <label className="form-label" style={{ fontWeight: 'bold' }}>Ã¢ÂÂÃ¯Â¸Â {language === 'es' ? 'Nueva Nota' : 'New Note'}</label>
+                      <textarea className="form-control" rows={3} placeholder={language === 'es' ? 'Escribe aquÃÂ­ la nota de seguimiento...' : 'Write follow-up note here...'} value={newFollowUpNote} onChange={e => setNewFollowUpNote(e.target.value)} />
                       <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
                         <button className="btn-secondary btn-xs" onClick={() => setIsAddingNote(false)}>
                           {language === 'es' ? 'Cancelar' : 'Cancel'}
@@ -18873,7 +18745,7 @@ USING (true);`;
                             setNewFollowUpNote('');
                             setIsAddingNote(false);
                             triggerReload();
-                            showToast(language === 'es' ? 'Nota agregada con éxito.' : 'Note added successfully.', 'success');
+                            showToast(language === 'es' ? 'Nota agregada con ÃÂ©xito.' : 'Note added successfully.', 'success');
                           } catch {
                             showToast('Error.', 'error');
                           }
@@ -18887,7 +18759,7 @@ USING (true);`;
                   {/* Add Reminder Section (Drawer) */}
                   {isAddingReminder && (
                     <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                      <label className="form-label" style={{ fontWeight: 'bold' }}>⏰ {language === 'es' ? 'Nuevo Recordatorio de Seguimiento' : 'New Follow-up Reminder'}</label>
+                      <label className="form-label" style={{ fontWeight: 'bold' }}>Ã¢ÂÂ° {language === 'es' ? 'Nuevo Recordatorio de Seguimiento' : 'New Follow-up Reminder'}</label>
                       <div className="form-grid">
                         <div className="form-group">
                           <label className="form-label">{language === 'es' ? 'Fecha de Recordatorio' : 'Reminder Date'}</label>
@@ -18900,7 +18772,7 @@ USING (true);`;
                           />
                         </div>
                         <div className="form-group">
-                          <label className="form-label">{language === 'es' ? 'Acción de Seguimiento' : 'Follow-up Action'}</label>
+                          <label className="form-label">{language === 'es' ? 'AcciÃÂ³n de Seguimiento' : 'Follow-up Action'}</label>
                           <input 
                             type="text" 
                             className="form-control" 
@@ -18924,7 +18796,8 @@ USING (true);`;
                             const reminderEvent: CompanyEvent = {
                               id: newEventId,
                               title: `Seguimiento: ${lead.name}`,
-                              description: `${newFollowUpReminderAction || 'Seguimiento Lead'}\n[LeadID: ${lead.id}]`,
+                              description: `${newFollowUpReminderAction || 'Seguimiento Lead'}\
+[LeadID: ${lead.id}]`,
                               event_date: newFollowUpReminderDate,
                               remind_one_week: false,
                               remind_one_day: true,
@@ -18957,7 +18830,7 @@ USING (true);`;
                   {/* Notes History */}
                   <div>
                     <h4 style={{ margin: '0 0 8px 0', borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: '4px' }}>
-                      📝 {language === 'es' ? 'Historial de Notas' : 'Notes History'}
+                      Ã°ÂÂÂ {language === 'es' ? 'Historial de Notas' : 'Notes History'}
                     </h4>
                     <div style={{ maxHeight: '200px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '8px', paddingRight: '4px' }}>
                       {notesList.length === 0 ? (
@@ -18968,7 +18841,7 @@ USING (true);`;
                         notesList.map((n, idx) => (
                           <div key={n.id || idx} style={{ background: 'rgba(255,255,255,0.03)', padding: '10px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.05)' }}>
                             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--text-muted)', marginBottom: '4px' }}>
-                              <span>👤 {language === 'es' ? 'Comentario' : 'Comment'}</span>
+                              <span>Ã°ÂÂÂ¤ {language === 'es' ? 'Comentario' : 'Comment'}</span>
                               <span>{new Date(n.date).toLocaleString()}</span>
                             </div>
                             <div style={{ fontSize: '13px', whiteSpace: 'pre-wrap' }}>{n.content}</div>
@@ -18981,7 +18854,7 @@ USING (true);`;
                   {/* Reminders List */}
                   <div>
                     <h4 style={{ margin: '0 0 8px 0', borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: '4px' }}>
-                      🔔 {language === 'es' ? 'Recordatorios Activos' : 'Active Reminders'}
+                      Ã°ÂÂÂ {language === 'es' ? 'Recordatorios Activos' : 'Active Reminders'}
                     </h4>
                     <div style={{ maxHeight: '150px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '8px', paddingRight: '4px' }}>
                       {leadEvents.length === 0 ? (
@@ -18995,10 +18868,12 @@ USING (true);`;
                             <div key={e.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: e.status === 'Realizado' ? 'rgba(255,255,255,0.01)' : 'rgba(16, 185, 129, 0.05)', padding: '10px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.05)' }}>
                               <div>
                                 <div style={{ fontWeight: 'bold', color: e.status === 'Realizado' ? 'var(--text-muted)' : '#a7f3d0', fontSize: '13px' }}>
-                                  📅 {e.event_date} {e.status === 'Realizado' && `(✓ ${language === 'es' ? 'Realizado' : 'Done'})`}
+                                  Ã°ÂÂÂ
+ {e.event_date} {e.status === 'Realizado' && `(Ã¢ÂÂ ${language === 'es' ? 'Realizado' : 'Done'})`}
                                 </div>
                                 <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '2px' }}>
-                                  {e.description ? e.description.split('\n')[0] : ''}
+                                  {e.description ? e.description.split('\
+')[0] : ''}
                                 </div>
                               </div>
                               {e.status === 'Pendiente' && (
@@ -19011,9 +18886,9 @@ USING (true);`;
                                     } catch {
                                       showToast('Error.', 'error');
                                     }
-                                  }}>✓</button>
+                                  }}>Ã¢ÂÂ</button>
                                   <button className="btn-danger btn-xs" style={{ padding: '2px 8px' }} onClick={async () => {
-                                    if (!await asyncConfirm(language === 'es' ? '¿Eliminar recordatorio?' : 'Delete reminder?')) return;
+                                    if (!await asyncConfirm(language === 'es' ? 'ÃÂ¿Eliminar recordatorio?' : 'Delete reminder?')) return;
                                     try {
                                       await deleteEvent(e.id);
                                       triggerReload();
@@ -19021,7 +18896,7 @@ USING (true);`;
                                     } catch {
                                       showToast('Error.', 'error');
                                     }
-                                  }}>✕</button>
+                                  }}>Ã¢ÂÂ</button>
                                 </div>
                               )}
                             </div>
@@ -19048,27 +18923,27 @@ USING (true);`;
               labelEs: 'Nuevo', 
               labelEn: 'New', 
               color: 'rgba(99, 102, 241, 0.08)', 
-              descEs: 'Lead recién registrado en la plataforma.', 
+              descEs: 'Lead reciÃÂ©n registrado en la plataforma.', 
               descEn: 'Newly registered prospect in the platform.', 
-              icon: '🆕' 
+              icon: 'Ã°ÂÂÂ' 
             },
             { 
               value: 'Contactado', 
               labelEs: 'En Seguimiento', 
               labelEn: 'In Follow-up', 
               color: 'rgba(245, 158, 11, 0.08)', 
-              descEs: 'Prospecto con seguimiento activo y comunicación continua.', 
+              descEs: 'Prospecto con seguimiento activo y comunicaciÃÂ³n continua.', 
               descEn: 'Prospect with active follow-ups and communication.', 
-              icon: '🔄' 
+              icon: 'Ã°ÂÂÂ' 
             },
             { 
               value: 'Convertido', 
               labelEs: 'Convertido', 
               labelEn: 'Converted', 
               color: 'rgba(16, 185, 129, 0.08)', 
-              descEs: '¡Venta concretada o suscripción completada con éxito!', 
+              descEs: 'ÃÂ¡Venta concretada o suscripciÃÂ³n completada con ÃÂ©xito!', 
               descEn: 'Sale closed or rental completed successfully!', 
-              icon: '🎯' 
+              icon: 'Ã°ÂÂÂ¯' 
             },
             { 
               value: 'Perdido', 
@@ -19077,7 +18952,7 @@ USING (true);`;
               color: 'rgba(239, 68, 68, 0.08)', 
               descEs: 'Prospecto cerrado sin concretar la venta.', 
               descEn: 'Prospect closed without finalizing a sale.', 
-              icon: '❌' 
+              icon: 'Ã¢ÂÂ' 
             }
           ];
 
@@ -19085,13 +18960,13 @@ USING (true);`;
             <div className="modal-overlay">
               <div className="modal-content" style={{ maxWidth: '500px' }}>
                 <div className="modal-header">
-                  <h3>🔄 {language === 'es' ? `Cambiar Estado: ${lead.name}` : `Change Status: ${lead.name}`}</h3>
-                  <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+                  <h3>Ã°ÂÂÂ {language === 'es' ? `Cambiar Estado: ${lead.name}` : `Change Status: ${lead.name}`}</h3>
+                  <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
                 </div>
                 <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                   <p style={{ fontSize: '13px', color: 'var(--text-muted)', margin: 0 }}>
                     {language === 'es' 
-                      ? 'Selecciona el estado actual del prospecto para actualizar su posición en el embudo comercial:' 
+                      ? 'Selecciona el estado actual del prospecto para actualizar su posiciÃÂ³n en el embudo comercial:' 
                       : 'Select the prospect\'s current status to update their position in the commercial funnel:'}
                   </p>
 
@@ -19106,7 +18981,7 @@ USING (true);`;
                               await upsertLead({ ...lead, status: opt.value });
                               triggerReload();
                               setModalType(null);
-                              showToast(language === 'es' ? 'Estado actualizado con éxito.' : 'Status updated successfully.', 'success');
+                              showToast(language === 'es' ? 'Estado actualizado con ÃÂ©xito.' : 'Status updated successfully.', 'success');
                             } catch {
                               showToast('Error.', 'error');
                             }
@@ -19161,8 +19036,8 @@ USING (true);`;
         <div className="modal-overlay">
           <div className="modal-content" style={{ maxWidth: '550px' }}>
             <div className="modal-header">
-              <h3>📲 {language === 'es' ? `Enviar WhatsApp: ${whatsappName}` : `Send WhatsApp: ${whatsappName}`}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => { setWhatsappModalOpen(false); setModalType(null); }}>✕</button>
+              <h3>Ã°ÂÂÂ² {language === 'es' ? `Enviar WhatsApp: ${whatsappName}` : `Send WhatsApp: ${whatsappName}`}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => { setWhatsappModalOpen(false); setModalType(null); }}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div className="form-group">
@@ -19175,21 +19050,21 @@ USING (true);`;
                   rows={6}
                   value={whatsappMessageText}
                   onChange={(e) => setWhatsappMessageText(e.target.value)}
-                  placeholder={language === 'es' ? 'Escribe tu mensaje aquí...' : 'Write your message here...'}
+                  placeholder={language === 'es' ? 'Escribe tu mensaje aquÃÂ­...' : 'Write your message here...'}
                   style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit', fontSize: '14px', lineHeight: '1.5' }}
                 />
               </div>
 
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '-8px' }}>
                 <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: 0 }}>
-                  💡 {language === 'es' ? 'Tip: Usa {nombre} en la plantilla para personalizar el nombre.' : 'Tip: Use {nombre} in the template for dynamic names.'}
+                  Ã°ÂÂÂ¡ {language === 'es' ? 'Tip: Usa {nombre} en la plantilla para personalizar el nombre.' : 'Tip: Use {nombre} in the template for dynamic names.'}
                 </p>
                 <button
                   className="btn-secondary btn-xs"
                   onClick={handleSaveWhatsappTemplate}
                   style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '4px 8px' }}
                 >
-                  💾 {language === 'es' ? 'Guardar como plantilla' : 'Save as template'}
+                  Ã°ÂÂÂ¾ {language === 'es' ? 'Guardar como plantilla' : 'Save as template'}
                 </button>
               </div>
 
@@ -19198,7 +19073,7 @@ USING (true);`;
                 <div style={{ borderTop: '1px solid rgba(255, 255, 255, 0.08)', paddingTop: '12px' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap', gap: '8px' }}>
                     <h4 style={{ fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--text-muted)', margin: 0 }}>
-                      💬 {language === 'es' ? 'Insertar Respuesta Rápida' : 'Insert Quick Reply'}
+                      Ã°ÂÂÂ¬ {language === 'es' ? 'Insertar Respuesta RÃÂ¡pida' : 'Insert Quick Reply'}
                     </h4>
                     
                     {/* Language Filter Pills */}
@@ -19206,12 +19081,12 @@ USING (true);`;
                       {(['all', 'es', 'en', 'pt'] as const).map(langVal => {
                         const isActive = qrModalFilterLang === langVal;
                         const label = langVal === 'all' 
-                          ? (language === 'es' ? '🌍 Todos' : '🌍 All')
+                          ? (language === 'es' ? 'Ã°ÂÂÂ Todos' : 'Ã°ÂÂÂ All')
                           : langVal === 'es'
-                          ? '🇪🇸 ES'
+                          ? 'Ã°ÂÂÂªÃ°ÂÂÂ¸ ES'
                           : langVal === 'en'
-                          ? '🇬🇧 EN'
-                          : '🇵🇹 PT';
+                          ? 'Ã°ÂÂÂ¬Ã°ÂÂÂ§ EN'
+                          : 'Ã°ÂÂÂµÃ°ÂÂÂ¹ PT';
                         return (
                           <button
                             key={langVal}
@@ -19246,7 +19121,7 @@ USING (true);`;
                     if (filtered.length === 0) {
                       return (
                         <p style={{ fontSize: '12px', color: 'var(--text-muted)', textAlign: 'center', margin: '16px 0' }}>
-                          {language === 'es' ? 'No hay respuestas rápidas en este idioma.' : 'No quick replies in this language.'}
+                          {language === 'es' ? 'No hay respuestas rÃÂ¡pidas en este idioma.' : 'No quick replies in this language.'}
                         </p>
                       );
                     }
@@ -19277,7 +19152,7 @@ USING (true);`;
                               }}
                               title={qr.content}
                             >
-                              ⚡ {parsed.cleanTitle}
+                              Ã¢ÂÂ¡ {parsed.cleanTitle}
                             </button>
                           );
                         })}
@@ -19321,7 +19196,7 @@ USING (true);`;
                     setModalType(null);
                   }}
                 >
-                  {language === 'es' ? 'Enviar Mensaje 📲' : 'Send Message 📲'}
+                  {language === 'es' ? 'Enviar Mensaje Ã°ÂÂÂ²' : 'Send Message Ã°ÂÂÂ²'}
                 </a>
               </div>
             </div>
@@ -19331,20 +19206,20 @@ USING (true);`;
 
       {/* MODAL: Report Theft/Loss */}
       {reportTheftOpen && (() => {
-        const activeRental = rentals.find(r => r.bike_id === reportTheftBikeId && (r.status === 'Activo' || r.status === 'Devolución en Proceso'));
+        const activeRental = rentals.find(r => r.bike_id === reportTheftBikeId && (r.status === 'Activo' || r.status === 'DevoluciÃÂ³n en Proceso'));
         const associatedRentalItems = activeRental ? rentalItems.filter(item => item.rental_id === activeRental.id) : [];
 
         return (
           <div className="modal-overlay">
             <div className="modal-content" style={{ maxWidth: '450px' }}>
               <div className="modal-header">
-                <h3>🚨 {language === 'es' ? 'Reportar Robo / Pérdida' : 'Report Theft / Loss'}</h3>
-                <button className="btn-secondary btn-xs" onClick={() => setReportTheftOpen(false)}>✕</button>
+                <h3>Ã°ÂÂÂ¨ {language === 'es' ? 'Reportar Robo / PÃÂ©rdida' : 'Report Theft / Loss'}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setReportTheftOpen(false)}>Ã¢ÂÂ</button>
               </div>
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                 <p style={{ fontSize: '14px', color: 'var(--text-color)' }}>
                   {language === 'es' 
-                    ? 'Seleccione el estado que desea aplicar al vehículo y elija qué otros artículos asociados también se perdieron o robaron:'
+                    ? 'Seleccione el estado que desea aplicar al vehÃÂ­culo y elija quÃÂ© otros artÃÂ­culos asociados tambiÃÂ©n se perdieron o robaron:'
                     : 'Select the status you want to apply to the vehicle and choose which other associated items were also lost or stolen:'}
                 </p>
                 
@@ -19357,7 +19232,7 @@ USING (true);`;
                       checked={reportTheftType === 'Robada'} 
                       onChange={() => setReportTheftType('Robada')}
                     />
-                    <span>🚨 {language === 'es' ? 'Robada' : 'Stolen'}</span>
+                    <span>Ã°ÂÂÂ¨ {language === 'es' ? 'Robada' : 'Stolen'}</span>
                   </label>
                   <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontWeight: reportTheftType === 'Perdida/Garda' ? 'bold' : 'normal', color: reportTheftType === 'Perdida/Garda' ? '#f87171' : 'var(--text-color)' }}>
                     <input 
@@ -19367,14 +19242,14 @@ USING (true);`;
                       checked={reportTheftType === 'Perdida/Garda'} 
                       onChange={() => setReportTheftType('Perdida/Garda')}
                     />
-                    <span>🔍 {language === 'es' ? 'Perdida/Garda' : 'Lost/Garda'}</span>
+                    <span>Ã°ÂÂÂ {language === 'es' ? 'Perdida/Garda' : 'Lost/Garda'}</span>
                   </label>
                 </div>
 
                 {associatedRentalItems.length > 0 && (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                     <h4 style={{ fontSize: '13px', color: 'var(--text-bright)', margin: '4px 0 0 0' }}>
-                      📋 {language === 'es' ? 'Artículos asociados en el alquiler:' : 'Associated items in the rental:'}
+                      Ã°ÂÂÂ {language === 'es' ? 'ArtÃÂ­culos asociados en el alquiler:' : 'Associated items in the rental:'}
                     </h4>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', background: 'rgba(0,0,0,0.2)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
                       {associatedRentalItems.map(item => {
@@ -19399,8 +19274,8 @@ USING (true);`;
                       })}
                     </div>
                     <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: 0, fontStyle: 'italic' }}>
-                      💡 {language === 'es' 
-                        ? 'Los artículos no marcados volverán automáticamente al estado "Disponible".'
+                      Ã°ÂÂÂ¡ {language === 'es' 
+                        ? 'Los artÃÂ­culos no marcados volverÃÂ¡n automÃÂ¡ticamente al estado "Disponible".'
                         : 'Unmarked items will automatically return to the "Available" status.'}
                     </p>
                   </div>
@@ -19419,7 +19294,7 @@ USING (true);`;
 
                       const statusStr = reportTheftType === 'Robada' ? (language === 'es' ? 'Robada' : 'Stolen') : (language === 'es' ? 'Perdida/Garda' : 'Lost/Garda');
                       const confirmMsg = language === 'es'
-                        ? `¿Estás seguro de que quieres reportar este vehículo como ${statusStr}?`
+                        ? `ÃÂ¿EstÃÂ¡s seguro de que quieres reportar este vehÃÂ­culo como ${statusStr}?`
                         : `Are you sure you want to report this vehicle as ${statusStr}?`;
 
                       if (!await asyncConfirm(confirmMsg)) return;
@@ -19454,7 +19329,7 @@ USING (true);`;
                             ...activeRental,
                             status: 'Inactivo' as const,
                             end_date: new Date().toISOString().split('T')[0],
-                            damage_report: reportTheftType === 'Robada' ? 'Robo reportado' : 'Pérdida/Garda reportada'
+                            damage_report: reportTheftType === 'Robada' ? 'Robo reportado' : 'PÃÂ©rdida/Garda reportada'
                           };
                           updates.push(upsertRental(endedRental));
                         }
@@ -19489,8 +19364,8 @@ USING (true);`;
         <div className="modal-overlay">
           <div className="modal-content" style={{ maxWidth: '500px' }}>
             <div className="modal-header">
-              <h3>🏬 {selectedProductId ? (language === 'es' ? 'Editar Proveedor' : 'Edit Supplier') : (language === 'es' ? 'Nuevo Proveedor' : 'New Supplier')}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+              <h3>Ã°ÂÂÂ¬ {selectedProductId ? (language === 'es' ? 'Editar Proveedor' : 'Edit Supplier') : (language === 'es' ? 'Nuevo Proveedor' : 'New Supplier')}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div className="form-group">
@@ -19503,7 +19378,7 @@ USING (true);`;
                   <input type="text" className="form-control" value={supFormContact} onChange={e => setSupFormContact(e.target.value)} />
                 </div>
                 <div className="form-group">
-                  <label className="form-label">{language === 'es' ? 'Teléfono' : 'Phone'}</label>
+                  <label className="form-label">{language === 'es' ? 'TelÃÂ©fono' : 'Phone'}</label>
                   <input type="text" className="form-control" value={supFormPhone} onChange={e => setSupFormPhone(e.target.value)} />
                 </div>
               </div>
@@ -19518,7 +19393,7 @@ USING (true);`;
                 </div>
               </div>
               <div className="form-group">
-                <label className="form-label">{language === 'es' ? 'Dirección' : 'Address'}</label>
+                <label className="form-label">{language === 'es' ? 'DirecciÃÂ³n' : 'Address'}</label>
                 <input type="text" className="form-control" value={supFormAddress} onChange={e => setSupFormAddress(e.target.value)} />
               </div>
               <div className="form-group">
@@ -19543,7 +19418,7 @@ USING (true);`;
                   setModalType(null);
                   showToast(language === 'es' ? 'Proveedor guardado.' : 'Supplier saved.', 'success');
                 } catch { showToast('Error.', 'error'); }
-              }}>💾 {language === 'es' ? 'Guardar' : 'Save'}</button>
+              }}>Ã°ÂÂÂ¾ {language === 'es' ? 'Guardar' : 'Save'}</button>
             </div>
           </div>
         </div>
@@ -19554,8 +19429,8 @@ USING (true);`;
         <div className="modal-overlay">
           <div className="modal-content" style={{ maxWidth: '500px' }}>
             <div className="modal-header">
-              <h3>📦 {selectedProductId ? (language === 'es' ? 'Editar Producto de Catálogo' : 'Edit Catalog Product') : (language === 'es' ? 'Nuevo Producto de Catálogo' : 'New Catalog Product')}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+              <h3>Ã°ÂÂÂ¦ {selectedProductId ? (language === 'es' ? 'Editar Producto de CatÃÂ¡logo' : 'Edit Catalog Product') : (language === 'es' ? 'Nuevo Producto de CatÃÂ¡logo' : 'New Catalog Product')}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div className="form-group">
@@ -19573,16 +19448,16 @@ USING (true);`;
               </div>
               <div className="form-grid">
                 <div className="form-group">
-                  <label className="form-label">{language === 'es' ? 'Categoría' : 'Category'}</label>
+                  <label className="form-label">{language === 'es' ? 'CategorÃÂ­a' : 'Category'}</label>
                   <select className="form-control" value={spFormCategory} onChange={e => setSpFormCategory(e.target.value as any)}>
                     <option value="Bicicleta">{language === 'es' ? 'Bicicleta' : 'Bike'}</option>
-                    <option value="Batería">{language === 'es' ? 'Batería' : 'Battery'}</option>
+                    <option value="BaterÃÂ­a">{language === 'es' ? 'BaterÃÂ­a' : 'Battery'}</option>
                     <option value="Repuesto">{language === 'es' ? 'Repuesto' : 'Spare Part'}</option>
                     <option value="Accesorio">{language === 'es' ? 'Accesorio' : 'Accessory'}</option>
                   </select>
                 </div>
                 <div className="form-group">
-                  <label className="form-label">{language === 'es' ? 'Costo (€)' : 'Cost (€)'}</label>
+                  <label className="form-label">{language === 'es' ? 'Costo (Ã¢ÂÂ¬)' : 'Cost (Ã¢ÂÂ¬)'}</label>
                   <input type="number" className="form-control" value={spFormCost} onChange={e => setSpFormCost(e.target.value ? Number(e.target.value) : '')} />
                 </div>
               </div>
@@ -19592,7 +19467,7 @@ USING (true);`;
                   <input type="number" className="form-control" value={spFormMoq} onChange={e => setSpFormMoq(e.target.value ? Number(e.target.value) : '')} />
                 </div>
                 <div className="form-group">
-                  <label className="form-label">{language === 'es' ? 'Tiempo de Entrega (Días)' : 'Delivery Time (Days)'}</label>
+                  <label className="form-label">{language === 'es' ? 'Tiempo de Entrega (DÃÂ­as)' : 'Delivery Time (Days)'}</label>
                   <input type="number" className="form-control" value={spFormDelivery} onChange={e => setSpFormDelivery(e.target.value ? Number(e.target.value) : '')} />
                 </div>
               </div>
@@ -19621,9 +19496,9 @@ USING (true);`;
                   await upsertSupplierProduct(sp);
                   triggerReload();
                   setModalType(null);
-                  showToast(language === 'es' ? 'Producto de catálogo guardado.' : 'Catalog product saved.', 'success');
+                  showToast(language === 'es' ? 'Producto de catÃÂ¡logo guardado.' : 'Catalog product saved.', 'success');
                 } catch { showToast('Error.', 'error'); }
-              }}>💾 {language === 'es' ? 'Guardar' : 'Save'}</button>
+              }}>Ã°ÂÂÂ¾ {language === 'es' ? 'Guardar' : 'Save'}</button>
             </div>
           </div>
         </div>
@@ -19637,20 +19512,20 @@ USING (true);`;
           <div className="modal-overlay">
             <div className="modal-content" style={{ maxWidth: '420px' }}>
               <div className="modal-header">
-                <h3>💶 {t.addEarning}: {acc.owner_name}</h3>
-                <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+                <h3>Ã°ÂÂÂ¶ {t.addEarning}: {acc.owner_name}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
               </div>
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                 <p style={{ fontSize: '14px', color: 'var(--text-bright)', lineHeight: '1.5', margin: 0 }}>
                   {language === 'es'
-                    ? `¿Confirmar el registro del pago de la tarifa semanal para la cuenta de ${acc.owner_name}?`
+                    ? `ÃÂ¿Confirmar el registro del pago de la tarifa semanal para la cuenta de ${acc.owner_name}?`
                     : `Confirm registering the weekly payment for ${acc.owner_name}'s account?`
                   }
                 </p>
                 <div style={{ background: 'rgba(255,255,255,0.04)', padding: '12px', borderRadius: '8px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <span style={{ color: 'var(--text-muted)', fontSize: '13px' }}>{language === 'es' ? 'Monto semanal:' : 'Weekly amount:'}</span>
-                    <strong style={{ color: 'var(--color-primary)', fontSize: '15px' }}>€{earnFormAmount}</strong>
+                    <strong style={{ color: 'var(--color-primary)', fontSize: '15px' }}>Ã¢ÂÂ¬{earnFormAmount}</strong>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <span style={{ color: 'var(--text-muted)', fontSize: '13px' }}>{language === 'es' ? 'Fecha de pago:' : 'Payment date:'}</span>
@@ -19672,7 +19547,7 @@ USING (true);`;
                     triggerReload(); setModalType(null); 
                     showToast(language === 'es' ? 'Pago registrado.' : 'Payment logged.', 'success');
                   } catch { showToast('Error.', 'error'); }
-                }}>💾 {t.logPayment}</button>
+                }}>Ã°ÂÂÂ¾ {t.logPayment}</button>
               </div>
             </div>
           </div>
@@ -19693,14 +19568,14 @@ USING (true);`;
         if (prod.purchase_date) {
           ledgerItems.push({
             date: prod.purchase_date,
-            description: language === 'es' ? 'Adquisición de E-Bike (Inversión Inicial)' : 'E-Bike Acquisition (Initial Investment)',
+            description: language === 'es' ? 'AdquisiciÃÂ³n de E-Bike (InversiÃÂ³n Inicial)' : 'E-Bike Acquisition (Initial Investment)',
             amount: -prod.price_paid,
             type: 'cost'
           });
         } else if (prod.date_added) {
           ledgerItems.push({
             date: prod.date_added.split('T')[0],
-            description: language === 'es' ? 'Adquisición de E-Bike (Inversión Inicial)' : 'E-Bike Acquisition (Initial Investment)',
+            description: language === 'es' ? 'AdquisiciÃÂ³n de E-Bike (InversiÃÂ³n Inicial)' : 'E-Bike Acquisition (Initial Investment)',
             amount: -prod.price_paid,
             type: 'cost'
           });
@@ -19748,7 +19623,7 @@ USING (true);`;
             ledgerItems.push({
               date: r.end_date || r.start_date,
               description: (language === 'es'
-                ? `${isRentalActive ? 'Depósito en garantía' : 'Depósito retenido'} (Rider: ${riderName})`
+                ? `${isRentalActive ? 'DepÃÂ³sito en garantÃÂ­a' : 'DepÃÂ³sito retenido'} (Rider: ${riderName})`
                 : `${isRentalActive ? 'Security deposit' : 'Retained deposit'} (Rider: ${riderName})`) + (r.deposit_received_via ? ` (${r.deposit_received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''),
               amount: retained,
               type: 'deposit'
@@ -19806,8 +19681,8 @@ USING (true);`;
           <div className="modal-overlay">
             <div className="modal-content" style={{ maxWidth: '650px', maxHeight: '90vh', display: 'flex', flexDirection: 'column' }}>
               <div className="modal-header">
-                <h3>📊 {language === 'es' ? 'Historial e Ingresos de ROI' : 'ROI Payouts & History'}</h3>
-                <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+                <h3>Ã°ÂÂÂ {language === 'es' ? 'Historial e Ingresos de ROI' : 'ROI Payouts & History'}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
               </div>
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '20px', overflowY: 'auto' }}>
                 
@@ -19816,7 +19691,7 @@ USING (true);`;
                   <div>
                     <h4 style={{ margin: 0, fontSize: '16px', color: 'var(--text-bright)' }}>{prod.name}</h4>
                     <p style={{ margin: '4px 0 0 0', fontSize: '12px', color: 'var(--text-muted)' }}>
-                      {language === 'es' ? 'Código de Stock:' : 'Stock Code:'} <strong>{prod.serial_number.replace(/^([A-Za-z]+)(\d+)$/, '$1-$2')}</strong>
+                      {language === 'es' ? 'CÃÂ³digo de Stock:' : 'Stock Code:'} <strong>{prod.serial_number.replace(/^([A-Za-z]+)(\d+)$/, '$1-$2')}</strong>
                     </p>
                   </div>
                   <span className={`roi-badge ${roiColorClass}`} style={{ fontSize: '18px', padding: '8px 16px', borderRadius: '8px', fontWeight: 700 }}>
@@ -19827,21 +19702,21 @@ USING (true);`;
                 {/* Key Metric Blocks */}
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '12px' }}>
                   <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.04)' }}>
-                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Inversión Inicial' : 'Initial Investment'}</span>
-                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#f87171' }}>-€{stats.cost}</h5>
+                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{language === 'es' ? 'InversiÃÂ³n Inicial' : 'Initial Investment'}</span>
+                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#f87171' }}>-Ã¢ÂÂ¬{stats.cost}</h5>
                   </div>
                   <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.04)' }}>
                     <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Ingresos Totales' : 'Total Revenues'}</span>
-                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#34d399' }}>+€{totalRevenues}</h5>
+                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#34d399' }}>+Ã¢ÂÂ¬{totalRevenues}</h5>
                   </div>
                   <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.04)' }}>
                     <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Gastos Taller/Otros' : 'Garage/Other Exp.'}</span>
-                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#fb923c' }}>-€{stats.totalExp}</h5>
+                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#fb923c' }}>-Ã¢ÂÂ¬{stats.totalExp}</h5>
                   </div>
                   <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.04)' }}>
                     <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Retorno Neto' : 'Net Returns'}</span>
                     <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: netProfit >= 0 ? '#34d399' : '#f87171' }}>
-                      {netProfit >= 0 ? '+' : ''}€{netProfit}
+                      {netProfit >= 0 ? '+' : ''}Ã¢ÂÂ¬{netProfit}
                     </h5>
                   </div>
                 </div>
@@ -19849,7 +19724,7 @@ USING (true);`;
                 {/* Ledger Timeline */}
                 <div>
                   <h4 style={{ color: 'var(--color-primary)', marginBottom: '12px', fontSize: '14px', fontWeight: 600 }}>
-                    🕒 {language === 'es' ? 'Historial de Transacciones (Libro de Cuentas)' : 'Transaction Ledger'}
+                    Ã°ÂÂÂ {language === 'es' ? 'Historial de Transacciones (Libro de Cuentas)' : 'Transaction Ledger'}
                   </h4>
                   {ledgerItems.length === 0 ? (
                     <p style={{ color: 'var(--text-muted)', fontSize: '13px', fontStyle: 'italic', margin: 0 }}>
@@ -19861,13 +19736,21 @@ USING (true);`;
                         const isPositive = item.amount >= 0;
                         const amtColor = isPositive ? '#34d399' : '#f87171';
                         return (
-                          <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(0,0,0,0.12)', padding: '10px 14px', borderRadius: '8px', fontSize: '13px', borderLeft: `3px solid ${amtColor}` }}>
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                              <span style={{ color: 'var(--text-bright)', fontWeight: 500 }}>{item.description}</span>
-                              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>📅 {formatDate(item.date)}</span>
+                          <div
+                            key={idx}
+                            onClick={() => setLedgerDetail(item)}
+                            title={language === 'es' ? 'Ver detalle' : 'View detail'}
+                            style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(0,0,0,0.12)', padding: '10px 14px', borderRadius: '8px', fontSize: '13px', borderLeft: `3px solid ${amtColor}`, cursor: 'pointer' }}
+                          >
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 }}>
+                              <span style={{ color: 'var(--text-bright)', fontWeight: 500 }}>
+                                {item.description.length > 60 ? `${item.description.slice(0, 60)}...` : item.description}
+                              </span>
+                              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Ã°ÂÂÂ
+ {formatDate(item.date)}</span>
                             </div>
                             <strong style={{ color: amtColor, fontSize: '14px', whiteSpace: 'nowrap', marginLeft: '12px' }}>
-                              {isPositive ? '+' : ''}€{item.amount}
+                              {isPositive ? '+' : ''}Ã¢ÂÂ¬{item.amount}
                             </strong>
                           </div>
                         );
@@ -19878,8 +19761,8 @@ USING (true);`;
 
                 {/* Formula explanation note */}
                 <div style={{ marginTop: '4px', background: 'rgba(52, 211, 153, 0.04)', border: '1px dashed rgba(52, 211, 153, 0.2)', padding: '12px', borderRadius: '8px', fontSize: '11.5px', color: 'var(--text-muted)', lineHeight: '1.4' }}>
-                  💡 {language === 'es'
-                    ? "El ROI (Retorno de Inversión) se calcula como: (Ingresos Totales + Valor de Venta - Gastos de Mantenimiento - Costo de Compra) dividido por el Costo de Compra. Las baterías, candados y accesorios se incluyen gratis con el alquiler de la bicicleta, por lo que el 100% de los ingresos le corresponden a la E-Bike."
+                  Ã°ÂÂÂ¡ {language === 'es'
+                    ? "El ROI (Retorno de InversiÃÂ³n) se calcula como: (Ingresos Totales + Valor de Venta - Gastos de Mantenimiento - Costo de Compra) dividido por el Costo de Compra. Las baterÃÂ­as, candados y accesorios se incluyen gratis con el alquiler de la bicicleta, por lo que el 100% de los ingresos le corresponden a la E-Bike."
                     : "ROI is calculated as: (Total Revenues + Sale Value - Maintenance Expenses - Purchase Cost) / Purchase Cost. Batteries, locks and accessories are free with the bike rental, meaning 100% of revenues are assigned to the E-Bike."
                   }
                 </div>
@@ -19904,8 +19787,8 @@ USING (true);`;
           <div className="modal-overlay">
             <div className="modal-content" style={{ maxWidth: '750px' }}>
               <div className="modal-header">
-                <h3>📊 {language === 'es' ? `Historial de Alquiler: ${bike.serial_number}` : `Rental History: ${bike.serial_number}`}</h3>
-                <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+                <h3>Ã°ÂÂÂ {language === 'es' ? `Historial de Alquiler: ${bike.serial_number}` : `Rental History: ${bike.serial_number}`}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
               </div>
               <div className="modal-body">
                 <p style={{ fontSize: '13px', color: 'var(--text-muted)', marginBottom: '16px' }}>
@@ -19924,9 +19807,9 @@ USING (true);`;
                       <thead>
                         <tr>
                           <th>Rider</th>
-                          <th>{language === 'es' ? 'Período' : 'Period'}</th>
+                          <th>{language === 'es' ? 'PerÃÂ­odo' : 'Period'}</th>
                           <th>{language === 'es' ? 'Estado' : 'Status'}</th>
-                          <th>{language === 'es' ? 'Acción' : 'Action'}</th>
+                          <th>{language === 'es' ? 'AcciÃÂ³n' : 'Action'}</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -19954,7 +19837,7 @@ USING (true);`;
                                 )}
                               </td>
                               <td>
-                                <span className={`badge ${r.status === 'Activo' ? 'status-rented' : r.status === 'Devolución en Proceso' ? 'status-maintenance' : 'status-sold'}`}>
+                                <span className={`badge ${r.status === 'Activo' ? 'status-rented' : r.status === 'DevoluciÃÂ³n en Proceso' ? 'status-maintenance' : 'status-sold'}`}>
                                   {r.status === 'Inactivo' ? (language === 'es' ? 'Finalizado' : 'Finished') : r.status}
                                 </span>
                               </td>
@@ -19964,10 +19847,11 @@ USING (true);`;
                                     className="btn-secondary btn-xs"
                                     onClick={() => {
                                       setActiveCustomerId(rider.id);
+                                      setProfileRentalId(null);
                                       setModalType(null);
                                     }}
                                   >
-                                    📋 {language === 'es' ? 'Ver Expediente' : 'View Profile'}
+                                    Ã°ÂÂÂ {language === 'es' ? 'Ver Expediente' : 'View Profile'}
                                   </button>
                                 )}
                               </td>
@@ -19989,8 +19873,8 @@ USING (true);`;
         <div className="modal-overlay">
           <div className="modal-content">
             <div className="modal-header">
-              <h3>📝 {t.addJournalEntry}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+              <h3>Ã°ÂÂÂ {t.addJournalEntry}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div className="form-group"><label className="form-label">{language === 'es' ? 'Fecha' : 'Date'}</label><input type="date" className="form-control" value={noteFormDate} onChange={e => setNoteFormDate(e.target.value)} /></div>
@@ -20001,7 +19885,7 @@ USING (true);`;
                   await insertAccountNote({ id: crypto.randomUUID(), account_id: activeAccountId, note: noteFormText, date: noteFormDate, created_at: new Date().toISOString() });
                   triggerReload(); setModalType(null); showToast('Nota guardada.', 'success');
                 } catch { showToast('Error.', 'error'); }
-              }}>💾 {t.save}</button>
+              }}>Ã°ÂÂÂ¾ {t.save}</button>
             </div>
           </div>
         </div>
@@ -20012,8 +19896,8 @@ USING (true);`;
         <div className="modal-overlay" style={{ zIndex: 1100 }}>
           <div className="modal-content">
             <div className="modal-header">
-              <h3>🏷️ {language === 'es' ? 'Prefijos de Código de Stock' : 'Stock Code Prefixes'}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+              <h3>Ã°ÂÂÂ·Ã¯Â¸Â {language === 'es' ? 'Prefijos de CÃÂ³digo de Stock' : 'Stock Code Prefixes'}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
@@ -20022,14 +19906,14 @@ USING (true);`;
                   const catLabel = cat ? ` (${language === 'es' ? cat.name_es : cat.name_en})` : '';
                   return (
                     <div key={pf.id} style={{ display: 'flex', justifyContent: 'space-between', padding: '10px', background: 'rgba(0,0,0,0.1)', borderRadius: '8px' }}>
-                      <span><strong>{pf.prefix}</strong> — {pf.description}{catLabel}</span>
+                      <span><strong>{pf.prefix}</strong> Ã¢ÂÂ {pf.description}{catLabel}</span>
                       <div style={{ display: 'flex', gap: '6px' }}>
                         <button className="btn-secondary btn-xs" onClick={() => {
                           setEditingPrefixId(pf.id);
                           setPfFormPrefix(pf.prefix);
                           setPfFormDesc(pf.description);
                           setPfFormCategoryId(pf.category_id || '');
-                        }} title={language === 'es' ? 'Editar' : 'Edit'}>✏️</button>
+                        }} title={language === 'es' ? 'Editar' : 'Edit'}>Ã¢ÂÂÃ¯Â¸Â</button>
                         <button className="btn-danger btn-xs" onClick={async () => {
                           try {
                             await deletePrefix(pf.id);
@@ -20039,26 +19923,26 @@ USING (true);`;
                             console.error('Error deleting prefix:', err);
                             showToast(language === 'es' ? 'Error al eliminar prefijo.' : 'Error deleting prefix.', 'error');
                           }
-                        }}>✕</button>
+                        }}>Ã¢ÂÂ</button>
                       </div>
                     </div>
                   );
                 })}
               </div>
               <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '16px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                <h4>{editingPrefixId ? (language === 'es' ? '✏️ Editar Prefijo' : '✏️ Edit Prefix') : `+ ${language === 'es' ? 'Crear Nuevo Prefijo' : 'Create New Prefix'}`}</h4>
+                <h4>{editingPrefixId ? (language === 'es' ? 'Ã¢ÂÂÃ¯Â¸Â Editar Prefijo' : 'Ã¢ÂÂÃ¯Â¸Â Edit Prefix') : `+ ${language === 'es' ? 'Crear Nuevo Prefijo' : 'Create New Prefix'}`}</h4>
                 <div className="form-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))' }}>
                   <div className="form-group"><label className="form-label">{language === 'es' ? 'Prefijo (ej: B-)' : 'Prefix (e.g., B-)'}</label><input type="text" className="form-control" value={pfFormPrefix} onChange={e => setPfFormPrefix(e.target.value)} /></div>
-                  <div className="form-group"><label className="form-label">{language === 'es' ? 'Descripción' : 'Description'}</label><input type="text" className="form-control" value={pfFormDesc} onChange={e => setPfFormDesc(e.target.value)} /></div>
+                  <div className="form-group"><label className="form-label">{language === 'es' ? 'DescripciÃÂ³n' : 'Description'}</label><input type="text" className="form-control" value={pfFormDesc} onChange={e => setPfFormDesc(e.target.value)} /></div>
                   <div className="form-group">
-                    <label className="form-label">{language === 'es' ? 'Categoría' : 'Category'}</label>
+                    <label className="form-label">{language === 'es' ? 'CategorÃÂ­a' : 'Category'}</label>
                     <select 
                       className="form-control" 
                       value={pfFormCategoryId} 
                       onChange={e => setPfFormCategoryId(e.target.value)}
                       disabled={!isPrefixCategorySupported}
                     >
-                      <option value="">{language === 'es' ? '-- Sin categoría --' : '-- No category --'}</option>
+                      <option value="">{language === 'es' ? '-- Sin categorÃÂ­a --' : '-- No category --'}</option>
                       {categories.map(c => (
                         <option key={c.id} value={c.id}>
                           {language === 'es' ? c.name_es : c.name_en}
@@ -20070,7 +19954,7 @@ USING (true);`;
                 {!isPrefixCategorySupported && (
                   <div className="glass-card" style={{ padding: '12px', background: 'rgba(239, 68, 68, 0.08)', border: '1px solid rgba(239, 68, 68, 0.3)', borderRadius: '8px', fontSize: '12px' }}>
                     <p style={{ margin: 0, color: '#f87171' }}>
-                      ⚠️ <strong>Actualización SQL necesaria:</strong> Para habilitar la selección de categorías en los prefijos, copia y ejecuta el siguiente comando en el SQL Editor de tu Dashboard de Supabase:
+                      Ã¢ÂÂ Ã¯Â¸Â <strong>ActualizaciÃÂ³n SQL necesaria:</strong> Para habilitar la selecciÃÂ³n de categorÃÂ­as en los prefijos, copia y ejecuta el siguiente comando en el SQL Editor de tu Dashboard de Supabase:
                     </p>
                     <code style={{ display: 'block', margin: '8px 0', background: 'rgba(0,0,0,0.3)', padding: '6px', borderRadius: '4px', wordBreak: 'break-all', fontFamily: 'monospace' }}>
                       ALTER TABLE public.serial_prefixes ADD COLUMN IF NOT EXISTS category_id UUID REFERENCES public.categories(id) ON DELETE SET NULL;
@@ -20083,7 +19967,7 @@ USING (true);`;
                         showToast(language === 'es' ? 'SQL copiado al portapapeles.' : 'SQL copied to clipboard.', 'success');
                       }}
                     >
-                      📋 Copiar SQL
+                      Ã°ÂÂÂ Copiar SQL
                     </button>
                   </div>
                 )}
@@ -20103,7 +19987,7 @@ USING (true);`;
                       console.error('Error saving prefix:', err);
                       showToast(language === 'es' ? 'Error al guardar prefijo.' : 'Error saving prefix.', 'error');
                     }
-                  }}>💾 {t.save}</button>
+                  }}>Ã°ÂÂÂ¾ {t.save}</button>
                   {editingPrefixId && (
                     <button type="button" className="btn-secondary" onClick={() => {
                       setPfFormPrefix(''); setPfFormDesc(''); setPfFormCategoryId(''); setEditingPrefixId(null);
@@ -20123,8 +20007,8 @@ USING (true);`;
         <div className="modal-overlay" style={{ zIndex: 1100 }}>
           <div className="modal-content">
             <div className="modal-header">
-              <h3>📁 {language === 'es' ? 'Categorías de Stock' : 'Stock Categories'}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+              <h3>Ã°ÂÂÂ {language === 'es' ? 'CategorÃÂ­as de Stock' : 'Stock Categories'}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
@@ -20136,12 +20020,12 @@ USING (true);`;
                         try {
                           await deleteCategory(cat.id);
                           triggerReload();
-                          showToast(language === 'es' ? 'Categoría eliminada.' : 'Category deleted.', 'success');
+                          showToast(language === 'es' ? 'CategorÃÂ­a eliminada.' : 'Category deleted.', 'success');
                         } catch (err) {
                           console.error('Error deleting category:', err);
-                          showToast(language === 'es' ? 'Error al eliminar categoría.' : 'Error deleting category.', 'error');
+                          showToast(language === 'es' ? 'Error al eliminar categorÃÂ­a.' : 'Error deleting category.', 'error');
                         }
-                      }}>✕</button>
+                      }}>Ã¢ÂÂ</button>
                     )}
                   </div>
                 ))}
@@ -20157,12 +20041,12 @@ USING (true);`;
                   try {
                     await upsertCategory({ id: crypto.randomUUID(), name_es: catFormNameEs, name_en: catFormNameEn, is_deletable: true });
                     setCatFormNameEs(''); setCatFormNameEn(''); triggerReload();
-                    showToast(language === 'es' ? 'Categoría creada.' : 'Category created.', 'success');
+                    showToast(language === 'es' ? 'CategorÃÂ­a creada.' : 'Category created.', 'success');
                   } catch (err) {
                     console.error('Error creating category:', err);
-                    showToast(language === 'es' ? 'Error al crear categoría.' : 'Error creating category.', 'error');
+                    showToast(language === 'es' ? 'Error al crear categorÃÂ­a.' : 'Error creating category.', 'error');
                   }
-                }}>💾 {t.save}</button>
+                }}>Ã°ÂÂÂ¾ {t.save}</button>
               </div>
             </div>
           </div>
@@ -20173,8 +20057,8 @@ USING (true);`;
         <div className="modal-overlay" style={{ zIndex: 1200 }}>
           <div className="modal-content" style={{ maxWidth: '500px' }}>
             <div className="modal-header">
-              <h3>📁 {language === 'es' ? 'Gestor de Plataformas' : 'Platform Manager'}</h3>
-              <button className="btn-secondary btn-xs" type="button" onClick={() => { setShowAddPlatformModal(false); setNewPlatformName(''); setEditingPlatformId(null); setEditingPlatformName(''); }}>✕</button>
+              <h3>Ã°ÂÂÂ {language === 'es' ? 'Gestor de Plataformas' : 'Platform Manager'}</h3>
+              <button className="btn-secondary btn-xs" type="button" onClick={() => { setShowAddPlatformModal(false); setNewPlatformName(''); setEditingPlatformId(null); setEditingPlatformName(''); }}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '250px', overflowY: 'auto', paddingRight: '4px' }}>
@@ -20209,9 +20093,9 @@ USING (true);`;
                               }
                             }}
                           >
-                            💾
+                            Ã°ÂÂÂ¾
                           </button>
-                          <button className="btn-secondary btn-xs" type="button" onClick={() => { setEditingPlatformId(null); setEditingPlatformName(''); }}>✕</button>
+                          <button className="btn-secondary btn-xs" type="button" onClick={() => { setEditingPlatformId(null); setEditingPlatformName(''); }}>Ã¢ÂÂ</button>
                         </div>
                       </>
                     ) : (
@@ -20226,13 +20110,13 @@ USING (true);`;
                               setEditingPlatformName(p.name);
                             }}
                           >
-                            ✏️
+                            Ã¢ÂÂÃ¯Â¸Â
                           </button>
                           <button
                             className="btn-danger btn-xs"
                             type="button"
                             onClick={async () => {
-                              if (!await asyncConfirm(language === 'es' ? `¿Seguro que quieres eliminar "${p.name}"?` : `Are you sure you want to delete "${p.name}"?`)) return;
+                              if (!await asyncConfirm(language === 'es' ? `ÃÂ¿Seguro que quieres eliminar "${p.name}"?` : `Are you sure you want to delete "${p.name}"?`)) return;
                               try {
                                 await deletePlatform(p.id);
                                 const plats = await getPlatforms();
@@ -20247,7 +20131,7 @@ USING (true);`;
                               }
                             }}
                           >
-                            ✕
+                            Ã¢ÂÂ
                           </button>
                         </div>
                       </>
@@ -20290,7 +20174,7 @@ USING (true);`;
                     }
                   }}
                 >
-                  💾 {t.save}
+                  Ã°ÂÂÂ¾ {t.save}
                 </button>
               </div>
             </div>
@@ -20302,8 +20186,8 @@ USING (true);`;
         <div className="modal-overlay" style={{ zIndex: 1200 }}>
           <div className="modal-content" style={{ maxWidth: '500px' }}>
             <div className="modal-header">
-              <h3>🚲 {language === 'es' ? 'Gestor de Tipos de Vehículo' : 'Vehicle Type Manager'}</h3>
-              <button className="btn-secondary btn-xs" type="button" onClick={() => { setShowAddVehicleModal(false); setNewVehicleName(''); setEditingVehicleId(null); setEditingVehicleName(''); }}>✕</button>
+              <h3>Ã°ÂÂÂ² {language === 'es' ? 'Gestor de Tipos de VehÃÂ­culo' : 'Vehicle Type Manager'}</h3>
+              <button className="btn-secondary btn-xs" type="button" onClick={() => { setShowAddVehicleModal(false); setNewVehicleName(''); setEditingVehicleId(null); setEditingVehicleName(''); }}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '250px', overflowY: 'auto', paddingRight: '4px' }}>
@@ -20331,16 +20215,16 @@ USING (true);`;
                                 setVehicles(vehs);
                                 setEditingVehicleId(null);
                                 setEditingVehicleName('');
-                                showToast(language === 'es' ? 'Tipo de vehículo actualizado.' : 'Vehicle type updated.', 'success');
+                                showToast(language === 'es' ? 'Tipo de vehÃÂ­culo actualizado.' : 'Vehicle type updated.', 'success');
                               } catch (err) {
                                 console.error(err);
                                 showToast(language === 'es' ? 'Error al actualizar.' : 'Error updating.', 'error');
                               }
                             }}
                           >
-                            💾
+                            Ã°ÂÂÂ¾
                           </button>
-                          <button className="btn-secondary btn-xs" type="button" onClick={() => { setEditingVehicleId(null); setEditingVehicleName(''); }}>✕</button>
+                          <button className="btn-secondary btn-xs" type="button" onClick={() => { setEditingVehicleId(null); setEditingVehicleName(''); }}>Ã¢ÂÂ</button>
                         </div>
                       </>
                     ) : (
@@ -20355,13 +20239,13 @@ USING (true);`;
                               setEditingVehicleName(v.name);
                             }}
                           >
-                            ✏️
+                            Ã¢ÂÂÃ¯Â¸Â
                           </button>
                           <button
                             className="btn-danger btn-xs"
                             type="button"
                             onClick={async () => {
-                              if (!await asyncConfirm(language === 'es' ? `¿Seguro que quieres eliminar "${v.name}"?` : `Are you sure you want to delete "${v.name}"?`)) return;
+                              if (!await asyncConfirm(language === 'es' ? `ÃÂ¿Seguro que quieres eliminar "${v.name}"?` : `Are you sure you want to delete "${v.name}"?`)) return;
                               try {
                                 await deleteVehicle(v.id);
                                 const vehs = await getVehicles();
@@ -20369,14 +20253,14 @@ USING (true);`;
                                 if (accFormVehicle === v.id) {
                                   setAccFormVehicle(vehs[0]?.id ?? '');
                                 }
-                                showToast(language === 'es' ? 'Tipo de vehículo eliminado.' : 'Vehicle type deleted.', 'success');
+                                showToast(language === 'es' ? 'Tipo de vehÃÂ­culo eliminado.' : 'Vehicle type deleted.', 'success');
                               } catch (err) {
                                 console.error(err);
-                                showToast(language === 'es' ? 'Error al eliminar tipo de vehículo.' : 'Error deleting vehicle type.', 'error');
+                                showToast(language === 'es' ? 'Error al eliminar tipo de vehÃÂ­culo.' : 'Error deleting vehicle type.', 'error');
                               }
                             }}
                           >
-                            ✕
+                            Ã¢ÂÂ
                           </button>
                         </div>
                       </>
@@ -20386,7 +20270,7 @@ USING (true);`;
               </div>
 
               <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '16px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                <h4>+ {language === 'es' ? 'Nuevo Tipo de Vehículo' : 'New Vehicle Type'}</h4>
+                <h4>+ {language === 'es' ? 'Nuevo Tipo de VehÃÂ­culo' : 'New Vehicle Type'}</h4>
                 <div className="form-group">
                   <label className="form-label">{language === 'es' ? 'Nombre' : 'Name'}</label>
                   <input
@@ -20412,14 +20296,14 @@ USING (true);`;
                       setAccFormVehicle(v.id);
                       setNewVehicleName('');
                       setShowAddVehicleModal(false);
-                      showToast(language === 'es' ? 'Tipo de vehículo creado.' : 'Vehicle type created.', 'success');
+                      showToast(language === 'es' ? 'Tipo de vehÃÂ­culo creado.' : 'Vehicle type created.', 'success');
                     } catch (err) {
                       console.error('Error creating vehicle type:', err);
-                      showToast(language === 'es' ? 'Error al crear tipo de vehículo.' : 'Error creating vehicle type.', 'error');
+                      showToast(language === 'es' ? 'Error al crear tipo de vehÃÂ­culo.' : 'Error creating vehicle type.', 'error');
                     }
                   }}
                 >
-                  💾 {t.save}
+                  Ã°ÂÂÂ¾ {t.save}
                 </button>
               </div>
             </div>
@@ -20432,12 +20316,12 @@ USING (true);`;
         <div className="modal-overlay" style={{ zIndex: 9999 }}>
           <div className="modal-content" style={{ maxWidth: '400px' }}>
             <div className="modal-header">
-              <h3>❌ {language === 'es' ? 'Desvincular Cuenta' : 'Unlink Account'}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setAccountToUnlink(null)}>✕</button>
+              <h3>Ã¢ÂÂ {language === 'es' ? 'Desvincular Cuenta' : 'Unlink Account'}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => setAccountToUnlink(null)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body">
               <p style={{ margin: 0, color: 'var(--text-muted)' }}>
-                {language === 'es' ? '¿Estás seguro de que deseas desvincular esta cuenta del perfil actual?' : 'Are you sure you want to unlink this account from the current profile?'}
+                {language === 'es' ? 'ÃÂ¿EstÃÂ¡s seguro de que deseas desvincular esta cuenta del perfil actual?' : 'Are you sure you want to unlink this account from the current profile?'}
               </p>
             </div>
             <div className="modal-footer" style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '24px' }}>
@@ -20455,7 +20339,7 @@ USING (true);`;
                       : [];
                     const totalEarnedForRider = activeEarns.reduce((sum, e) => sum + e.amount, 0);
 
-                    const noteText = `Finalizacion de vinculo con el Rider ${riderName} (Total: €${totalEarnedForRider})`;
+                    const noteText = `Finalizacion de vinculo con el Rider ${riderName} (Total: Ã¢ÂÂ¬${totalEarnedForRider})`;
                     
                     await insertAccountNote({
                       id: crypto.randomUUID(),
@@ -20474,7 +20358,7 @@ USING (true);`;
                   console.error(err);
                   showToast('Error', 'error');
                 }
-              }}>❌ {language === 'es' ? 'Desvincular' : 'Unlink'}</button>
+              }}>Ã¢ÂÂ {language === 'es' ? 'Desvincular' : 'Unlink'}</button>
             </div>
           </div>
         </div>
@@ -20484,8 +20368,8 @@ USING (true);`;
         <div className="modal-overlay">
           <div className="modal-content" style={{ maxWidth: '450px' }}>
             <div className="modal-header">
-              <h3>🔗 {language === 'es' ? 'Vincular Cuenta de Reparto' : 'Link Gig Account'}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+              <h3>Ã°ÂÂÂ {language === 'es' ? 'Vincular Cuenta de Reparto' : 'Link Gig Account'}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div className="form-group">
@@ -20525,16 +20409,16 @@ USING (true);`;
                   if (rider) {
                     const platformName = platforms.find(p => p.id === acc.platform_id)?.name || 'Plataforma';
                     const emailLang = (rider.nationality === 'Brasil' || rider.nationality === 'Portuguesa') ? 'pt' : (language === 'es' ? 'es' : 'en');
-                    sendAppAccountAssignedEmail(rider, platformName, acc.username || acc.platform_account_number || '', acc.password || '—', acc.bank_details || '—', emailLang, emailTemplates);
+                    sendAppAccountAssignedEmail(rider, platformName, acc.username || acc.platform_account_number || '', acc.password || 'Ã¢ÂÂ', acc.bank_details || 'Ã¢ÂÂ', emailLang, emailTemplates);
                   }
 
                   triggerReload();
                   setModalType(null);
-                  showToast(language === 'es' ? 'Cuenta vinculada con éxito' : 'Account linked successfully', 'success');
+                  showToast(language === 'es' ? 'Cuenta vinculada con ÃÂ©xito' : 'Account linked successfully', 'success');
                 } catch {
                   showToast('Error', 'error');
                 }
-              }}>🔗 {language === 'es' ? 'Vincular' : 'Link'}</button>
+              }}>Ã°ÂÂÂ {language === 'es' ? 'Vincular' : 'Link'}</button>
             </div>
           </div>
         </div>
@@ -20545,7 +20429,7 @@ USING (true);`;
           <div className="modal-content">
             <div className="modal-header">
               <h3>{accFormForceLinkRiderMode ? (language === 'es' ? 'Vincular Rider' : 'Link Rider') : (accFormRiderReadOnly ? (language === 'es' ? 'Detalles de la Cuenta' : 'Account Details') : (selectedAccountId ? t.edit : 'Nueva Cuenta de Reparto'))}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+              <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               {!accFormForceLinkRiderMode && (
@@ -20557,18 +20441,18 @@ USING (true);`;
                         {platforms.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
                       </select>
                       {!accFormRiderReadOnly && (
-                        <button className="btn-secondary" style={{ padding: '0 12px', minWidth: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center' }} type="button" title={language === 'es' ? 'Nueva Plataforma' : 'New Platform'} onClick={() => setShowAddPlatformModal(true)}>➕</button>
+                        <button className="btn-secondary" style={{ padding: '0 12px', minWidth: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center' }} type="button" title={language === 'es' ? 'Nueva Plataforma' : 'New Platform'} onClick={() => setShowAddPlatformModal(true)}>Ã¢ÂÂ</button>
                       )}
                     </div>
                   </div>
                   <div className="form-group">
-                    <label className="form-label">{language === 'es' ? 'Tipo de Vehículo' : 'Vehicle Type'}</label>
+                    <label className="form-label">{language === 'es' ? 'Tipo de VehÃÂ­culo' : 'Vehicle Type'}</label>
                     <div style={{ display: 'flex', gap: '8px' }}>
                       <select className="form-control" value={accFormVehicle} disabled={accFormRiderReadOnly} onChange={e => setAccFormVehicle(e.target.value)}>
                         {vehicles.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
                       </select>
                       {!accFormRiderReadOnly && (
-                        <button className="btn-secondary" style={{ padding: '0 12px', minWidth: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center' }} type="button" title={language === 'es' ? 'Nuevo Tipo de Vehículo' : 'New Vehicle Type'} onClick={() => setShowAddVehicleModal(true)}>➕</button>
+                        <button className="btn-secondary" style={{ padding: '0 12px', minWidth: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center' }} type="button" title={language === 'es' ? 'Nuevo Tipo de VehÃÂ­culo' : 'New Vehicle Type'} onClick={() => setShowAddVehicleModal(true)}>Ã¢ÂÂ</button>
                       )}
                     </div>
                   </div>
@@ -20585,10 +20469,10 @@ USING (true);`;
                   </div>
                    <div className="form-group"><label className="form-label">{language === 'es' ? 'Nombre Propietario Original' : 'Original Owner Name'}</label><input type="text" className="form-control" disabled={accFormRiderReadOnly} value={accFormOwner} onChange={e => setAccFormOwner(e.target.value)} /></div>
                   <div className="form-group"><label className="form-label">{language === 'es' ? 'Usuario' : 'Username'}</label><input type="text" className="form-control" disabled={accFormRiderReadOnly} value={accFormUser} onChange={e => setAccFormUser(e.target.value)} /></div>
-                  <div className="form-group"><label className="form-label">{language === 'es' ? 'Contraseña' : 'Password'}</label><input type="text" className="form-control" disabled={accFormRiderReadOnly} value={accFormPass} onChange={e => setAccFormPass(e.target.value)} /></div>
+                  <div className="form-group"><label className="form-label">{language === 'es' ? 'ContraseÃÂ±a' : 'Password'}</label><input type="text" className="form-control" disabled={accFormRiderReadOnly} value={accFormPass} onChange={e => setAccFormPass(e.target.value)} /></div>
                   <div className="form-group"><label className="form-label">Email</label><input type="email" className="form-control" disabled={accFormRiderReadOnly} value={accFormEmail} onChange={e => setAccFormEmail(e.target.value)} /></div>
                   <div className="form-group"><label className="form-label">{language === 'es' ? 'Banco / IBAN' : 'Bank / IBAN'}</label><input type="text" className="form-control" disabled={accFormRiderReadOnly} value={accFormBank} onChange={e => setAccFormBank(e.target.value)} /></div>
-                  <div className="form-group"><label className="form-label">{language === 'es' ? 'Tarifa Semanal (€)' : 'Weekly Rate (€)'}</label><input type="number" className="form-control" disabled={accFormRiderReadOnly} value={accFormRate} onChange={e => setAccFormRate(Number(e.target.value))} /></div>
+                  <div className="form-group"><label className="form-label">{language === 'es' ? 'Tarifa Semanal (Ã¢ÂÂ¬)' : 'Weekly Rate (Ã¢ÂÂ¬)'}</label><input type="number" className="form-control" disabled={accFormRiderReadOnly} value={accFormRate} onChange={e => setAccFormRate(Number(e.target.value))} /></div>
                   {!accFormRiderReadOnly && (
                     <div className="form-group">
                       <label className="form-label">{language === 'es' ? 'Estado' : 'Status'}</label>
@@ -20604,7 +20488,7 @@ USING (true);`;
               {!accFormRiderReadOnly && !accFormForceLinkRiderMode && (
                 <div className="form-group" style={{ marginTop: '12px', marginBottom: '8px' }}>
                   <label className="form-label" style={{ fontWeight: '600', color: 'var(--color-primary)' }}>
-                    {language === 'es' ? '¿Deseas vincular un Rider ahora?' : 'Do you want to link a Rider now?'}
+                    {language === 'es' ? 'ÃÂ¿Deseas vincular un Rider ahora?' : 'Do you want to link a Rider now?'}
                   </label>
                   <select 
                     className="form-control" 
@@ -20613,7 +20497,7 @@ USING (true);`;
                     style={{ border: '1px solid var(--color-primary)', background: 'rgba(var(--color-primary-rgb), 0.05)' }}
                   >
                     <option value="no">{language === 'es' ? 'No' : 'No'}</option>
-                    <option value="yes">{language === 'es' ? 'Sí' : 'Yes'}</option>
+                    <option value="yes">{language === 'es' ? 'SÃÂ­' : 'Yes'}</option>
                   </select>
                 </div>
               )}
@@ -20652,14 +20536,14 @@ USING (true);`;
                       <input type="text" className="form-control" value={accFormCustLastName} onChange={e => setAccFormCustLastName(e.target.value)} disabled={!!accFormCustomerId} />
                     </div>
                     <div className="form-group">
-                      <label className="form-label">{language === 'es' ? 'Código (US-)' : 'Code (US-)'}</label>
+                      <label className="form-label">{language === 'es' ? 'CÃÂ³digo (US-)' : 'Code (US-)'}</label>
                       <div style={{ display: 'flex' }}>
                         <span style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid var(--border-color)', borderRight: 'none', padding: '0 12px', display: 'flex', alignItems: 'center', borderTopLeftRadius: '8px', borderBottomLeftRadius: '8px', fontSize: '13px', color: 'var(--text-muted)' }}>US-</span>
                         <input type="text" className="form-control" value={accFormCustCode} onChange={e => setAccFormCustCode(e.target.value.replace(/^US-?/i, ''))} disabled={!!accFormCustomerId} style={{ borderTopLeftRadius: 0, borderBottomLeftRadius: 0 }} />
                       </div>
                     </div>
                     <div className="form-group">
-                      <label className="form-label">{language === 'es' ? 'Teléfono' : 'Phone'}</label>
+                      <label className="form-label">{language === 'es' ? 'TelÃÂ©fono' : 'Phone'}</label>
                       <input type="text" className="form-control" value={accFormCustPhone} onChange={e => setAccFormCustPhone(e.target.value)} disabled={!!accFormCustomerId} />
                     </div>
                     <div className="form-group">
@@ -20694,7 +20578,7 @@ USING (true);`;
                     return;
                   }
                   if (!accFormVehicle) {
-                    showToast(language === 'es' ? 'Por favor, selecciona un Tipo de Vehículo.' : 'Please select a Vehicle Type.', 'error');
+                    showToast(language === 'es' ? 'Por favor, selecciona un Tipo de VehÃÂ­culo.' : 'Please select a Vehicle Type.', 'error');
                     return;
                   }
                   if (!cleanAccNum) {
@@ -20722,7 +20606,7 @@ USING (true);`;
                     return;
                   }
                   if (accFormRate === undefined || accFormRate === null || isNaN(accFormRate)) {
-                    showToast(language === 'es' ? 'Debe ingresar una Tarifa Semanal válida.' : 'Must enter a valid Weekly Rate.', 'error');
+                    showToast(language === 'es' ? 'Debe ingresar una Tarifa Semanal vÃÂ¡lida.' : 'Must enter a valid Weekly Rate.', 'error');
                     return;
                   }
 
@@ -20743,11 +20627,11 @@ USING (true);`;
                         return;
                       }
                       if (!accFormCustCode.trim()) {
-                        showToast(language === 'es' ? 'Debe ingresar el Código (US-) del nuevo Rider.' : 'Must enter the Code (US-) of the new Rider.', 'error');
+                        showToast(language === 'es' ? 'Debe ingresar el CÃÂ³digo (US-) del nuevo Rider.' : 'Must enter the Code (US-) of the new Rider.', 'error');
                         return;
                       }
                       if (!accFormCustPhone.trim()) {
-                        showToast(language === 'es' ? 'Debe ingresar el Teléfono del nuevo Rider.' : 'Must enter the Phone of the new Rider.', 'error');
+                        showToast(language === 'es' ? 'Debe ingresar el TelÃÂ©fono del nuevo Rider.' : 'Must enter the Phone of the new Rider.', 'error');
                         return;
                       }
                       if (!accFormCustNat) {
@@ -20794,7 +20678,7 @@ USING (true);`;
                           : [];
                         const totalEarnedForRider = activeEarns.reduce((sum, e) => sum + e.amount, 0);
 
-                        const noteText = `Finalizacion de vinculo con el Rider ${oldRiderName} (Total: €${totalEarnedForRider})`;
+                        const noteText = `Finalizacion de vinculo con el Rider ${oldRiderName} (Total: Ã¢ÂÂ¬${totalEarnedForRider})`;
                         
                         await insertAccountNote({
                           id: crypto.randomUUID(),
@@ -20832,12 +20716,12 @@ USING (true);`;
                   } catch (err: any) {
                     console.error("Error al guardar la cuenta de plataforma:", err);
                     if (err?.message?.includes('schema cache')) {
-                      showToast('Caché de Supabase desactualizado. Actualizando...', 'error');
+                      showToast('CachÃÂ© de Supabase desactualizado. Actualizando...', 'error');
                     } else {
-                      showToast('Error al guardar. Revisa la consola para más detalles.', 'error');
+                      showToast('Error al guardar. Revisa la consola para mÃÂ¡s detalles.', 'error');
                     }
                   }
-                }}>💾 {t.save}</button>
+                }}>Ã°ÂÂÂ¾ {t.save}</button>
               )}
             </div>
           </div>
@@ -20852,13 +20736,13 @@ USING (true);`;
         <div className="modal-overlay" onClick={() => setTmplModalOpen(false)}>
           <div className="modal-content" style={{ maxWidth: '650px' }} onClick={e => e.stopPropagation()}>
             <div className="modal-header">
-              <h3>📋 {tmplEditing ? (language === 'es' ? 'Editar Plantilla' : 'Edit Template') : (language === 'es' ? 'Nueva Plantilla' : 'New Template')}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setTmplModalOpen(false)}>✕</button>
+              <h3>Ã°ÂÂÂ {tmplEditing ? (language === 'es' ? 'Editar Plantilla' : 'Edit Template') : (language === 'es' ? 'Nueva Plantilla' : 'New Template')}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => setTmplModalOpen(false)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div className="form-grid">
                 <div className="form-group">
-                  <label className="form-label">{language === 'es' ? 'Categoría' : 'Category'}</label>
+                  <label className="form-label">{language === 'es' ? 'CategorÃÂ­a' : 'Category'}</label>
                   <select className="form-control" value={tmplCategory} onChange={e => {
                     setTmplCategory(e.target.value);
                     const pf = e.target.value === catBikeId ? prefixes.find(p => p.prefix === 'B-')?.id ?? ''
@@ -20880,7 +20764,7 @@ USING (true);`;
                         .map(pf => <option key={pf.id} value={pf.id}>{pf.prefix}</option>)}
                     </select>
                     <button type="button" className="btn-secondary" style={{ padding: '0 12px', minWidth: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={() => setModalType('prefix')} title={language === 'es' ? 'Agregar Prefijo' : 'Add Prefix'}>
-                      ➕
+                      Ã¢ÂÂ
                     </button>
                   </div>
                 </div>
@@ -20895,7 +20779,7 @@ USING (true);`;
                 </div>
 
                 <div className="form-group" style={{ gridColumn: 'span 2' }}>
-                  <label className="form-label">{language === 'es' ? 'Color de Identificación' : 'Identification Color'}</label>
+                  <label className="form-label">{language === 'es' ? 'Color de IdentificaciÃÂ³n' : 'Identification Color'}</label>
                   <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap', background: 'rgba(255,255,255,0.03)', padding: '10px 14px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
                     {[
                       { hex: '#6366f1', name: 'Indigo' },
@@ -20952,11 +20836,11 @@ USING (true);`;
                 {tmplCategory === catBikeId && (
                   <>
                     <div className="form-group">
-                      <label className="form-label">{language === 'es' ? 'Tarifa Semanal (€)' : 'Weekly Rate (€)'}</label>
+                      <label className="form-label">{language === 'es' ? 'Tarifa Semanal (Ã¢ÂÂ¬)' : 'Weekly Rate (Ã¢ÂÂ¬)'}</label>
                       <input type="number" className="form-control" value={tmplWeeklyRate} onChange={e => setTmplWeeklyRate(Number(e.target.value))} />
                     </div>
                     <div className="form-group">
-                      <label className="form-label">{language === 'es' ? 'Depósito (€)' : 'Deposit (€)'}</label>
+                      <label className="form-label">{language === 'es' ? 'DepÃÂ³sito (Ã¢ÂÂ¬)' : 'Deposit (Ã¢ÂÂ¬)'}</label>
                       <input type="number" className="form-control" value={tmplDeposit} onChange={e => setTmplDeposit(Number(e.target.value))} />
                     </div>
                   </>
@@ -20966,17 +20850,17 @@ USING (true);`;
               {/* Custom Fields for this category */}
               <div style={{ background: 'rgba(0,0,0,0.1)', padding: '16px', borderRadius: '12px', display: 'flex', flexDirection: 'column', gap: '12px', marginTop: '4px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <h4 style={{ color: 'var(--color-primary)' }}>🧩 {language === 'es' ? 'Campos Personalizados' : 'Custom Fields'}</h4>
+                  <h4 style={{ color: 'var(--color-primary)' }}>Ã°ÂÂ§Â© {language === 'es' ? 'Campos Personalizados' : 'Custom Fields'}</h4>
                   <button type="button" className="btn-secondary btn-xs" onClick={() => {
                     setAddCFTargetCategory(tmplCategory);
                     setAddCFNewName(''); setAddCFNewType('text');
                     setAddCFSource('template');
                     setAddCFModalOpen(true);
-                  }}>➕ {language === 'es' ? 'Agregar Campo' : 'Add Field'}</button>
+                  }}>Ã¢ÂÂ {language === 'es' ? 'Agregar Campo' : 'Add Field'}</button>
                 </div>
                 {customFieldDefs.filter(d => d.category_id === tmplCategory).length === 0 ? (
                   <p style={{ color: 'var(--text-muted)', fontStyle: 'italic', fontSize: '13px', margin: 0 }}>
-                    {language === 'es' ? 'No hay campos personalizados para esta categoría.' : 'No custom fields for this category.'}
+                    {language === 'es' ? 'No hay campos personalizados para esta categorÃÂ­a.' : 'No custom fields for this category.'}
                   </p>
                 ) : (
                   <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
@@ -20999,7 +20883,7 @@ USING (true);`;
                             justifyContent: 'center'
                           }}
                           onClick={async () => {
-                            if (!await asyncConfirm(language === 'es' ? `¿Eliminar el campo "${d.field_name}"? Los valores existentes no se borrarán de los productos.` : `Delete field "${d.field_name}"? Existing values won't be removed from products.`)) return;
+                            if (!await asyncConfirm(language === 'es' ? `ÃÂ¿Eliminar el campo "${d.field_name}"? Los valores existentes no se borrarÃÂ¡n de los productos.` : `Delete field "${d.field_name}"? Existing values won't be removed from products.`)) return;
                             try {
                               await deleteCustomFieldDefinition(d.id);
                               showToast(language === 'es' ? 'Campo eliminado.' : 'Field deleted.');
@@ -21009,7 +20893,7 @@ USING (true);`;
                             }
                           }}
                         >
-                          ✕
+                          Ã¢ÂÂ
                         </button>
                       </span>
                     ))}
@@ -21019,15 +20903,15 @@ USING (true);`;
 
               {/* Template Photo */}
               <div style={{ background: 'rgba(0,0,0,0.1)', padding: '16px', borderRadius: '12px', display: 'flex', flexDirection: 'column', gap: '12px', marginTop: '4px' }}>
-                <h4 style={{ color: 'var(--color-primary)' }}>📷 {language === 'es' ? 'Foto del Modelo' : 'Model Photo'}</h4>
+                <h4 style={{ color: 'var(--color-primary)' }}>Ã°ÂÂÂ· {language === 'es' ? 'Foto del Modelo' : 'Model Photo'}</h4>
                 {tmplImagePreview && (
                   <div style={{ position: 'relative', width: '100%', maxWidth: '280px' }}>
                     <img src={tmplImagePreview} alt="Template" style={{ width: '100%', borderRadius: '10px', border: '1px solid var(--border-color)' }} />
-                    <button type="button" className="btn-danger btn-xs" style={{ position: 'absolute', top: '6px', right: '6px' }} onClick={() => { setTmplImagePreview(null); setTmplImageFile(null); }}>✕</button>
+                    <button type="button" className="btn-danger btn-xs" style={{ position: 'absolute', top: '6px', right: '6px' }} onClick={() => { setTmplImagePreview(null); setTmplImageFile(null); }}>Ã¢ÂÂ</button>
                   </div>
                 )}
                 <label style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', padding: '10px 16px', background: 'var(--bg-surface)', border: '1px solid var(--border-color)', borderRadius: '8px', cursor: 'pointer', fontSize: '14px', color: 'var(--text-bright)' }}>
-                  📎 {language === 'es' ? 'Seleccionar Imagen' : 'Select Image'}
+                  Ã°ÂÂÂ {language === 'es' ? 'Seleccionar Imagen' : 'Select Image'}
                   <input type="file" accept="image/jpeg, image/png, image/webp" style={{ display: 'none' }} onChange={async e => {
                     const file = e.target.files?.[0];
                     if (file) { 
@@ -21079,7 +20963,7 @@ USING (true);`;
                   console.error('Error saving template:', err);
                   showToast(language === 'es' ? 'Error al guardar.' : 'Save error.', 'error');
                 }
-              }}>💾 {t.save}</button>
+              }}>Ã°ÂÂÂ¾ {t.save}</button>
             </div>
           </div>
         </div>
@@ -21099,7 +20983,7 @@ USING (true);`;
           <div className="modal-overlay" onClick={() => setBatchModalOpen(false)}>
             <div className="modal-content" onClick={e => e.stopPropagation()}>
               <div className="modal-body">
-                <h3>📦 {language === 'es' ? 'Registro por Lotes' : 'Batch Registration'}</h3>
+                <h3>Ã°ÂÂÂ¦ {language === 'es' ? 'Registro por Lotes' : 'Batch Registration'}</h3>
 
                 {batchModel && (
                   <div style={{ display: 'flex', gap: '12px', alignItems: 'center', padding: '12px', background: 'rgba(0,0,0,0.1)', borderRadius: '10px', marginBottom: '16px' }}>
@@ -21108,7 +20992,7 @@ USING (true);`;
                       <strong style={{ color: 'var(--text-bright)' }}>{batchModel.brand} {batchModel.model_name}</strong>
                       <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
                         {pfStr && <span>Prefix: {pfStr} | </span>}
-                        €{batchModel.suggested_weekly_rate}/{language === 'es' ? 'sem' : 'wk'}
+                        Ã¢ÂÂ¬{batchModel.suggested_weekly_rate}/{language === 'es' ? 'sem' : 'wk'}
                       </div>
                     </div>
                   </div>
@@ -21120,15 +21004,15 @@ USING (true);`;
                     <input type="number" className="form-control" min={1} max={100} value={batchQuantity} onChange={e => setBatchQuantity(Math.max(1, Number(e.target.value)))} />
                   </div>
                   <div className="form-group">
-                    <label className="form-label">{language === 'es' ? 'Número inicial' : 'Start number'}</label>
+                    <label className="form-label">{language === 'es' ? 'NÃÂºmero inicial' : 'Start number'}</label>
                     <input type="number" className="form-control" min={1} value={batchStartNum} onChange={e => setBatchStartNum(Math.max(1, Number(e.target.value)))} />
                   </div>
                   <div className="form-group">
-                    <label className="form-label">{language === 'es' ? 'Coste por unidad (€)' : 'Cost per unit (€)'}</label>
+                    <label className="form-label">{language === 'es' ? 'Coste por unidad (Ã¢ÂÂ¬)' : 'Cost per unit (Ã¢ÂÂ¬)'}</label>
                     <input type="number" className="form-control" value={batchCost} onChange={e => setBatchCost(Number(e.target.value))} />
                   </div>
                   <div className="form-group">
-                    <label className="form-label">{language === 'es' ? 'Depósito (€)' : 'Deposit (€)'}</label>
+                    <label className="form-label">{language === 'es' ? 'DepÃÂ³sito (Ã¢ÂÂ¬)' : 'Deposit (Ã¢ÂÂ¬)'}</label>
                     <input type="number" className="form-control" value={batchDeposit} onChange={e => setBatchDeposit(Number(e.target.value))} />
                   </div>
                 </div>
@@ -21140,7 +21024,7 @@ USING (true);`;
                     {previewSerials.map(s => (
                       <span key={s} className="badge" style={{ background: 'rgba(99,102,241,0.15)', color: '#818cf8' }}>{s}</span>
                     ))}
-                    {batchQuantity > 20 && <span className="badge" style={{ background: 'rgba(255,255,255,0.07)' }}>...+{batchQuantity - 20} {language === 'es' ? 'más' : 'more'}</span>}
+                    {batchQuantity > 20 && <span className="badge" style={{ background: 'rgba(255,255,255,0.07)' }}>...+{batchQuantity - 20} {language === 'es' ? 'mÃÂ¡s' : 'more'}</span>}
                   </div>
                 </div>
 
@@ -21157,8 +21041,10 @@ USING (true);`;
                     );
                     showToast(
                       language === 'es'
-                        ? `✅ ${batchQuantity} unidades creadas exitosamente.`
-                        : `✅ ${batchQuantity} units created successfully.`
+                        ? `Ã¢ÂÂ
+ ${batchQuantity} unidades creadas exitosamente.`
+                        : `Ã¢ÂÂ
+ ${batchQuantity} units created successfully.`
                     );
                     setBatchModalOpen(false);
                     triggerReload();
@@ -21170,7 +21056,7 @@ USING (true);`;
                       'error'
                     );
                   }
-                }}>📦 {language === 'es' ? `Crear ${batchQuantity} unidades` : `Create ${batchQuantity} units`}</button>
+                }}>Ã°ÂÂÂ¦ {language === 'es' ? `Crear ${batchQuantity} unidades` : `Create ${batchQuantity} units`}</button>
                 <button className="btn-secondary" style={{ marginTop: '8px' }} onClick={() => setBatchModalOpen(false)}>{t.cancel}</button>
               </div>
             </div>
@@ -21184,8 +21070,8 @@ USING (true);`;
         <div className="modal-overlay" onClick={() => setViewCFModalOpen(false)}>
           <div className="modal-content" style={{ maxWidth: '600px' }} onClick={e => e.stopPropagation()}>
             <div className="modal-header">
-              <h3>🧩 {language === 'es' ? 'Campos Personalizados' : 'Custom Fields'}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setViewCFModalOpen(false)}>✕</button>
+              <h3>Ã°ÂÂ§Â© {language === 'es' ? 'Campos Personalizados' : 'Custom Fields'}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => setViewCFModalOpen(false)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               {customFieldDefs.length === 0 ? (
@@ -21197,7 +21083,7 @@ USING (true);`;
                   <table className="custom-table">
                     <thead>
                       <tr>
-                        <th>{language === 'es' ? 'Categoría' : 'Category'}</th>
+                        <th>{language === 'es' ? 'CategorÃÂ­a' : 'Category'}</th>
                         <th>{language === 'es' ? 'Nombre del Campo' : 'Field Name'}</th>
                         <th>{language === 'es' ? 'Tipo' : 'Type'}</th>
                         <th style={{ width: '60px' }}></th>
@@ -21206,21 +21092,21 @@ USING (true);`;
                     <tbody>
                       {customFieldDefs.map(d => {
                         const cat = categories.find(c => c.id === d.category_id);
-                        const typeLabels: Record<string, string> = { text: language === 'es' ? 'Texto' : 'Text', number: language === 'es' ? 'Número' : 'Number', date: language === 'es' ? 'Fecha' : 'Date', boolean: language === 'es' ? 'Sí/No' : 'Yes/No' };
+                        const typeLabels: Record<string, string> = { text: language === 'es' ? 'Texto' : 'Text', number: language === 'es' ? 'NÃÂºmero' : 'Number', date: language === 'es' ? 'Fecha' : 'Date', boolean: language === 'es' ? 'SÃÂ­/No' : 'Yes/No' };
                         return (
                           <tr key={d.id}>
-                            <td><span className="badge" style={{ background: 'rgba(239, 131, 35, 0.15)', border: '1px solid rgba(239, 131, 35, 0.3)' }}>{cat ? (language === 'es' ? cat.name_es : cat.name_en) : '—'}</span></td>
+                            <td><span className="badge" style={{ background: 'rgba(239, 131, 35, 0.15)', border: '1px solid rgba(239, 131, 35, 0.3)' }}>{cat ? (language === 'es' ? cat.name_es : cat.name_en) : 'Ã¢ÂÂ'}</span></td>
                             <td style={{ fontWeight: 600, color: 'var(--text-bright)' }}>{d.field_name}</td>
                             <td>{typeLabels[d.field_type] ?? d.field_type}</td>
                             <td>
                               <button className="btn-danger btn-xs" onClick={async () => {
-                                if (!await asyncConfirm(language === 'es' ? `¿Eliminar el campo "${d.field_name}"? Los valores existentes no se borrarán de los productos.` : `Delete field "${d.field_name}"? Existing values won't be removed from products.`)) return;
+                                if (!await asyncConfirm(language === 'es' ? `ÃÂ¿Eliminar el campo "${d.field_name}"? Los valores existentes no se borrarÃÂ¡n de los productos.` : `Delete field "${d.field_name}"? Existing values won't be removed from products.`)) return;
                                 try {
                                   await deleteCustomFieldDefinition(d.id);
                                   showToast(language === 'es' ? 'Campo eliminado.' : 'Field deleted.');
                                   triggerReload();
                                 } catch { showToast(language === 'es' ? 'Error al eliminar.' : 'Delete error.', 'error'); }
-                              }}>🗑️</button>
+                              }}>Ã°ÂÂÂÃ¯Â¸Â</button>
                             </td>
                           </tr>
                         );
@@ -21234,7 +21120,7 @@ USING (true);`;
                 setAddCFNewName(''); setAddCFNewType('text');
                 setAddCFSource('template');
                 setAddCFModalOpen(true);
-              }}>➕ {language === 'es' ? 'Crear Nuevo Campo' : 'Create New Field'}</button>
+              }}>Ã¢ÂÂ {language === 'es' ? 'Crear Nuevo Campo' : 'Create New Field'}</button>
             </div>
           </div>
         </div>
@@ -21245,12 +21131,12 @@ USING (true);`;
         <div className="modal-overlay" style={{ zIndex: 1100 }} onClick={() => setAddCFModalOpen(false)}>
           <div className="modal-content" style={{ maxWidth: '500px' }} onClick={e => e.stopPropagation()}>
             <div className="modal-header">
-              <h3>🧩 {language === 'es' ? 'Agregar Campo Personalizado' : 'Add Custom Field'}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setAddCFModalOpen(false)}>✕</button>
+              <h3>Ã°ÂÂ§Â© {language === 'es' ? 'Agregar Campo Personalizado' : 'Add Custom Field'}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => setAddCFModalOpen(false)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div className="form-group">
-                <label className="form-label">{language === 'es' ? 'Categoría' : 'Category'}</label>
+                <label className="form-label">{language === 'es' ? 'CategorÃÂ­a' : 'Category'}</label>
                 <select className="form-control" value={addCFTargetCategory} onChange={e => setAddCFTargetCategory(e.target.value)}>
                   {categories.map(c => <option key={c.id} value={c.id}>{language === 'es' ? c.name_es : c.name_en}</option>)}
                 </select>
@@ -21263,9 +21149,9 @@ USING (true);`;
                 <label className="form-label">{language === 'es' ? 'Tipo de Dato' : 'Data Type'}</label>
                 <select className="form-control" value={addCFNewType} onChange={e => setAddCFNewType(e.target.value as 'text' | 'number' | 'date' | 'boolean')}>
                   <option value="text">{language === 'es' ? 'Texto' : 'Text'}</option>
-                  <option value="number">{language === 'es' ? 'Número' : 'Number'}</option>
+                  <option value="number">{language === 'es' ? 'NÃÂºmero' : 'Number'}</option>
                   <option value="date">{language === 'es' ? 'Fecha' : 'Date'}</option>
-                  <option value="boolean">{language === 'es' ? 'Sí / No' : 'Yes / No'}</option>
+                  <option value="boolean">{language === 'es' ? 'SÃÂ­ / No' : 'Yes / No'}</option>
                 </select>
               </div>
             </div>
@@ -21281,7 +21167,7 @@ USING (true);`;
                   // Check if field name already exists in this category
                   const exists = customFieldDefs.some(d => d.category_id === addCFTargetCategory && d.field_name.toLowerCase() === addCFNewName.trim().toLowerCase());
                   if (exists) {
-                    showToast(language === 'es' ? 'Ya existe un campo con ese nombre en esta categoría.' : 'A field with that name already exists in this category.', 'error');
+                    showToast(language === 'es' ? 'Ya existe un campo con ese nombre en esta categorÃÂ­a.' : 'A field with that name already exists in this category.', 'error');
                     return;
                   }
                   await upsertCustomFieldDefinition({
@@ -21297,7 +21183,7 @@ USING (true);`;
                   console.error('Error saving custom field:', err);
                   showToast(language === 'es' ? 'Error al guardar campo.' : 'Error saving field.', 'error');
                 }
-              }}>💾 {t.save}</button>
+              }}>Ã°ÂÂÂ¾ {t.save}</button>
             </div>
           </div>
         </div>
@@ -21308,14 +21194,14 @@ USING (true);`;
         <div className="modal-overlay" style={{ zIndex: 1100 }} onClick={() => setKitSearchModalOpen(false)}>
           <div className="modal-content" style={{ maxWidth: '700px' }} onClick={e => e.stopPropagation()}>
             <div className="modal-header">
-              <h3>🎒 {language === 'es' ? 'Agregar Artículo al Kit' : 'Add Item to Kit'}</h3>
-              <button className="btn-secondary btn-xs" onClick={() => setKitSearchModalOpen(false)}>✕</button>
+              <h3>Ã°ÂÂÂ {language === 'es' ? 'Agregar ArtÃÂ­culo al Kit' : 'Add Item to Kit'}</h3>
+              <button className="btn-secondary btn-xs" onClick={() => setKitSearchModalOpen(false)}>Ã¢ÂÂ</button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <input
                 type="text"
                 className="form-control"
-                placeholder={language === 'es' ? '🔍 Buscar por código, nombre, marca...' : '🔍 Search by code, name, brand...'}
+                placeholder={language === 'es' ? 'Ã°ÂÂÂ Buscar por cÃÂ³digo, nombre, marca...' : 'Ã°ÂÂÂ Search by code, name, brand...'}
                 value={kitSearchQuery}
                 onChange={e => setKitSearchQuery(e.target.value)}
                 autoFocus
@@ -21325,9 +21211,9 @@ USING (true);`;
                 <table className="custom-table">
                   <thead>
                     <tr>
-                      <th>{language === 'es' ? 'Código' : 'Code'}</th>
+                      <th>{language === 'es' ? 'CÃÂ³digo' : 'Code'}</th>
                       <th>{language === 'es' ? 'Nombre' : 'Name'}</th>
-                      <th>{language === 'es' ? 'Categoría' : 'Category'}</th>
+                      <th>{language === 'es' ? 'CategorÃÂ­a' : 'Category'}</th>
                       <th style={{ width: '100px', textAlign: 'center' }}></th>
                     </tr>
                   </thead>
@@ -21339,6 +21225,9 @@ USING (true);`;
                         if (p.category_id === catBikeId || p.category_id === catBattId || p.category_id === catLockId) return false;
                         // Only available
                         if (p.status !== 'Disponible') return false;
+                        // Exclude consolidated products with 0 units
+                        const _dist = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
+                        if (_dist != null && Object.values(_dist).reduce((a, b) => a + b, 0) <= 0) return false;
                         // Exclude already selected kit items
                         if (wizKitProductIds.includes(p.id)) return false;
                         // Exclude already selected bike/battery/lock in wizard
@@ -21363,16 +21252,33 @@ USING (true);`;
                         return (
                           <tr>
                             <td colSpan={4} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '24px' }}>
-                              {language === 'es' ? 'No se encontraron artículos disponibles.' : 'No available items found.'}
+                              {language === 'es' ? 'No se encontraron artÃÂ­culos disponibles.' : 'No available items found.'}
                             </td>
                           </tr>
                         );
                       }
 
                       return Array.from(groupsMap.entries()).map(([serial, groupProds]) => {
-                        const representativeItem = groupProds[0];
+                        // Prefer the consolidated record (the one carrying a distribution) as the
+                        // representative so the rental references the real stock row.
+                        const representativeItem =
+                          groupProds.find(p => p.custom_field_values?.location_distribution != null) || groupProds[0];
                         const catName = categories.find(c => c.id === representativeItem.category_id);
-                        const count = groupProds.length;
+                        // Count available UNITS, not records: a row with a distribution counts its summed
+                        // quantity; a plain single-unit row (e.g. a legacy split) counts as 1.
+                        const totalUnits = groupProds.reduce((sum, p) => {
+                          const d = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
+                          return sum + (d != null ? Object.values(d).reduce((a, b) => a + (Number(b) || 0), 0) : 1);
+                        }, 0);
+                        // Subtract units already out on an active rental (tracked via rental_items).
+                        const grpIds = new Set(groupProds.map(p => p.id));
+                        const activeRented = (rentalItems || []).filter(ri =>
+                          grpIds.has(ri.product_id) &&
+                          (rentals || []).some(r => r.id === ri.rental_id && r.status === 'Activo')
+                        ).length;
+                        const count = Math.max(0, totalUnits - activeRented);
+                        // No real stock left Ã¢ÂÂ don't offer it.
+                        if (count <= 0) return null;
                         return (
                           <tr key={representativeItem.id}>
                             <td>
@@ -21392,7 +21298,7 @@ USING (true);`;
                                   setWizKitProductIds(prev => [...prev, representativeItem.id]);
                                   setKitSearchModalOpen(false);
                                 }}>
-                                ➕ {language === 'es' ? 'Seleccionar' : 'Select'}
+                                Ã¢ÂÂ {language === 'es' ? 'Seleccionar' : 'Select'}
                               </button>
                             </td>
                           </tr>
@@ -21407,11 +21313,300 @@ USING (true);`;
         </div>
       )}
 
+      {/* MODAL: Balance transaction detail */}
+      {txDetail && (() => {
+        const isPositive = txDetail.type === 'income';
+        const amtColor = isPositive ? '#10b981' : '#ef4444';
+        const viaLabel = txDetail.received_via
+          ? (txDetail.received_via === 'efectivo' ? (language === 'es' ? 'Ã°ÂÂÂµ Efectivo' : 'Ã°ÂÂÂµ Cash') : (language === 'es' ? 'Ã°ÂÂÂ¦ Transferencia' : 'Ã°ÂÂÂ¦ Transfer'))
+          : 'Ã¢ÂÂ';
+        const dFmt = (() => { const p = txDetail.date.split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0].slice(-2)}` : txDetail.date; })();
+        return (
+          <div className="modal-overlay" onClick={() => setTxDetail(null)} style={{ zIndex: 9999 }}>
+            <div className="modal-content" style={{ maxWidth: '540px' }} onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <h3>Ã°ÂÂ§Â¾ {language === 'es' ? 'Detalle de TransacciÃÂ³n' : 'Transaction Detail'}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setTxDetail(null)}>Ã¢ÂÂ</button>
+              </div>
+              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderLeft: `4px solid ${amtColor}`, paddingLeft: '12px' }}>
+                  <span className="badge">{txDetail.category}</span>
+                  <strong style={{ color: amtColor, fontSize: '20px' }}>{isPositive ? '+' : '-'}Ã¢ÂÂ¬{txDetail.amount}</strong>
+                </div>
+                <div>
+                  <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{language === 'es' ? 'DescripciÃÂ³n' : 'Description'}</p>
+                  <p style={{ fontSize: '14px', color: 'var(--text-bright)', margin: 0, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{txDetail.description}</p>
+                </div>
+                <div style={{ display: 'flex', gap: '24px', flexWrap: 'wrap' }}>
+                  <div>
+                    <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{language === 'es' ? 'Fecha' : 'Date'}</p>
+                    <p style={{ fontSize: '14px', color: 'var(--text-bright)', margin: 0 }}>Ã°ÂÂÂ
+ {dFmt}</p>
+                  </div>
+                  <div>
+                    <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{language === 'es' ? 'Medio' : 'Method'}</p>
+                    <p style={{ fontSize: '14px', color: 'var(--text-bright)', margin: 0 }}>{viaLabel}</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* MODAL: Ledger transaction detail */}
+      {ledgerDetail && (() => {
+        const isPositive = ledgerDetail.amount >= 0;
+        const amtColor = isPositive ? '#34d399' : '#f87171';
+        const typeLabels: Record<string, { es: string; en: string }> = {
+          cost: { es: 'Costo de compra', en: 'Purchase cost' },
+          sale: { es: 'Venta', en: 'Sale' },
+          payment: { es: 'Pago', en: 'Payment' },
+          deposit: { es: 'DepÃÂ³sito', en: 'Deposit' },
+          expense: { es: 'Gasto', en: 'Expense' },
+        };
+        const typeLabel = typeLabels[ledgerDetail.type] ? (language === 'es' ? typeLabels[ledgerDetail.type].es : typeLabels[ledgerDetail.type].en) : ledgerDetail.type;
+        return (
+          <div className="modal-overlay" onClick={() => setLedgerDetail(null)} style={{ zIndex: 9999 }}>
+            <div className="modal-content" style={{ maxWidth: '520px' }} onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <h3>Ã°ÂÂ§Â¾ {language === 'es' ? 'Detalle de TransacciÃÂ³n' : 'Transaction Detail'}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setLedgerDetail(null)}>Ã¢ÂÂ</button>
+              </div>
+              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderLeft: `4px solid ${amtColor}`, paddingLeft: '12px' }}>
+                  <span style={{ fontSize: '12px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{typeLabel}</span>
+                  <strong style={{ color: amtColor, fontSize: '20px' }}>{isPositive ? '+' : ''}Ã¢ÂÂ¬{ledgerDetail.amount}</strong>
+                </div>
+                <div>
+                  <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{language === 'es' ? 'DescripciÃÂ³n' : 'Description'}</p>
+                  <p style={{ fontSize: '14px', color: 'var(--text-bright)', margin: 0, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{ledgerDetail.description}</p>
+                </div>
+                <div>
+                  <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{language === 'es' ? 'Fecha' : 'Date'}</p>
+                  <p style={{ fontSize: '14px', color: 'var(--text-bright)', margin: 0 }}>Ã°ÂÂÂ
+ {(() => { const p = ledgerDetail.date.split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0].slice(-2)}` : ledgerDetail.date; })()}</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Internal checklist modal used inside the rental wizard (edits wizard state, saved on confirm) */}
+      {wizShowInternalChecklist && (() => {
+        const wizBike = products.find(p => p.id === wizBikeId);
+        return (
+          <div
+            className="modal-overlay"
+            onClick={() => setWizShowInternalChecklist(false)}
+            style={{
+              position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+              background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(10px)',
+              display: 'flex', justifyContent: 'center', alignItems: 'flex-start',
+              zIndex: 9999, padding: '24px', overflowY: 'auto'
+            }}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="sign-page-card"
+              style={{ width: '100%', maxWidth: '640px', margin: 'auto', background: 'var(--bg-elevated, #1e293b)' }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+                <h3 style={{ margin: 0 }}>Ã°ÂÂÂ§ {language === 'es' ? 'Checklist TÃÂ©cnica (Interno)' : 'Technical Checklist (Internal)'}</h3>
+                <button className="btn-secondary btn-xs" style={{ padding: '4px 10px' }} onClick={() => setWizShowInternalChecklist(false)}>Ã¢ÂÂ</button>
+              </div>
+              <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: 0 }}>
+                {language === 'es' ? 'InspecciÃÂ³n previa a la entrega Ã¢ÂÂ uso interno' : 'Pre-delivery inspection Ã¢ÂÂ internal use'}
+              </p>
+              <div className="contract-details" style={{ background: 'rgba(0,0,0,0.2)', borderRadius: '12px', padding: '12px 16px', margin: '12px 0' }}>
+                {[
+                  ['E-Bike Model', wizBike?.name || 'Ã¢ÂÂ'],
+                  ['E-Bike Serial Number', wizBike?.serial_number || 'Ã¢ÂÂ'],
+                  ['Date', new Date().toISOString().split('T')[0]],
+                ].map(([label, val]) => (
+                  <div key={label} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0', fontSize: '13px' }}>
+                    <span style={{ color: 'var(--text-muted)' }}>{label}</span>
+                    <span style={{ fontWeight: 600 }}>{val}</span>
+                  </div>
+                ))}
+              </div>
+
+              <InternalChecklistEditor
+                value={wizInternalChecklist}
+                onChange={setWizInternalChecklist}
+              />
+
+              <div className="sign-actions" style={{ marginTop: '16px' }}>
+                <button className="btn-primary" style={{ flex: 1 }} onClick={() => setWizShowInternalChecklist(false)}>
+                  Ã¢ÂÂ
+ {language === 'es' ? 'Listo' : 'Done'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {editInternalChecklist && (
+        <div
+          className="modal-overlay"
+          onClick={() => setEditInternalChecklist(null)}
+          style={{
+            position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+            background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(10px)',
+            display: 'flex', justifyContent: 'center', alignItems: 'flex-start',
+            zIndex: 9999, padding: '24px', overflowY: 'auto'
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="sign-page-card"
+            style={{ width: '100%', maxWidth: '640px', margin: 'auto', background: 'var(--bg-elevated, #1e293b)' }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+              <h3 style={{ margin: 0 }}>Ã°ÂÂÂ§ {language === 'es' ? 'Checklist TÃÂ©cnica (Interno)' : 'Technical Checklist (Internal)'}</h3>
+              <button className="btn-secondary btn-xs" style={{ padding: '4px 10px' }} onClick={() => setEditInternalChecklist(null)}>Ã¢ÂÂ</button>
+            </div>
+            <div className="contract-details" style={{ background: 'rgba(0,0,0,0.2)', borderRadius: '12px', padding: '12px 16px', margin: '12px 0' }}>
+              {[
+                ['E-Bike Model', editInternalChecklist.bikeModel || 'Ã¢ÂÂ'],
+                ['E-Bike Serial Number', editInternalChecklist.bikeSerial || 'Ã¢ÂÂ'],
+                ['Date', editInternalChecklist.deliveryDate],
+              ].map(([label, val]) => (
+                <div key={label} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0', fontSize: '13px' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>{label}</span>
+                  <span style={{ fontWeight: 600 }}>{val}</span>
+                </div>
+              ))}
+            </div>
+
+            <InternalChecklistEditor
+              value={editInternalValue}
+              onChange={setEditInternalValue}
+            />
+
+            <div className="sign-actions" style={{ marginTop: '16px' }}>
+              <button className="btn-secondary" style={{ flex: 1 }} onClick={() => setEditInternalChecklist(null)}>
+                {language === 'es' ? 'Cancelar' : 'Cancel'}
+              </button>
+              <button
+                className="btn-primary"
+                style={{ flex: 2 }}
+                disabled={editInternalSaving}
+                onClick={async () => {
+                  if (!editInternalChecklist) return;
+                  setEditInternalSaving(true);
+                  try {
+                    await persistInternalChecklist({
+                      existingId: editInternalChecklist.existingId,
+                      rentalId: editInternalChecklist.rentalId,
+                      customerName: editInternalChecklist.customerName,
+                      bikeModel: editInternalChecklist.bikeModel,
+                      bikeSerial: editInternalChecklist.bikeSerial,
+                      deliveryDate: editInternalChecklist.deliveryDate,
+                      value: editInternalValue,
+                    });
+                    setEditInternalChecklist(null);
+                    triggerReload();
+                    showToast(language === 'es' ? 'Checklist tÃÂ©cnica guardada.' : 'Technical checklist saved.', 'success');
+                  } catch (err) {
+                    console.error('Failed to save internal checklist:', err);
+                    showToast(language === 'es' ? 'Error al guardar la checklist.' : 'Error saving checklist.', 'error');
+                  }
+                  setEditInternalSaving(false);
+                }}
+              >
+                {editInternalSaving ? (language === 'es' ? 'Ã¢ÂÂ³ Guardando...' : 'Ã¢ÂÂ³ Saving...') : (language === 'es' ? 'Ã°ÂÂÂ¾ Guardar' : 'Ã°ÂÂÂ¾ Save')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {viewChecklist && (
+        <div
+          className="modal-overlay"
+          onClick={() => setViewChecklist(null)}
+          style={{
+            position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+            background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(10px)',
+            display: 'flex', justifyContent: 'center', alignItems: 'flex-start',
+            zIndex: 9999, padding: '24px', overflowY: 'auto'
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: '100%', maxWidth: '640px', background: 'var(--bg-elevated, #1e293b)',
+              border: '1px solid rgba(255,255,255,0.1)', borderRadius: '16px',
+              padding: '24px', boxShadow: '0 20px 60px rgba(0,0,0,0.4)', margin: 'auto'
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+              <h3 style={{ margin: 0 }}>Ã°ÂÂÂ E-Bike Delivery Checklist</h3>
+              <button className="btn-secondary btn-xs" style={{ padding: '4px 10px' }} onClick={() => setViewChecklist(null)}>Ã¢ÂÂ</button>
+            </div>
+            <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: 0 }}>Customer Acknowledgement &amp; Liability Waiver</p>
+
+            <div className="contract-details" style={{ background: 'rgba(0,0,0,0.2)', borderRadius: '12px', padding: '16px', margin: '16px 0' }}>
+              {[
+                ['E-Bike Model', viewChecklist.bike_model || 'Ã¢ÂÂ'],
+                ['E-Bike Serial Number', viewChecklist.bike_serial || 'Ã¢ÂÂ'],
+                ['Date', viewChecklist.delivery_date],
+                ['Battery Charge Level', viewChecklist.battery_level || 'Ã¢ÂÂ'],
+                ['Customer Name', viewChecklist.customer_name],
+                ['Status', viewChecklist.status === 'completed' ? (language === 'es' ? 'Ã¢ÂÂ Completada' : 'Ã¢ÂÂ Completed') : (language === 'es' ? 'Ã¢ÂÂ³ Pendiente' : 'Ã¢ÂÂ³ Pending')],
+              ].map(([label, val]) => (
+                <div key={label} style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0', fontSize: '13px', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>{label}</span>
+                  <span style={{ fontWeight: 600 }}>{val}</span>
+                </div>
+              ))}
+            </div>
+
+            {DELIVERY_CHECKLIST_GROUPS.map(group => (
+              <div key={group.key} style={{ marginBottom: '14px' }}>
+                <p style={{ fontSize: '13px', fontWeight: 700, color: 'var(--color-primary)', margin: '0 0 6px' }}>{group.title}</p>
+                {group.items.map(item => (
+                  <p key={item.key} style={{ fontSize: '12px', lineHeight: 1.5, margin: '4px 0', color: 'var(--text-main)' }}>
+                    {group.kind === 'checkbox'
+                      ? <span style={{ color: viewChecklist.items?.[item.key] ? 'var(--color-primary)' : 'var(--text-muted)', fontWeight: 700, marginRight: '6px' }}>{viewChecklist.items?.[item.key] ? 'Ã¢ÂÂ' : 'Ã¢ÂÂ'}</span>
+                      : <span style={{ color: 'var(--text-muted)', marginRight: '6px' }}>Ã¢ÂÂ¢</span>}
+                    {item.text}
+                  </p>
+                ))}
+              </div>
+            ))}
+
+            <p style={{ fontSize: '12px', fontStyle: 'italic', color: 'var(--text-muted)', margin: '12px 0' }}>
+              By signing below, the customer confirms acceptance of all the aforementioned conditions and declarations.
+            </p>
+
+            <p style={{ fontSize: '13px', fontWeight: 600, margin: '0 0 6px' }}>Customer Signature</p>
+            {viewChecklist.signature_url ? (
+              <img
+                src={viewChecklist.signature_url}
+                alt="signature"
+                style={{ maxWidth: '320px', width: '100%', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px', background: '#fff' }}
+              />
+            ) : (
+              <p style={{ fontSize: '12px', color: 'var(--text-muted)', fontStyle: 'italic' }}>{language === 'es' ? 'Sin firma todavÃÂ­a' : 'Not signed yet'}</p>
+            )}
+            {viewChecklist.completed_at && (
+              <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '8px' }}>
+                {language === 'es' ? 'Aceptada el' : 'Accepted on'} {new Date(viewChecklist.completed_at).toLocaleString()} {language === 'es' ? 'por' : 'by'} {viewChecklist.customer_name}.
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+
       {lightboxUrl && (
-        <div 
-          className="modal-overlay" 
-          onClick={() => setLightboxUrl(null)} 
-          style={{ 
+        <div
+          className="modal-overlay"
+          onClick={() => setLightboxUrl(null)}
+          style={{
             position: 'fixed',
             top: 0,
             left: 0,
@@ -21464,7 +21659,7 @@ USING (true);`;
               onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.2)'}
               onMouseLeave={e => e.currentTarget.style.background = 'rgba(255,255,255,0.1)'}
             >
-              ✕
+              Ã¢ÂÂ
             </button>
             <img 
               src={lightboxUrl} 
@@ -21494,7 +21689,7 @@ USING (true);`;
                   gap: '6px'
                 }}
               >
-                🔗 {language === 'es' ? 'Abrir en pestaña nueva' : 'Open in new tab'}
+                Ã°ÂÂÂ {language === 'es' ? 'Abrir en pestaÃÂ±a nueva' : 'Open in new tab'}
               </a>
             </div>
           </div>
@@ -21520,7 +21715,7 @@ USING (true);`;
                   width: '36px', height: '36px', borderRadius: '10px',
                   background: 'linear-gradient(135deg, var(--color-primary), var(--color-secondary))',
                   display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '18px'
-                }}>👤</div>
+                }}>Ã°ÂÂÂ¤</div>
                 <div>
                   <h3 style={{ margin: 0, fontSize: '17px', fontWeight: 700 }}>
                     {language === 'es' ? 'Agregar Usuario' : 'Add User'}
@@ -21534,7 +21729,7 @@ USING (true);`;
                 className="btn-secondary btn-xs"
                 onClick={() => setQuickAddRiderModalOpen(false)}
                 style={{ padding: '4px 8px', fontSize: '14px' }}
-              >✕</button>
+              >Ã¢ÂÂ</button>
             </div>
 
             {/* Form fields */}
@@ -21552,12 +21747,12 @@ USING (true);`;
                   autoFocus
                   value={quickAddFirstName}
                   onChange={e => setQuickAddFirstName(e.target.value)}
-                  placeholder={language === 'es' ? 'Ej: María' : 'E.g.: John'}
+                  placeholder={language === 'es' ? 'Ej: MarÃÂ­a' : 'E.g.: John'}
                   onKeyDown={e => { if (e.key === 'Enter') handleQuickAddRider(); }}
                 />
               </div>
 
-              {/* 2-col row: Apellido + Teléfono */}
+              {/* 2-col row: Apellido + TelÃÂ©fono */}
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
                 <div className="form-group" style={{ margin: 0 }}>
                   <label className="form-label">
@@ -21571,12 +21766,12 @@ USING (true);`;
                     className="form-control"
                     value={quickAddLastName}
                     onChange={e => setQuickAddLastName(e.target.value)}
-                    placeholder={language === 'es' ? 'Ej: García' : 'E.g.: Smith'}
+                    placeholder={language === 'es' ? 'Ej: GarcÃÂ­a' : 'E.g.: Smith'}
                   />
                 </div>
                 <div className="form-group" style={{ margin: 0 }}>
                   <label className="form-label">
-                    {language === 'es' ? 'Teléfono' : 'Phone'}
+                    {language === 'es' ? 'TelÃÂ©fono' : 'Phone'}
                     <span style={{ color: 'var(--text-muted)', fontSize: '11px', marginLeft: '4px' }}>
                       ({language === 'es' ? 'opcional' : 'optional'})
                     </span>
@@ -21621,13 +21816,13 @@ USING (true);`;
                   value={quickAddNationality}
                   onChange={e => setQuickAddNationality(e.target.value)}
                 >
-                  <optgroup label={language === 'es' ? '⭐ Frecuentes' : '⭐ Common'}>
+                  <optgroup label={language === 'es' ? 'Ã¢Â­Â Frecuentes' : 'Ã¢Â­Â Common'}>
                     {POPULAR_NATIONALITIES.map(n => (
                       <option key={n.value} value={n.value}>{language === 'es' ? n.labelEs : n.labelEn}</option>
                     ))}
                   </optgroup>
                   <optgroup label={language === 'es' ? 'Todas' : 'All'}>
-                    {NATIONALITIES.map(n => (
+                    {sortedNationalities.map(n => (
                       <option key={n.value} value={n.value}>{language === 'es' ? n.labelEs : n.labelEn}</option>
                     ))}
                   </optgroup>
@@ -21647,7 +21842,7 @@ USING (true);`;
                   rows={3}
                   value={quickAddNotes}
                   onChange={e => setQuickAddNotes(e.target.value)}
-                  placeholder={language === 'es' ? 'Información adicional sobre este usuario...' : 'Additional info about this user...'}
+                  placeholder={language === 'es' ? 'InformaciÃÂ³n adicional sobre este usuario...' : 'Additional info about this user...'}
                   style={{ resize: 'vertical', minHeight: '72px' }}
                 />
               </div>
@@ -21667,7 +21862,7 @@ USING (true);`;
                 onClick={handleQuickAddRider}
                 style={{ display: 'flex', alignItems: 'center', gap: '6px' }}
               >
-                👤 {language === 'es' ? 'Crear Usuario' : 'Create User'}
+                Ã°ÂÂÂ¤ {language === 'es' ? 'Crear Usuario' : 'Create User'}
               </button>
             </div>
           </div>
@@ -21684,8 +21879,8 @@ USING (true);`;
           <div className="modal-overlay" style={{ zIndex: 1300 }} onClick={() => setAddGenStockModalOpen(false)}>
             <div className="modal-content" style={{ maxWidth: '450px', width: '100%', padding: '24px' }} onClick={e => e.stopPropagation()}>
               <div className="modal-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-                <h3>➕ {language === 'es' ? 'Agregar Existencias' : 'Add Stock'} ({prod.serial_number})</h3>
-                <button className="btn-secondary btn-xs" onClick={() => setAddGenStockModalOpen(false)}>✕</button>
+                <h3>Ã¢ÂÂ {language === 'es' ? 'Agregar Existencias' : 'Add Stock'} ({prod.serial_number})</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setAddGenStockModalOpen(false)}>Ã¢ÂÂ</button>
               </div>
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
                 <div className="form-group">
@@ -21699,13 +21894,13 @@ USING (true);`;
                   />
                 </div>
                 <div className="form-group" style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                  <label className="form-label">{language === 'es' ? 'Ubicación' : 'Location'}</label>
+                  <label className="form-label">{language === 'es' ? 'UbicaciÃÂ³n' : 'Location'}</label>
                   <select
                     className="form-control"
                     value={genStockLocation}
                     onChange={(e) => setGenStockLocation(e.target.value)}
                   >
-                    <option value="">{language === 'es' ? '-- Seleccione ubicación --' : '-- Select location --'}</option>
+                    <option value="">{language === 'es' ? '-- Seleccione ubicaciÃÂ³n --' : '-- Select location --'}</option>
                     {locationsList.map((loc) => (
                       <option key={loc} value={loc}>{loc}</option>
                     ))}
@@ -21716,7 +21911,7 @@ USING (true);`;
                       type="text"
                       className="form-control"
                       style={{ flex: 1 }}
-                      placeholder={language === 'es' ? 'Crear nueva ubicación' : 'Create new location'}
+                      placeholder={language === 'es' ? 'Crear nueva ubicaciÃÂ³n' : 'Create new location'}
                       value={newLocationInput}
                       onChange={(e) => setNewLocationInput(e.target.value)}
                     />
@@ -21735,17 +21930,17 @@ USING (true);`;
                         setGenStockLocation(trimmed);
                         setNewLocationInput('');
                         showToast(
-                          language === 'es' ? `Ubicación "${trimmed}" creada.` : `Location "${trimmed}" created.`,
+                          language === 'es' ? `UbicaciÃÂ³n "${trimmed}" creada.` : `Location "${trimmed}" created.`,
                           'success'
                         );
                       }}
                     >
-                      ➕ {language === 'es' ? 'Crear' : 'Create'}
+                      Ã¢ÂÂ {language === 'es' ? 'Crear' : 'Create'}
                     </button>
                   </div>
                 </div>
                 <div className="form-group">
-                  <label className="form-label">{language === 'es' ? 'Costo unitario (€)' : 'Unit Cost (€)'}</label>
+                  <label className="form-label">{language === 'es' ? 'Costo unitario (Ã¢ÂÂ¬)' : 'Unit Cost (Ã¢ÂÂ¬)'}</label>
                   <input
                     type="number"
                     className="form-control"
@@ -21758,8 +21953,8 @@ USING (true);`;
                     const total = (genStockCost || 0) * qty;
                     return (
                       <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '6px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(16, 185, 129, 0.05)', padding: '6px 10px', borderRadius: '6px', border: '1px solid rgba(16, 185, 129, 0.1)' }}>
-                        <span>{language === 'es' ? 'Total de la compra' : 'Total purchase'} ({qty} {language === 'es' ? 'uds' : 'units'} × €{genStockCost || 0})</span>
-                        <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{total.toLocaleString()}</strong>
+                        <span>{language === 'es' ? 'Total de la compra' : 'Total purchase'} ({qty} {language === 'es' ? 'uds' : 'units'} ÃÂ Ã¢ÂÂ¬{genStockCost || 0})</span>
+                        <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>Ã¢ÂÂ¬{total.toLocaleString()}</strong>
                       </div>
                     );
                   })()}
@@ -21772,7 +21967,7 @@ USING (true);`;
                 <button 
                   className="btn-primary" 
                   onClick={async () => {
-                    const cleanLocation = genStockLocation.trim() || 'Almacén Central';
+                    const cleanLocation = genStockLocation.trim() || 'AlmacÃÂ©n Central';
                     try {
                       // Insert new product row representing these new generic units
                       const newId = crypto.randomUUID();
@@ -21793,7 +21988,7 @@ USING (true);`;
                           }
                         }
                       });
-                      showToast(language === 'es' ? 'Existencias añadidas correctamente.' : 'Stock added successfully.', 'success');
+                      showToast(language === 'es' ? 'Existencias aÃÂ±adidas correctamente.' : 'Stock added successfully.', 'success');
                       setAddGenStockModalOpen(false);
                       triggerReload();
                     } catch (err) {
@@ -21802,7 +21997,7 @@ USING (true);`;
                     }
                   }}
                 >
-                  💾 {language === 'es' ? 'Guardar' : 'Save'}
+                  Ã°ÂÂÂ¾ {language === 'es' ? 'Guardar' : 'Save'}
                 </button>
               </div>
             </div>
@@ -21841,8 +22036,8 @@ USING (true);`;
           <div className="modal-overlay" style={{ zIndex: 1300 }} onClick={() => setRemoveGenStockModalOpen(false)}>
             <div className="modal-content" style={{ maxWidth: '450px', width: '100%', padding: '24px' }} onClick={e => e.stopPropagation()}>
               <div className="modal-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-                <h3>➖ {language === 'es' ? 'Quitar Existencias' : 'Remove Stock'} ({prod.serial_number})</h3>
-                <button className="btn-secondary btn-xs" onClick={() => setRemoveGenStockModalOpen(false)}>✕</button>
+                <h3>Ã¢ÂÂ {language === 'es' ? 'Quitar Existencias' : 'Remove Stock'} ({prod.serial_number})</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setRemoveGenStockModalOpen(false)}>Ã¢ÂÂ</button>
               </div>
               
               {availableLocations.length === 0 ? (
@@ -21852,7 +22047,7 @@ USING (true);`;
               ) : (
                 <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
                   <div className="form-group">
-                    <label className="form-label">{language === 'es' ? 'Ubicación' : 'Location'}</label>
+                    <label className="form-label">{language === 'es' ? 'UbicaciÃÂ³n' : 'Location'}</label>
                     <select 
                       className="form-control" 
                       value={genStockLocation} 
@@ -22051,7 +22246,7 @@ USING (true);`;
                   e.currentTarget.style.color = 'var(--text-muted)';
                 }}
               >
-                ✏️ {t.edit}
+                Ã¢ÂÂÃ¯Â¸Â {t.edit}
               </button>
               
               {isGeneric && (
@@ -22077,7 +22272,7 @@ USING (true);`;
                       setActiveStockMenuId(null);
                       setSelectedProductId(prod.id);
                       setGenStockQty(1);
-                      setGenStockLocation('Almacén Central');
+                      setGenStockLocation('AlmacÃÂ©n Central');
                       setGenStockCost(prod.price_paid || 0);
                       setAddGenStockModalOpen(true);
                     }}
@@ -22090,7 +22285,7 @@ USING (true);`;
                       e.currentTarget.style.color = 'var(--text-muted)';
                     }}
                   >
-                    ➕ {language === 'es' ? 'Agregar existencias' : 'Add Stock'}
+                    Ã¢ÂÂ {language === 'es' ? 'Agregar existencias' : 'Add Stock'}
                   </button>
                   {hasAvailableStock && (
                     <button
@@ -22116,7 +22311,7 @@ USING (true);`;
                         setGenStockQty(1);
                         const distObj = (prod.custom_field_values?.location_distribution as Record<string, number>) || {};
                         const locs = Object.keys(distObj).filter(k => distObj[k] > 0);
-                        setGenStockLocation(locs[0] || 'Almacén Central');
+                        setGenStockLocation(locs[0] || 'AlmacÃÂ©n Central');
                         setRemoveGenStockModalOpen(true);
                       }}
                       onMouseEnter={(e) => {
@@ -22128,7 +22323,7 @@ USING (true);`;
                         e.currentTarget.style.color = 'var(--text-muted)';
                       }}
                     >
-                      ➖ {language === 'es' ? 'Quitar existencias' : 'Remove Stock'}
+                      Ã¢ÂÂ {language === 'es' ? 'Quitar existencias' : 'Remove Stock'}
                     </button>
                   )}
                 </>
@@ -22169,7 +22364,7 @@ USING (true);`;
                       e.currentTarget.style.color = 'var(--text-muted)';
                     }}
                   >
-                    📍 {language === 'es' ? 'Ubicación' : 'Location'}
+                    Ã°ÂÂÂ {language === 'es' ? 'UbicaciÃÂ³n' : 'Location'}
                   </button>
 
                   {(prod.category_id === catBikeId || prod.category_id === catBattId) && (
@@ -22205,9 +22400,7 @@ USING (true);`;
                         e.currentTarget.style.color = 'var(--text-muted)';
                       }}
                     >
-                      ✨ {language === 'es' ? 'Condición' : 'Condition'}
-                    </button>
-                  )}
+
                 </>
               )}
 
@@ -22243,7 +22436,7 @@ USING (true);`;
                     e.currentTarget.style.color = 'var(--text-muted)';
                   }}
                 >
-                  🔧 Service
+                  Ã°ÂÂÂ§ Service
                 </button>
               )}
 
@@ -22279,7 +22472,7 @@ USING (true);`;
                     e.currentTarget.style.color = 'var(--text-muted)';
                   }}
                 >
-                  🛠️ {language === 'es' ? 'Modificaciones' : 'Modifications'}
+                  Ã°ÂÂÂ Ã¯Â¸Â {language === 'es' ? 'Modificaciones' : 'Modifications'}
                 </button>
               )}
 
@@ -22316,7 +22509,7 @@ USING (true);`;
                   e.currentTarget.style.color = 'var(--text-muted)';
                 }}
               >
-                📝 {language === 'es' ? 'Notas' : 'Notes'}
+                Ã°ÂÂÂ {language === 'es' ? 'Notas' : 'Notes'}
               </button>
 
               <button 
@@ -22344,10 +22537,10 @@ USING (true);`;
                   const inactiveStatuses = ['Vendida', 'Financiada', 'Robada', 'Perdida', 'Perdida/Garda'];
 
                   // If the menu was opened on a single sold/lost/stolen unit (e.g. from the Sold tab),
-                  // delete ONLY that unit — never the available stock of the same batch — and also
+                  // delete ONLY that unit Ã¢ÂÂ never the available stock of the same batch Ã¢ÂÂ and also
                   // remove its sale transaction from the financial balance.
                   if (inactiveStatuses.includes(prod.status)) {
-                    if (!await asyncConfirm(language === 'es' ? '¿Eliminar este artículo vendido? También se quitará su venta del balance financiero. No afecta al stock disponible del lote.' : 'Delete this sold item? Its sale will also be removed from the financial balance. It will not affect the batch available stock.')) return;
+                    if (!await asyncConfirm(language === 'es' ? 'ÃÂ¿Eliminar este artÃÂ­culo vendido? TambiÃÂ©n se quitarÃÂ¡ su venta del balance financiero. No afecta al stock disponible del lote.' : 'Delete this sold item? Its sale will also be removed from the financial balance. It will not affect the batch available stock.')) return;
                     try {
                       // Clean up the linked sale(s) so the income disappears from the balance.
                       const allItems = await getSaleItems();
@@ -22355,13 +22548,13 @@ USING (true);`;
                       for (const si of linkedItems) {
                         const remaining = allItems.filter(other => other.sale_id === si.sale_id && other.id !== si.id);
                         if (remaining.length === 0) {
-                          // This product was the sale's only item → remove the whole sale (+ financing).
+                          // This product was the sale's only item Ã¢ÂÂ remove the whole sale (+ financing).
                           const plan = financingPlans.find(fp => fp.sale_id === si.sale_id);
                           if (plan) {
                             const sale = sales.find(s => s.id === si.sale_id);
                             const cust = sale ? customers.find(c => c.id === sale.customer_id) : null;
                             const custName = cust ? `${cust.first_name} ${cust.last_name}` : null;
-                            const linkedEvents = events.filter(e => e.title.includes('💳 Cuota') && (custName ? e.title.includes(custName) : false));
+                            const linkedEvents = events.filter(e => e.title.includes('Ã°ÂÂÂ³ Cuota') && (custName ? e.title.includes(custName) : false));
                             for (const ev of linkedEvents) await deleteEvent(ev.id);
                             await deleteFinancingPayments(plan.id);
                             await deleteFinancingPlan(plan.id);
@@ -22369,7 +22562,7 @@ USING (true);`;
                           await deleteSaleItems(si.sale_id);
                           await deleteSale(si.sale_id);
                         } else {
-                          // Sale has other items → drop just this item and reduce the sale total.
+                          // Sale has other items Ã¢ÂÂ drop just this item and reduce the sale total.
                           await deleteSaleItem(si.id);
                           const sale = sales.find(s => s.id === si.sale_id);
                           if (sale) {
@@ -22378,7 +22571,7 @@ USING (true);`;
                         }
                       }
                       await deleteProduct(prod.id);
-                      showToast(language === 'es' ? 'Artículo y venta eliminados.' : 'Item and sale deleted.');
+                      showToast(language === 'es' ? 'ArtÃÂ­culo y venta eliminados.' : 'Item and sale deleted.');
                       triggerReload();
                     } catch { showToast(language === 'es' ? 'Error al eliminar.' : 'Delete error.', 'error'); }
                     return;
@@ -22391,11 +22584,11 @@ USING (true);`;
                     return sum + (d != null ? Object.values(d).reduce((a, b) => a + (Number(b) || 0), 0) : 1);
                   }, 0);
                   const confirmMsg = unitsToDelete > 1
-                    ? (language === 'es' ? `⚠️ ¿Eliminar TODAS las ${unitsToDelete} unidades en stock de este lote?` : `⚠️ Delete ALL ${unitsToDelete} stock units of this batch?`)
-                    : (language === 'es' ? '¿Eliminar este producto del inventario?' : 'Delete this product from inventory?');
+                    ? (language === 'es' ? `Ã¢ÂÂ Ã¯Â¸Â ÃÂ¿Eliminar TODAS las ${unitsToDelete} unidades en stock de este lote?` : `Ã¢ÂÂ Ã¯Â¸Â Delete ALL ${unitsToDelete} stock units of this batch?`)
+                    : (language === 'es' ? 'ÃÂ¿Eliminar este producto del inventario?' : 'Delete this product from inventory?');
 
                   if (hasRentals) {
-                    if (!await asyncConfirm(language === 'es' ? '⚠️ Este lote/producto tiene alquileres activos. ¿Eliminar de todos modos?' : '⚠️ This batch/product has active rentals. Delete anyway?')) return;
+                    if (!await asyncConfirm(language === 'es' ? 'Ã¢ÂÂ Ã¯Â¸Â Este lote/producto tiene alquileres activos. ÃÂ¿Eliminar de todos modos?' : 'Ã¢ÂÂ Ã¯Â¸Â This batch/product has active rentals. Delete anyway?')) return;
                   } else {
                     if (!await asyncConfirm(confirmMsg)) return;
                   }
@@ -22415,7 +22608,7 @@ USING (true);`;
                   e.currentTarget.style.color = 'rgba(239, 68, 68, 0.85)';
                 }}
               >
-                🗑️ {t.delete}
+                Ã°ÂÂÂÃ¯Â¸Â {t.delete}
               </button>
             </div>
           </>
@@ -22440,7 +22633,7 @@ USING (true);`;
                   width: '36px', height: '36px', borderRadius: '10px',
                   background: 'linear-gradient(135deg, #4f46e5, #7c3aed)',
                   display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '18px'
-                }}>🔒</div>
+                }}>Ã°ÂÂÂ</div>
                 <div>
                   <h3 style={{ margin: 0, fontSize: '17px', fontWeight: 700 }}>
                     {language === 'es' ? 'Control de Accesos (Google Auth)' : 'Access Control (Google Auth)'}
@@ -22454,7 +22647,7 @@ USING (true);`;
                 className="btn-secondary btn-xs"
                 onClick={() => setWhitelistModalOpen(false)}
                 style={{ padding: '4px 8px', fontSize: '14px' }}
-              >✕</button>
+              >Ã¢ÂÂ</button>
             </div>
 
             {/* Content Body */}
@@ -22464,14 +22657,14 @@ USING (true);`;
                 /* Whitelist Table Error: Means the database table doesn't exist yet! */
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                   <div className="glass-card" style={{ border: '1px solid rgba(239, 68, 68, 0.2)', background: 'rgba(239, 68, 68, 0.05)', padding: '16px', display: 'flex', gap: '12px' }}>
-                    <span style={{ fontSize: '24px', flexShrink: 0 }}>⚠️</span>
+                    <span style={{ fontSize: '24px', flexShrink: 0 }}>Ã¢ÂÂ Ã¯Â¸Â</span>
                     <div>
                       <h4 style={{ margin: '0 0 6px 0', color: '#f87171', fontSize: '14px', fontWeight: 600 }}>
                         {language === 'es' ? 'Tabla de base de datos no configurada' : 'Database table not configured'}
                       </h4>
                       <p style={{ margin: 0, fontSize: '13px', color: 'var(--text-bright)', lineHeight: '1.5' }}>
                         {language === 'es' 
-                          ? 'Para activar el control de accesos, primero necesitas crear la tabla en tu base de datos de Supabase. Copia el siguiente código SQL y ejecútalo en la pestaña "SQL Editor" de tu panel de Supabase.'
+                          ? 'Para activar el control de accesos, primero necesitas crear la tabla en tu base de datos de Supabase. Copia el siguiente cÃÂ³digo SQL y ejecÃÂºtalo en la pestaÃÂ±a "SQL Editor" de tu panel de Supabase.'
                           : 'To enable access control, you first need to create the table in your Supabase database. Copy the SQL code below and execute it in the "SQL Editor" tab of your Supabase dashboard.'}
                       </p>
                     </div>
@@ -22494,7 +22687,8 @@ USING (true);`;
                         borderColor: 'rgba(255, 255, 255, 0.15)'
                       }}
                     >
-                      {sqlCopied ? '✅ ' : '📋 '}
+                      {sqlCopied ? 'Ã¢ÂÂ
+ ' : 'Ã°ÂÂÂ '}
                       {sqlCopied 
                         ? (language === 'es' ? 'Copiado' : 'Copied') 
                         : (language === 'es' ? 'Copiar SQL' : 'Copy SQL')}
@@ -22513,7 +22707,8 @@ USING (true);`;
                       whiteSpace: 'pre-wrap',
                       wordBreak: 'break-all'
                     }}>
-                      {`CREATE TABLE public.allowed_emails (...);\n-- (Haz clic en Copiar SQL para obtener el script completo)`}
+                      {`CREATE TABLE public.allowed_emails (...);\
+-- (Haz clic en Copiar SQL para obtener el script completo)`}
                     </pre>
                   </div>
 
@@ -22523,7 +22718,7 @@ USING (true);`;
                       onClick={fetchWhitelist}
                       style={{ padding: '8px 16px', fontSize: '13px' }}
                     >
-                      🔄 {language === 'es' ? 'Verificar Conexión' : 'Verify Connection'}
+                      Ã°ÂÂÂ {language === 'es' ? 'Verificar ConexiÃÂ³n' : 'Verify Connection'}
                     </button>
                   </div>
                 </div>
@@ -22545,10 +22740,10 @@ USING (true);`;
                       alignItems: 'center',
                       gap: '8px'
                     }}>
-                      <span style={{ fontSize: '16px' }}>⚠️</span>
+                      <span style={{ fontSize: '16px' }}>Ã¢ÂÂ Ã¯Â¸Â</span>
                       <span>
                         {language === 'es'
-                          ? 'Tu correo actual no está en la lista autorizada. Si cierras sesión serás bloqueado. ¡Añade tu correo a la lista blanca para asegurar tu acceso!'
+                          ? 'Tu correo actual no estÃÂ¡ en la lista autorizada. Si cierras sesiÃÂ³n serÃÂ¡s bloqueado. ÃÂ¡AÃÂ±ade tu correo a la lista blanca para asegurar tu acceso!'
                           : 'Your current email is not in the authorized list. If you log out, you will be locked out. Add your email to the whitelist to secure your access!'}
                       </span>
                     </div>
@@ -22592,7 +22787,7 @@ USING (true);`;
                       disabled={whitelistLoading || !whitelistEmailInput.trim()}
                       style={{ height: '38px', padding: '0 16px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
                     >
-                      {whitelistLoading ? '⏳' : '➕'} {language === 'es' ? 'Autorizar' : 'Authorize'}
+                      {whitelistLoading ? 'Ã¢ÂÂ³' : 'Ã¢ÂÂ'} {language === 'es' ? 'Autorizar' : 'Authorize'}
                     </button>
                   </form>
 
@@ -22605,7 +22800,7 @@ USING (true);`;
                     </span>
                     {allowedEmails.length === 0 && (
                       <span className="badge" style={{ background: 'rgba(52, 211, 153, 0.1)', color: '#34d399', border: '1px solid rgba(52, 211, 153, 0.2)' }}>
-                        🔓 {language === 'es' ? 'Modo Abierto (Cualquiera entra)' : 'Open Mode (Anyone can enter)'}
+                        Ã°ÂÂÂ {language === 'es' ? 'Modo Abierto (Cualquiera entra)' : 'Open Mode (Anyone can enter)'}
                       </span>
                     )}
                   </div>
@@ -22615,9 +22810,9 @@ USING (true);`;
                     <table className="custom-table" style={{ width: '100%' }}>
                       <thead>
                         <tr>
-                          <th>{language === 'es' ? 'Correo Electrónico' : 'Email Address'}</th>
+                          <th>{language === 'es' ? 'Correo ElectrÃÂ³nico' : 'Email Address'}</th>
                           <th>{language === 'es' ? 'Rol' : 'Role'}</th>
-                          <th>{language === 'es' ? 'Fecha Añadido' : 'Date Added'}</th>
+                          <th>{language === 'es' ? 'Fecha AÃÂ±adido' : 'Date Added'}</th>
                           <th style={{ width: '80px', textAlign: 'center' }}>{language === 'es' ? 'Acciones' : 'Actions'}</th>
                         </tr>
                       </thead>
@@ -22626,13 +22821,13 @@ USING (true);`;
                           <tr>
                             <td colSpan={4} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '24px', fontStyle: 'italic', fontSize: '13px' }}>
                               {language === 'es' 
-                                ? 'No hay correos autorizados todavía. La plataforma está abierta.'
+                                ? 'No hay correos autorizados todavÃÂ­a. La plataforma estÃÂ¡ abierta.'
                                 : 'No authorized emails yet. The platform is open to any Google account.'}
                             </td>
                           </tr>
                         ) : allowedEmails.map(row => {
                           const isSelf = row.email.toLowerCase() === user?.email?.toLowerCase();
-                          const fmtDate = row.created_at ? row.created_at.split('T')[0].split('-').reverse().join('/') : '—';
+                          const fmtDate = row.created_at ? row.created_at.split('T')[0].split('-').reverse().join('/') : 'Ã¢ÂÂ';
                           
                           return (
                             <tr key={row.id} style={{ background: isSelf ? 'rgba(99,102,241,0.06)' : undefined }}>
@@ -22641,7 +22836,7 @@ USING (true);`;
                                   <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-bright)' }}>{row.email}</span>
                                   {isSelf && (
                                     <span style={{ fontSize: '10px', background: 'rgba(99,102,241,0.2)', color: '#a5b4fc', padding: '1px 5px', borderRadius: '4px', fontWeight: 600 }}>
-                                      {language === 'es' ? 'Eres tú' : 'You'}
+                                      {language === 'es' ? 'Eres tÃÂº' : 'You'}
                                     </span>
                                   )}
                                 </div>
@@ -22664,7 +22859,7 @@ USING (true);`;
                                   onClick={() => handleDeleteWhitelistEmail(row.id, row.email)}
                                   title={language === 'es' ? 'Revocar Acceso' : 'Revoke Access'}
                                 >
-                                  🗑️
+                                  Ã°ÂÂÂÃ¯Â¸Â
                                 </button>
                               </td>
                             </tr>
@@ -22710,19 +22905,20 @@ USING (true);`;
         </div>
         <ul className="sidebar-menu">
           {[
-            { key: 'analytics',     icon: '📊', label: t.dashboard },
-            { key: 'balance',       icon: '💰', label: t.balance },
-            { key: 'stock',         icon: '📦', label: t.stock },
-            { key: 'rental_wizard', icon: '⚡', label: t.wizard },
-            { key: 'accounts',      icon: '🛵', label: t.accounts },
-            { key: 'users',         icon: '👥', label: t.users },
-            { key: 'maintenance',   icon: '⚙️', label: t.maintenance },
-            { key: 'crm',           icon: '🎯', label: t.crm },
-            { key: 'calendar',      icon: '📅', label: t.calendar },
-            { key: 'suppliers',     icon: '🏬', label: t.suppliers },
-            { key: 'quick_replies', icon: '💬', label: t.quick_replies },
-            { key: 'emails',        icon: '📧', label: language === 'es' ? 'Plantillas' : 'Templates' },
-            { key: 'tasks',         icon: '📋', label: t.tasks },
+            { key: 'analytics',     icon: 'Ã°ÂÂÂ', label: t.dashboard },
+            { key: 'balance',       icon: 'Ã°ÂÂÂ°', label: t.balance },
+            { key: 'stock',         icon: 'Ã°ÂÂÂ¦', label: t.stock },
+            { key: 'rental_wizard', icon: 'Ã¢ÂÂ¡', label: t.wizard },
+            { key: 'accounts',      icon: 'Ã°ÂÂÂµ', label: t.accounts },
+            { key: 'users',         icon: 'Ã°ÂÂÂ¥', label: t.users },
+            { key: 'maintenance',   icon: 'Ã¢ÂÂÃ¯Â¸Â', label: t.maintenance },
+            { key: 'crm',           icon: 'Ã°ÂÂÂ¯', label: t.crm },
+            { key: 'calendar',      icon: 'Ã°ÂÂÂ
+', label: t.calendar },
+            { key: 'suppliers',     icon: 'Ã°ÂÂÂ¬', label: t.suppliers },
+            { key: 'quick_replies', icon: 'Ã°ÂÂÂ¬', label: t.quick_replies },
+            { key: 'emails',        icon: 'Ã°ÂÂÂ§', label: language === 'es' ? 'Plantillas' : 'Templates' },
+            { key: 'tasks',         icon: 'Ã°ÂÂÂ', label: t.tasks },
           ].filter(({ key }) => !(key === 'balance' && isManager)).map(({ key, icon, label }) => (
             <li key={key}>
               <a className={`menu-item ${currentTab === key ? 'active' : ''}`}
@@ -22754,7 +22950,7 @@ USING (true);`;
               <span className="sidebar-user-name">{user.user_metadata?.full_name || user.email?.split('@')[0]}</span>
               <span className="sidebar-user-email">{user.email}</span>
             </div>
-            <button className="btn-secondary btn-xs" onClick={signOut} style={{ padding: '4px 8px', fontSize: '14px' }}>🚪</button>
+            <button className="btn-secondary btn-xs" onClick={signOut} style={{ padding: '4px 8px', fontSize: '14px' }}>Ã°ÂÂÂª</button>
           </div>
         )}
       </nav>
@@ -22762,9 +22958,9 @@ USING (true);`;
         <div className="modal-backdrop" style={{ zIndex: 99999, display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(8px)' }}>
           <div className="glass-card" style={{ maxWidth: '440px', width: '90%', padding: '24px', borderRadius: '16px', border: '1px solid rgba(255, 255, 255, 0.08)', background: 'rgba(15, 15, 25, 0.75)', boxShadow: '0 8px 32px rgba(0, 0, 0, 0.4)', display: 'flex', flexDirection: 'column', gap: '20px', animation: 'scaleUpConfirm 0.2s cubic-bezier(0.34, 1.56, 0.64, 1)' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-              <span style={{ fontSize: '24px' }}>⚠️</span>
+              <span style={{ fontSize: '24px' }}>Ã¢ÂÂ Ã¯Â¸Â</span>
               <h3 style={{ margin: 0, fontSize: '18px', fontWeight: 600, color: 'var(--text-bright)' }}>
-                {confirmPromise.title || (language === 'es' ? '¿Estás seguro?' : 'Are you sure?')}
+                {confirmPromise.title || (language === 'es' ? 'ÃÂ¿EstÃÂ¡s seguro?' : 'Are you sure?')}
               </h3>
             </div>
             <p style={{ margin: 0, fontSize: '14px', color: 'var(--text-muted)', lineHeight: 1.6, textAlign: 'left', whiteSpace: 'pre-wrap' }}>
