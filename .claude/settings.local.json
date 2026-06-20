@@ -20,7 +20,19 @@
       "Bash(cd \"C:\\\\roberto\\\\webs\\\\the_fast_sheep\" && echo \"=== Titulos/labels de las features de stock del stash ===\" && grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -oE \"\\(es' \\\\?|=== 'es' \\\\?|language === 'es' \\\\?\\) '[^']+' : '[^']+'\" | sed \"s/.*? '/ES: /; s/' : '/  | EN: /; s/'$//\" | grep -iE \"stock|ubicaci|locat|almac|generic|generic|consolid|distribu|mover|trasla|cantidad|merg\" | sort -u | head -30; echo \"\"; echo \"=== Strings 'Almacén' y modales gen-stock ===\"; grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -oiE \"\\(Agregar Stock|Quitar Stock|Add Stock|Remove Stock|Mover Stock|Stock Gen[^<']*|Distribución[^<']*|por Ubicación[^<']*\\)\" | sort -u | head)",
       "Bash(cd \"C:\\\\roberto\\\\webs\\\\the_fast_sheep\" && echo \"=== Nuevos useState \\(features nuevas\\) en el stash ===\" && grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -oE \"const \\\\[[a-zA-Z]+, set[A-Za-z]+\\\\]\" | sed 's/const \\\\[//; s/, set.*//' | sort -u | head -80)",
       "Bash(cd \"C:\\\\roberto\\\\webs\\\\the_fast_sheep\" && echo \"=== Claves de traduccion nuevas en el stash ===\" && grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -oE \"[a-zA-Z_]+: \\\\\"[^\\\\\"]+\\\\\"\" | grep -vE \"className|style|type|id:|key:|width|color|padding|margin|display|flex|font|background|border\" | sed 's/:.*//' | sort -u | head -60; echo \"\"; echo \"=== Feature 'prefix' \\(que es?\\) ===\"; grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -iE \"prefix|prefijo\" | grep -oiE \"\\(es' \\\\? '[^']+' : '[^']+'|Prefijo[^<']*|Prefix[^<']*\\)\" | sort -u | head)",
-      "Bash(cd \"C:\\\\roberto\\\\webs\\\\the_fast_sheep\" && echo \"=== TODOS los textos bilingues nuevos del stash \\(para inventario\\) ===\" && grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -oE \"=== 'es'|language === 'es' \\\\? '[^']+' : '[^']+'\" 2>/dev/null; grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -oE \"'es' \\\\? '[^']+' : '[^']+'\" | sed \"s/'es' ? '//; s/' : '/  |  /; s/'$//\" | sort -u | head -90)"
+      "Bash(cd \"C:\\\\roberto\\\\webs\\\\the_fast_sheep\" && echo \"=== TODOS los textos bilingues nuevos del stash \\(para inventario\\) ===\" && grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -oE \"=== 'es'|language === 'es' \\\\? '[^']+' : '[^']+'\" 2>/dev/null; grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -oE \"'es' \\\\? '[^']+' : '[^']+'\" | sed \"s/'es' ? '//; s/' : '/  |  /; s/'$//\" | sort -u | head -90)",
+      "Bash(git merge *)",
+      "Bash(awk ' *)",
+      "Bash(echo \"=== lineas que terminan en backslash \\(artefacto \\\\\\\\n literalizado\\) ===\")",
+      "Bash(grep -cE \"\\\\\\\\\\\\\\\\$\" src/App.tsx)",
+      "Bash(grep -nE \"\\\\\\\\\\\\\\\\$\" src/App.tsx)",
+      "Bash(python -)",
+      "Bash(cd \"C:\\\\roberto\\\\webs\\\\the_fast_sheep\" && git show 42bf50f:src/App.tsx > /tmp/clean42.tsx && echo \"=== en 42bf50f: contexto tras el onClick changeCondition ===\" && grep -n \"setModalType\\('changeCondition'\\)\" /tmp/clean42.tsx | head)",
+      "Bash(cd \"C:\\\\roberto\\\\webs\\\\the_fast_sheep\" && echo \"=== 42bf50f alrededor de 22197 \\(changeCondition de baja indentacion\\) ===\" && sed -n '22185,22230p' /tmp/clean42.tsx)",
+      "Bash(grep -vE \"^\\\\>\\\\s*$\")",
+      "Bash(grep -vE \"^<\\\\s*$\")",
+      "Bash(git add *)",
+      "Bash(git commit -q -m 'feat: agrega checklist \\(cliente+interno\\) + backup Excel + boton Usuarios; renombra BAT->VAT *)"
     ]
   }
 }

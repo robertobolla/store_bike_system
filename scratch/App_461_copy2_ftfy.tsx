@@ -22,6 +22,8 @@ import {
   getPayments, insertPayment, deletePayment,
   getExpenses, insertExpense,
   uploadRentalPhoto, uploadRiderDocument, uploadContractPhoto, uploadSignatureImage,
+  uploadChecklistSignature, createDeliveryChecklist, getDeliveryChecklist, getDeliveryChecklists, submitDeliveryChecklist,
+  createInternalChecklist, updateDeliveryChecklist,
   getLeadCategories, getLeads, upsertLead, deleteLead, insertLeadCategory,
   getSuppliers, upsertSupplier, deleteSupplier, getSupplierProducts, upsertSupplierProduct, deleteSupplierProduct,
   getPlatforms, getVehicles, getAppAccounts, upsertAppAccount, deleteAppAccount, insertPlatform, insertVehicle, updatePlatform, deletePlatform, updateVehicle, deleteVehicle,
@@ -40,8 +42,6 @@ import {
   getTaskCards, upsertTaskCard, deleteTaskCard,
   getTaskItems, upsertTaskItem, deleteTaskItem,
   getColorTags, upsertColorTag, deleteColorTag,
-  uploadChecklistSignature, createDeliveryChecklist, getDeliveryChecklist, getDeliveryChecklists, submitDeliveryChecklist,
-  createInternalChecklist, updateDeliveryChecklist,
 } from './db';
 import type { AllowedEmail, BikeModification, DeliveryChecklist } from './db';
 import { downloadBackupXlsx } from './backup';
@@ -207,9 +207,15 @@ function parseLeadNotes(notesRaw: string | null | undefined): NoteEntry[] {
   } catch (e) {
     // not JSON
   }
-  // 2. Try legacy format: [ISO_DATE] content\n---\n...
-  if (notesRaw.includes('\n---\n') || /^\[20\d{2}-/.test(notesRaw)) {
-    const segments = notesRaw.split('\n---\n').filter(s => s.trim());
+  // 2. Try legacy format: [ISO_DATE] content\
+---\
+...
+  if (notesRaw.includes('\
+---\
+') || /^\[20\d{2}-/.test(notesRaw)) {
+    const segments = notesRaw.split('\
+---\
+').filter(s => s.trim());
     const entries: NoteEntry[] = segments.map(seg => {
       const match = seg.match(/^\[([^\]]+)\]\s*([\s\S]*)$/);
       if (match) {
@@ -274,6 +280,7 @@ async function executeEmailSend(to: string, subject: string, html: string) {
   }
 }
 
+// ----------------------------------------------------
 // DELIVERY CHECKLIST – content & emails
 // Items mirror public/CHECKLIST2-bikeDelivery.pdf
 // ----------------------------------------------------
@@ -669,7 +676,6 @@ function sendDeliveryChecklistCopyEmail(
     </div>`;
   executeEmailSend(checklist.customer_email, subject, html);
 }
-
 
 // ----------------------------------------------------
 // EMAIL TEMPLATES & MOCK DELIVERY SYSTEM (Resend ready)
@@ -1252,29 +1258,38 @@ function sendFinancingCompletedEmail(customer: any, lang: 'es' | 'en' | 'pt', em
       es: {
         subject: `¡Felicidades! Has completado tu financiación - The Fast Sheep`,
         hello: `Hola ${customer.first_name},`,
-        body: `Queremos agradecerte y felicitarte por haber abonado exitosamente la última cuota de tu financiación.\n\n¡La bicicleta ahora es completamente tuya! Gracias por confiar en The Fast Sheep. Esperamos que la sigas disfrutando al máximo.`
+        body: `Queremos agradecerte y felicitarte por haber abonado exitosamente la última cuota de tu financiación.\
+\
+¡La bicicleta ahora es completamente tuya! Gracias por confiar en The Fast Sheep. Esperamos que la sigas disfrutando al máximo.`
       },
       en: {
         subject: `Congratulations! You have completed your financing - The Fast Sheep`,
         hello: `Hello ${customer.first_name},`,
-        body: `We want to thank you and congratulate you on successfully paying the last installment of your financing.\n\nThe bicycle is now completely yours! Thank you for trusting The Fast Sheep. We hope you continue to enjoy it to the fullest.`
+        body: `We want to thank you and congratulate you on successfully paying the last installment of your financing.\
+\
+The bicycle is now completely yours! Thank you for trusting The Fast Sheep. We hope you continue to enjoy it to the fullest.`
       },
       pt: {
         subject: `Parabéns! Você concluiu seu financiamento - The Fast Sheep`,
         hello: `Olá ${customer.first_name},`,
-        body: `Queremos agradecer e parabenizar você por pagar com sucesso a última parcela do seu financiamento.\n\nA bicicleta agora é totalmente sua! Obrigado por confiar na The Fast Sheep. Esperamos que continue a desfrutar dela ao máximo.`
+        body: `Queremos agradecer e parabenizar você por pagar com sucesso a última parcela do seu financiamento.\
+\
+A bicicleta agora é totalmente sua! Obrigado por confiar na The Fast Sheep. Esperamos que continue a desfrutar dela ao máximo.`
       }
     }[lang] || {
       subject: `¡Felicidades! Has completado tu financiación - The Fast Sheep`,
       hello: `Hola ${customer.first_name},`,
-      body: `Queremos agradecerte y felicitarte por haber abonado exitosamente la última cuota de tu financiación.\n\n¡La bicicleta ahora es completamente tuya! Gracias por confiar en The Fast Sheep. Esperamos que la sigas disfrutando al máximo.`
+      body: `Queremos agradecerte y felicitarte por haber abonado exitosamente la última cuota de tu financiación.\
+\
+¡La bicicleta ahora es completamente tuya! Gracias por confiar en The Fast Sheep. Esperamos que la sigas disfrutando al máximo.`
     };
 
     html = `
       <div style="font-family: sans-serif; padding: 20px; color: #333;">
         <h2>${t.subject}</h2>
         <p>${t.hello}</p>
-        <p>${t.body.replace(/\n/g, '<br/>')}</p>
+        <p>${t.body.replace(/\
+/g, '<br/>')}</p>
         <hr />
         <p style="font-size: 12px; color: #777;">El equipo de The Fast Sheep</p>
       </div>
@@ -1545,7 +1560,7 @@ const translations = {
     searchExistingRider: "Buscar Rider Existente por Email",
     customerCode: "Código de Usuario (Prefijo US-)",
     balance: "Balance Financiero", income: "Ingresos", expenses: "Egresos", netFlow: "Flujo Neto", transactions: "Transacciones",
-    maintHistory: "Historial", programService: "Programar Service", totalInvested: "Retorno Neto",
+    maintHistory: "Historial", programService: "Programar Service", totalInvested: "Total Invertido",
     currentOdometer: "Kilometraje Actual", noHistory: "No hay registros de mantenimiento para esta bicicleta.",
     mechanic: "Mecánico", location: "Ubicación", associatedRider: "Rider Asociado",
     serviceType: "Service Oficial", expenseType: "Reparación Extra",
@@ -1596,7 +1611,7 @@ const translations = {
     searchExistingRider: "Search Existing Rider by Email",
     customerCode: "User Code (Prefix US-)",
     balance: "Financial Balance", income: "Income", expenses: "Expenses", netFlow: "Net Flow", transactions: "Transactions",
-    maintHistory: "History", programService: "Schedule Service", totalInvested: "Net Return",
+    maintHistory: "Maintenance History", programService: "Schedule Service", totalInvested: "Total Invested",
     currentOdometer: "Current Odometer", noHistory: "No maintenance records for this bicycle.",
     mechanic: "Mechanic", location: "Location", associatedRider: "Associated Rider",
     serviceType: "Official Service", expenseType: "Extra Repair",
@@ -1739,8 +1754,12 @@ export default function App() {
     const isSelf = email.toLowerCase() === user?.email?.toLowerCase();
     const confirmMsg = isSelf 
       ? (language === 'es' 
-          ? `⚠️ ¡ATENCIÓN! Estás eliminando tu propia cuenta (${email}) de la lista de acceso. Si cierras la sesión o expira, podrías quedar fuera de la aplicación permanentemente.\n\n¿Estás seguro de que quieres continuar?` 
-          : `⚠️ WARNING! You are deleting your own email (${email}) from the access list. If you log out or your session expires, you may be permanently locked out.\n\nAre you sure you want to proceed?`)
+          ? `⚠️ ¡ATENCIÓN! Estás eliminando tu propia cuenta (${email}) de la lista de acceso. Si cierras la sesión o expira, podrías quedar fuera de la aplicación permanentemente.\
+\
+¿Estás seguro de que quieres continuar?` 
+          : `⚠️ WARNING! You are deleting your own email (${email}) from the access list. If you log out or your session expires, you may be permanently locked out.\
+\
+Are you sure you want to proceed?`)
       : (language === 'es'
           ? `¿Seguro que quieres revocar el acceso a ${email}?`
           : `Are you sure you want to revoke access for ${email}?`);
@@ -2017,8 +2036,8 @@ USING (true);`;
   const [userFormRole, setUserFormRole] = useState('');
   const [userFormNotes, setUserFormNotes] = useState('');
   const [userFormCode, setUserFormCode] = useState('');
-  const [userFormNationality, setUserFormNationality] = useState('');
-  const [userFormReferral, setUserFormReferral] = useState('');
+  const [userFormNationality, setUserFormNationality] = useState('Brasil');
+  const [userFormReferral, setUserFormReferral] = useState('Instagram');
   const [userFormRefType, setUserFormRefType] = useState('Instagram');
   const [userFormRefWhatsApp, setUserFormRefWhatsApp] = useState('');
   const [userFormRefUserQuery, setUserFormRefUserQuery] = useState('');
@@ -2972,6 +2991,11 @@ USING (true);`;
     // Dynamic seasonality from real rental data
     const monthCounts: Record<number, number> = {};
     rentals.forEach(r => {
+      if (!r.bike_id || !r.customer_id) return;
+      const bikeExists = products.some(p => p.id === r.bike_id);
+      const customerExists = customers.some(c => c.id === r.customer_id);
+      if (!bikeExists || !customerExists) return;
+
       const m = new Date(r.start_date).getMonth();
       monthCounts[m] = (monthCounts[m] || 0) + 1;
     });
@@ -2995,7 +3019,6 @@ USING (true);`;
   // ----------------------------------------------------------
   const [modalType,         setModalType]         = useState<string | null>(null);
   const [selectedProductId, setSelectedProductId] = useState<string | null>(null);
-  const [linkBikeSearchQuery, setLinkBikeSearchQuery] = useState('');
   const [selectedCondition, setSelectedCondition] = useState<'nuevo' | 'bueno' | 'regular' | 'para venta'>('bueno');
   const [activeStockMenuId, setActiveStockMenuId] = useState<string | null>(null);
 
@@ -3528,91 +3551,6 @@ USING (true);`;
   // ----------------------------------------------------------
   const selectedBikeHistory = useMemo(() => {
     if (!selectedProductId) return [];
-    const bike = products.find(p => p.id === selectedProductId);
-    if (!bike) return [];
-
-    const extraEvents: any[] = [];
-
-    // Purchase event
-    if (bike.purchase_date) {
-      extraEvents.push({
-        id: `purchase-${bike.id}`,
-        date: bike.purchase_date,
-        type: 'purchase' as const,
-        description: language === 'es' ? 'Fecha de Compra de la Bicicleta' : 'Bike Purchase Date',
-        cost: bike.price_paid || undefined
-      });
-    }
-
-    // Arrival event
-    if (bike.arrival_date) {
-      extraEvents.push({
-        id: `arrival-${bike.id}`,
-        date: bike.arrival_date,
-        type: 'arrival' as const,
-        description: language === 'es' ? 'Fecha de Arribo / Llegada a la Flota' : 'Arrival Date to Fleet',
-        cost: undefined
-      });
-    }
-
-    // Assembly event
-    const assemblyDate = bike.custom_field_values?.assembly_date as string;
-    if (assemblyDate) {
-      extraEvents.push({
-        id: `assembly-${bike.id}`,
-        date: assemblyDate,
-        type: 'assembly' as const,
-        description: language === 'es' ? 'Fecha de Armado / Ensamblaje' : 'Assembly Date',
-        cost: undefined
-      });
-    }
-
-    // Sale event
-    if (bike.status === 'Vendida' && bike.sold_date) {
-      extraEvents.push({
-        id: `sale-${bike.id}`,
-        date: bike.sold_date,
-        type: 'sale' as const,
-        description: language === 'es' ? 'Fecha de Venta de la Bicicleta' : 'Bike Sale Date',
-        cost: bike.price_sold || undefined
-      });
-    }
-
-    // Bitácora Notes event
-    if (bike.notes && bike.notes.trim()) {
-      extraEvents.push({
-        id: `note-${bike.id}`,
-        date: bike.date_added ? bike.date_added.split('T')[0] : (bike.purchase_date || new Date().toISOString().split('T')[0]),
-        type: 'note' as const,
-        description: language === 'es' ? `Bitácora: ${bike.notes}` : `Log/Notes: ${bike.notes}`,
-        cost: undefined
-      });
-    }
-
-    // Current Lock Association
-    const currentLock = products.find(p => p.category_id === catLockId && p.custom_field_values?.associated_bike_id === bike.id);
-    if (currentLock) {
-      extraEvents.push({
-        id: `lock-${currentLock.id}`,
-        date: new Date().toISOString().split('T')[0],
-        type: 'lock_link' as const,
-        description: language === 'es'
-          ? `Candado Vinculado Actualmente — Código: ${currentLock.serial_number} (${currentLock.name})`
-          : `Currently Linked Lock — Code: ${currentLock.serial_number} (${currentLock.name})`,
-        cost: undefined
-      });
-    }
-
-    // Current Fleet Status
-    extraEvents.push({
-      id: `status-${bike.id}`,
-      date: new Date().toISOString().split('T')[0],
-      type: 'status_change' as const,
-      description: language === 'es'
-        ? `Estado Actual de la Bicicleta: ${bike.status} ${bike.maintenance_status === 'Requiere Service' ? '(Requiere Service)' : ''}`
-        : `Current Bike Status: ${bike.status} ${bike.maintenance_status === 'Requiere Service' ? '(Needs Service)' : ''}`,
-      cost: undefined
-    });
 
     // 1. Fetch maintenance records (services)
     const bikeRecords = records
@@ -3688,10 +3626,10 @@ USING (true);`;
         return events;
       });
 
-    const combined = [...extraEvents, ...bikeRecords, ...bikeExpenses, ...bikeRentals];
+    const combined = [...bikeRecords, ...bikeExpenses, ...bikeRentals];
     combined.sort((a, b) => b.date.localeCompare(a.date));
     return combined;
-  }, [selectedProductId, products, records, expenses, rentals, customers, language, catLockId]);
+  }, [selectedProductId, records, expenses, rentals, customers, language]);
 
   // ----------------------------------------------------------
   // MODAL OPENERS (initialize form state cleanly)
@@ -3704,7 +3642,7 @@ USING (true);`;
       : (prefixes.find(p => p.prefix === (catId === catBikeId ? 'B-' : catId === catBattId ? 'BAT-' : catId === catLockId ? 'L-' : ''))?.id ?? prefixes.find(p => p.prefix === 'B-')?.id ?? '');
     setProdFormCategory(catId);
     setProdFormPrefixId(prefId);
-    const vatApplied = (prod?.custom_field_values?.vat_applied ?? prod?.custom_field_values?.bat_applied) === true;
+    const vatApplied = prod?.custom_field_values?.vat_applied === true;
     setProdFormAddVat(vatApplied);
     // When VAT was applied, the input shows the base cost; price_paid already includes the tax.
     setProdFormPricePaid(vatApplied ? ((prod?.custom_field_values?.cost_base as number) ?? prod?.price_paid ?? 1000) : (prod?.price_paid ?? 1000));
@@ -3861,11 +3799,6 @@ USING (true);`;
   }, [products, records, events]);
 
   const openSoldModal = useCallback((prod: Product) => {
-    if (prod.category_id === catLockId && prod.custom_field_values?.associated_bike_id) {
-      alert(language === 'es' ? 'Desvincule primero antes de vender' : 'Please unlink before selling');
-      return;
-    }
-
     const suggestedPrice = prod.price_sold ?? (prod.price_paid ? Math.round(prod.price_paid * 1.5) : 500);
     setSoldFormPrice(suggestedPrice);
     setSoldFormDate(new Date().toISOString().split('T')[0]);
@@ -3880,16 +3813,8 @@ USING (true);`;
     setSoldCustomerPhone('');
     setSoldCustomerSearch('');
     setSoldEmailLang('es');
-    const linkedLock = products.find(p => p.category_id === catLockId && p.custom_field_values?.associated_bike_id === prod.id);
-    if (linkedLock) {
-      const lockPrice = linkedLock.price_sold ?? (linkedLock.price_paid ? Math.round(linkedLock.price_paid * 1.5) : 50);
-      setSoldProducts([prod, linkedLock]);
-      setSoldProductPrices({ [prod.id]: suggestedPrice, [linkedLock.id]: lockPrice });
-      setSoldFormPrice(suggestedPrice + lockPrice);
-    } else {
-      setSoldProducts([prod]);
-      setSoldProductPrices({ [prod.id]: suggestedPrice });
-    }
+    setSoldProducts([prod]);
+    setSoldProductPrices({ [prod.id]: suggestedPrice });
     const dist = prod.custom_field_values?.location_distribution as Record<string, number> | undefined;
     const initialLoc = dist ? Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central' : (prod.custom_field_values?.location as string || 'Almacén Central');
     setSoldProductLocations({ [prod.id]: initialLoc });
@@ -3897,7 +3822,7 @@ USING (true);`;
     setSoldSubmitting(false);
     setSoldReceivedVia('efectivo');
     setSelectedProductId(prod.id); setModalType('sold');
-  }, [products, language, catLockId, catBikeId]);
+  }, []);
 
   const handlePayInstallment = useCallback(async (prod: Product, receivedVia?: 'efectivo' | 'transferencia') => {
     try {
@@ -3931,7 +3856,11 @@ USING (true);`;
 
       let finalReceivedVia = receivedVia;
       if (!finalReceivedVia) {
-        const isCash = await asyncConfirm(language === 'es' ? '¿El pago de la cuota fue en EFECTIVO?\n\n(Aceptar = Efectivo / Cancelar = Transferencia)' : 'Was the installment paid in CASH?\n\n(OK = Cash / Cancel = Bank Transfer)');
+        const isCash = await asyncConfirm(language === 'es' ? '¿El pago de la cuota fue en EFECTIVO?\
+\
+(Aceptar = Efectivo / Cancelar = Transferencia)' : 'Was the installment paid in CASH?\
+\
+(OK = Cash / Cancel = Bank Transfer)');
         finalReceivedVia = isCash ? 'efectivo' : 'transferencia';
       }
 
@@ -4075,7 +4004,6 @@ USING (true);`;
   const [wizGigAccountId, setWizGigAccountId] = useState<string | null>(null);
   const [wizBatteryIds,  setWizBatteryIds]  = useState<string[]>([]);
   const [wizLockId,      setWizLockId]      = useState('');
-  const [wizKeepAssociated, setWizKeepAssociated] = useState(false);
   const [wizFirstName,   setWizFirstName]   = useState('');
   const [wizLastName,    setWizLastName]    = useState('');
   const [wizCustomerCode, setWizCustomerCode] = useState('');
@@ -4107,6 +4035,7 @@ USING (true);`;
   const [wizKitProductIds, setWizKitProductIds] = useState<string[]>([]);
   const [kitSearchModalOpen, setKitSearchModalOpen] = useState(false);
   const [kitSearchQuery, setKitSearchQuery] = useState('');
+  const [linkBikeSearch, setLinkBikeSearch] = useState('');
   // Generic Stock addition/removal states
   const [addGenStockModalOpen, setAddGenStockModalOpen] = useState(false);
   const [removeGenStockModalOpen, setRemoveGenStockModalOpen] = useState(false);
@@ -4170,7 +4099,7 @@ USING (true);`;
   const [quickAddEmail, setQuickAddEmail] = useState('');
   const [quickAddNationality, setQuickAddNationality] = useState('Brasil');
   const [quickAddNotes, setQuickAddNotes] = useState('');
-  const [quickAddSource, setQuickAddSource] = useState<'wizard' | 'edit'>('wizard');
+  const [quickAddSource, setQuickAddSource] = useState<'wizard' | 'edit' | 'customers'>('wizard');
 
   // ----------------------------------------------------------
   // CONDITIONAL REFERRAL LOGIC
@@ -4317,42 +4246,7 @@ USING (true);`;
     }
   };
 
-  // Conditional Referral UI States (User Form Modal)
-  useEffect(() => {
-    const val = userFormReferral || '';
-    if (val === 'Instagram') {
-      setUserFormRefType('Instagram');
-    } else if (val === 'Web') {
-      setUserFormRefType('Web');
-    } else if (val === 'Sin referido') {
-      setUserFormRefType('Sin referido');
-    } else if (val.startsWith('WhatsApp Group:')) {
-      setUserFormRefType('WhatsApp Group');
-      setUserFormRefWhatsApp(val.slice('WhatsApp Group:'.length).trim());
-    } else if (val.startsWith('Usuario:')) {
-      setUserFormRefType('Usuario');
-      const userStr = val.slice('Usuario:'.length).trim();
-      setUserFormRefUserQuery(userStr);
-      const foundCust = customers.find(c => `${c.first_name} ${c.last_name} (${c.customer_code})`.toLowerCase() === userStr.toLowerCase() || `${c.first_name} ${c.last_name}`.toLowerCase() === userStr.toLowerCase());
-      if (foundCust) {
-        setUserFormRefUserSelected(foundCust);
-      }
-    } else if (val.startsWith('Otro:')) {
-      setUserFormRefType('Otro');
-      setUserFormRefOther(val.slice('Otro:'.length).trim());
-    } else if (val) {
-      setUserFormRefType('Otro');
-      setUserFormRefOther(val);
-    } else {
-      setUserFormRefType('');
-      setUserFormRefWhatsApp('');
-      setUserFormRefUserQuery('');
-      setUserFormRefUserSelected(null);
-      setUserFormRefOther('');
-    }
-  }, [userFormReferral, customers]);
-
-  const handleUserRefTypeChange = (type: string) => {
+  const handleUserFormRefTypeChange = (type: string) => {
     setUserFormRefType(type);
     if (type === 'Instagram') {
       setUserFormReferral('Instagram');
@@ -4371,17 +4265,17 @@ USING (true);`;
     }
   };
 
-  const handleUserRefWhatsAppChange = (val: string) => {
+  const handleUserFormRefWhatsAppChange = (val: string) => {
     setUserFormRefWhatsApp(val);
     setUserFormReferral(`WhatsApp Group: ${val}`);
   };
 
-  const handleUserRefOtherChange = (val: string) => {
+  const handleUserFormRefOtherChange = (val: string) => {
     setUserFormRefOther(val);
     setUserFormReferral(`Otro: ${val}`);
   };
 
-  const handleUserRefUserQueryChange = (val: string) => {
+  const handleUserFormRefUserQueryChange = (val: string) => {
     setUserFormRefUserQuery(val);
     setUserFormReferral(`Usuario: ${val}`);
     if (!val) {
@@ -4418,7 +4312,7 @@ USING (true);`;
         setWizRefUserQuery(displayName);
         setWizRefUserSelected(newRider);
         setWizReferral(`Usuario: ${displayName}`);
-      } else {
+      } else if (quickAddSource === 'edit') {
         setEditRefUserQuery(displayName);
         setEditRefUserSelected(newRider);
         setEditReferral(`Usuario: ${displayName}`);
@@ -4700,12 +4594,6 @@ USING (true);`;
       setWizDeposit(bike.suggested_deposit ?? 150); 
       setWizOdometer(bike.odometer ?? '');
     }
-    const linkedLock = products.find(p => p.category_id === catLockId && p.custom_field_values?.associated_bike_id === id);
-    if (linkedLock) {
-      setWizLockId(linkedLock.id);
-    } else {
-      setWizLockId('');
-    }
   };
 
   const handleWizBatteryChange = (id: string) => {
@@ -4808,9 +4696,9 @@ USING (true);`;
         condition_photos: conditionPhotoUrls,
         instagram_photos: instagramPhotoUrls,
         has_kit: wizHasKit,
-        kit_details: wizHasKit && wizKitProductIds.length > 0
-          ? wizKitProductIds.map(id => { const p = products.find(pr => pr.id === id); return p ? `${p.serial_number} (${p.name})` : ''; }).filter(Boolean).join(', ')
-          : wizKitDetails,
+        // Kit items are tracked as rental_items and listed on the card from there; kit_details is
+        // reserved for free-text notes only, to avoid duplicating the item list.
+        kit_details: wizKitDetails,
         deposit_refunded: null, damage_report: null, created_at: new Date().toISOString(),
         deposit_received_via: wizDepositPaymentMethod,
       };
@@ -4848,44 +4736,21 @@ USING (true);`;
         if (battProduct) updates.push(upsertProduct({ ...battProduct, status: 'Rentada' }));
       });
       const lockProduct = products.find(p => p.id === wizLockId);
-      if (lockProduct) {
-        updates.push(upsertProduct({
-          ...lockProduct,
-          status: 'Rentada',
-          custom_field_values: {
-            ...lockProduct.custom_field_values,
-            associated_bike_id: wizBikeId,
-            keep_associated: wizKeepAssociated
-          }
-        }));
-      }
-      // Update kit product statuses (handle generic products by splitting 1 unit off)
+      if (lockProduct) updates.push(upsertProduct({ ...lockProduct, status: 'Rentada' }));
+      // Update kit product statuses.
+      // - Consolidated/generic items (those carrying a location_distribution) are NOT split or
+      //   decremented: a single record always represents the full stock, and each rented unit is
+      //   tracked purely via its rental_item. The record stays 'Disponible' while units remain.
+      // - Single-unit items flip to 'Rentada' as usual.
       const resolvedKitIds: string[] = [];
       for (const kitId of wizKitProductIds) {
         const kitProduct = products.find(p => p.id === kitId);
         if (!kitProduct) continue;
         const dist = kitProduct.custom_field_values?.location_distribution as Record<string, number> | undefined;
         const totalQty = dist ? Object.values(dist).reduce((a, b) => a + b, 0) : 0;
-        if (dist && totalQty > 1) {
-          const splitId = crypto.randomUUID();
-          const mainLoc = Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central';
-          updates.push(upsertProduct({
-            ...kitProduct,
-            id: splitId,
-            status: 'Rentada',
-            custom_field_values: { ...kitProduct.custom_field_values, location: mainLoc, location_distribution: undefined },
-          }));
-          const updatedDist = { ...dist };
-          const locToDecrement = Object.keys(updatedDist).find(k => updatedDist[k] > 0) || mainLoc;
-          updatedDist[locToDecrement] = (updatedDist[locToDecrement] || 1) - 1;
-          Object.keys(updatedDist).forEach(k => { if (updatedDist[k] <= 0) delete updatedDist[k]; });
-          const newTotal = Object.values(updatedDist).reduce((a, b) => a + b, 0);
-          if (newTotal <= 0) {
-            updates.push(upsertProduct({ ...kitProduct, status: 'Rentada', custom_field_values: { ...kitProduct.custom_field_values, location_distribution: undefined } }));
-          } else {
-            updates.push(upsertProduct({ ...kitProduct, custom_field_values: { ...kitProduct.custom_field_values, location_distribution: updatedDist } }));
-          }
-          resolvedKitIds.push(splitId);
+        if (dist && totalQty >= 1) {
+          // Consolidated: reference it via rental_item only; do not mutate the product.
+          resolvedKitIds.push(kitId);
         } else {
           updates.push(upsertProduct({ ...kitProduct, status: 'Rentada' }));
           resolvedKitIds.push(kitId);
@@ -4978,7 +4843,6 @@ USING (true);`;
         console.error('Failed to create internal checklist:', err);
       }
 
-
       // Reset wizard
       setWizBikeId(''); setWizBatteryIds([]); setWizLockId(''); setWizGigAccountId(null);
       setWizFirstName(''); setWizLastName(''); setWizEmail('');
@@ -4990,17 +4854,13 @@ USING (true);`;
       setWizInstagramFiles([]); setWizInstagramPreviews([]);
       setWizIdDocFile(null); setWizIdDocPreview('');
       setWizContractMode(null); setWizPhysicalContractFiles([]); setWizPhysicalContractPreviews([]);
-      setWizUploadingEvidence(false);
       setWizSendDeliveryChecklist(true);
-      setWizInternalChecklist(emptyInternalChecklist());
-      setWizShowInternalChecklist(false);
+      setWizInternalChecklist(emptyInternalChecklist()); setWizShowInternalChecklist(false);
+      setWizUploadingEvidence(false);
       setWizardStep(1); triggerReload(); setCurrentTab('rental_wizard'); setShowRentalWizard(false);
       showToast('¡Alquiler registrado exitosamente!', 'success');
     } catch (err) {
       setWizUploadingEvidence(false);
-      setWizSendDeliveryChecklist(true);
-      setWizInternalChecklist(emptyInternalChecklist());
-      setWizShowInternalChecklist(false);
       showToast('Error al registrar el alquiler. Intenta de nuevo.', 'error');
     }
   };
@@ -5401,7 +5261,6 @@ USING (true);`;
       </div>
     );
   }
-
 
   // Render signing page if ?firmar= is present (no auth required)
   if (signRentalId) {
@@ -6466,8 +6325,12 @@ USING (true);`;
                                   {tx.category}
                                 </span>
                               </td>
-                              <td>
-                                {tx.description}
+                              <td
+                                onClick={() => setTxDetail(tx)}
+                                title={language === 'es' ? 'Ver detalle completo' : 'View full detail'}
+                                style={{ cursor: 'pointer' }}
+                              >
+                                {tx.description.length > 60 ? `${tx.description.slice(0, 60)}...` : tx.description}
                               </td>
                               <td>
                                 {tx.received_via ? (
@@ -6736,108 +6599,6 @@ USING (true);`;
               {wizardStep === 3 && (
                 <div>
                   <h3 style={{ marginBottom: '16px' }}>{t.step} 3 — {language === 'es' ? 'Asociar Candado' : 'Associate Lock'}</h3>
-
-                  {(() => {
-                    const linkedLock = products.find(p => p.category_id === catLockId && p.custom_field_values?.associated_bike_id === wizBikeId);
-                    return (
-                      <>
-                        {linkedLock && (
-                          <div style={{
-                            background: 'rgba(99, 102, 241, 0.1)',
-                            border: '1px solid rgba(99, 102, 241, 0.25)',
-                            borderRadius: '10px',
-                            padding: '14px 16px',
-                            marginBottom: '16px',
-                            display: 'flex',
-                            flexDirection: 'column',
-                            gap: '8px'
-                          }}>
-                            <div style={{
-                              display: 'flex',
-                              justifyContent: 'space-between',
-                              alignItems: 'center',
-                              width: '100%'
-                            }}>
-                              <div>
-                                <span style={{ fontSize: '11px', color: 'var(--text-bright)', fontWeight: 600, display: 'block', marginBottom: '2px', letterSpacing: '0.5px' }}>
-                                  🔗 {language === 'es' ? 'CANDADO PRE-VINCULADO' : 'PRE-LINKED LOCK'}
-                                </span>
-                                <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>{linkedLock.name}</strong>
-                                <span style={{ color: 'var(--text-muted)', fontSize: '13px', marginLeft: '8px' }}>({linkedLock.serial_number})</span>
-                              </div>
-                              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                                {wizLockId !== linkedLock.id ? (
-                                  <button 
-                                    className="btn-primary btn-xs" 
-                                    onClick={() => setWizLockId(linkedLock.id)}
-                                    style={{ background: 'var(--color-primary)', borderColor: 'var(--color-primary)' }}
-                                  >
-                                    {language === 'es' ? 'Seleccionar' : 'Select'}
-                                  </button>
-                                ) : (
-                                  <span style={{ color: 'var(--color-primary)', fontSize: '13px', fontWeight: 600, marginRight: '8px' }}>
-                                    ✓ {language === 'es' ? 'Seleccionado' : 'Selected'}
-                                  </span>
-                                )}
-                                <button 
-                                  className="btn-secondary btn-xs" 
-                                  style={{ color: '#ef4444' }} 
-                                  onClick={async () => {
-                                    if (window.confirm(language === 'es' ? '¿Estás seguro de que deseas desvincular este candado permanentemente de esta bicicleta?' : 'Are you sure you want to unlink this lock permanently from this bike?')) {
-                                      try {
-                                        const updatedLock = {
-                                          ...linkedLock,
-                                          custom_field_values: {
-                                            ...linkedLock.custom_field_values,
-                                            associated_bike_id: undefined
-                                          }
-                                        };
-                                        await upsertProduct(updatedLock);
-                                        triggerReload();
-                                        if (wizLockId === linkedLock.id) {
-                                          setWizLockId('');
-                                        }
-                                        showToast(language === 'es' ? 'Candado desvinculado.' : 'Lock unlinked.', 'success');
-                                      } catch (err) {
-                                        showToast(language === 'es' ? 'Error al desvincular.' : 'Error unlinking.', 'error');
-                                      }
-                                    }
-                                  }}
-                                >
-                                  {language === 'es' ? 'Desvincular' : 'Unlink'}
-                                </button>
-                              </div>
-                            </div>
-                            {wizLockId === linkedLock.id && (
-                              <div style={{
-                                display: 'flex',
-                                alignItems: 'center',
-                                gap: '8px',
-                                marginTop: '4px',
-                                borderTop: '1px solid rgba(255, 255, 255, 0.08)',
-                                paddingTop: '8px'
-                              }}>
-                                <input
-                                  type="checkbox"
-                                  id="wizKeepAssociatedPre"
-                                  checked={wizKeepAssociated}
-                                  onChange={e => setWizKeepAssociated(e.target.checked)}
-                                  style={{ width: '15px', height: '15px', cursor: 'pointer', margin: 0 }}
-                                />
-                                <label htmlFor="wizKeepAssociatedPre" style={{ margin: 0, fontSize: '12px', color: 'var(--text-bright)', cursor: 'pointer', userSelect: 'none' }}>
-                                  {language === 'es'
-                                    ? 'Mantener candado vinculado permanentemente (no desvincular al devolver)'
-                                    : 'Keep lock permanently associated (do not unlink on return)'
-                                  }
-                                </label>
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </>
-                    );
-                  })()}
-
                   <div className="table-container" style={{ marginTop: '12px' }}>
                     <table className="custom-table" style={{ cursor: 'pointer' }}>
                       <thead>
@@ -6888,36 +6649,7 @@ USING (true);`;
                                   style={{ accentColor: 'var(--color-primary)', transform: 'scale(1.15)', cursor: 'pointer' }}
                                 />
                               </td>
-                              <td style={{ verticalAlign: 'middle' }}>
-                                <strong>🔒 {lock.serial_number}</strong>
-                                {isSelected && (
-                                  <div style={{
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    gap: '6px',
-                                    marginTop: '6px',
-                                    background: 'rgba(255, 255, 255, 0.04)',
-                                    padding: '4px 8px',
-                                    borderRadius: '4px',
-                                    border: '1px solid rgba(255, 255, 255, 0.05)',
-                                    width: 'max-content'
-                                  }} onClick={e => e.stopPropagation()}>
-                                    <input
-                                      type="checkbox"
-                                      id={`keep-associated-${lock.id}`}
-                                      checked={wizKeepAssociated}
-                                      onChange={e => setWizKeepAssociated(e.target.checked)}
-                                      style={{ width: '13px', height: '13px', cursor: 'pointer', margin: 0 }}
-                                    />
-                                    <label htmlFor={`keep-associated-${lock.id}`} style={{ margin: 0, fontSize: '11px', color: 'var(--text-bright)', cursor: 'pointer', userSelect: 'none' }}>
-                                      {language === 'es'
-                                        ? 'Mantener candado vinculado permanentemente (no desvincular al devolver)'
-                                        : 'Keep lock permanently associated (do not unlink on return)'
-                                      }
-                                    </label>
-                                  </div>
-                                )}
-                              </td>
+                              <td style={{ verticalAlign: 'middle' }}><strong>🔒 {lock.serial_number}</strong></td>
                               <td style={{ verticalAlign: 'middle' }}>{lock.name}</td>
                               <td style={{ verticalAlign: 'middle' }}>
                                 <span className={`badge ${lock.maintenance_status === 'Requiere Service' ? 'status-lost' : 'status-active'}`} style={{ fontSize: '11px' }}>
@@ -7589,6 +7321,74 @@ USING (true);`;
                     )}
                   </div>
 
+                  {/* Section 3b: Delivery Checklist (customer) */}
+                  <div className="evidence-section">
+                    <div className="evidence-section-title">
+                      ✅ {language === 'es' ? 'Checklist de Entrega (Cliente)' : 'Delivery Checklist (Customer)'}
+                    </div>
+                    <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '12px' }}>
+                      {language === 'es'
+                        ? 'Se enviará al rider un correo con un enlace para revisar el estado de la e-bike, marcar su conformidad y firmar digitalmente. Al enviarlo recibirá una copia del documento aceptado.'
+                        : 'The rider will receive an email with a link to review the e-bike condition, confirm acceptance and sign digitally. On submission they receive a copy of the accepted document.'}
+                    </p>
+                    <label
+                      style={{
+                        display: 'flex', alignItems: 'flex-start', gap: '10px', cursor: wizEmail ? 'pointer' : 'not-allowed',
+                        padding: '12px', borderRadius: '10px', border: '1px solid var(--border-color)',
+                        background: wizSendDeliveryChecklist && wizEmail ? 'rgba(16,185,129,0.08)' : 'transparent',
+                        opacity: wizEmail ? 1 : 0.6,
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={wizSendDeliveryChecklist && !!wizEmail}
+                        disabled={!wizEmail}
+                        onChange={(e) => setWizSendDeliveryChecklist(e.target.checked)}
+                        style={{ marginTop: '2px', width: '18px', height: '18px', accentColor: 'var(--color-primary)' }}
+                      />
+                      <span style={{ fontSize: '13px' }}>
+                        <strong>{language === 'es' ? 'Enviar checklist de entrega al cliente por email' : 'Email the delivery checklist to the customer'}</strong>
+                        <br />
+                        <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                          {wizEmail
+                            ? (language === 'es' ? `Se enviará a ${wizEmail} al confirmar el alquiler.` : `Will be sent to ${wizEmail} when the rental is confirmed.`)
+                            : (language === 'es' ? '⚠️ Agrega el email del rider para habilitar el envío.' : '⚠️ Add the rider email to enable sending.')}
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+
+                  {/* Section 3c: Internal Technical Inspection Checklist */}
+                  <div className="evidence-section">
+                    <div className="evidence-section-title">
+                      🔧 {language === 'es' ? 'Checklist Técnica (Interno)' : 'Technical Checklist (Internal)'}
+                    </div>
+                    <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '12px' }}>
+                      {language === 'es'
+                        ? 'Inspección técnica previa a la entrega (uso interno). Podés completarla ahora o más tarde desde el expediente del rider.'
+                        : 'Pre-delivery technical inspection (internal use). You can complete it now or later from the rider profile.'}
+                    </p>
+                    {(() => {
+                      const done = INTERNAL_CHECKLIST_ITEM_KEYS.filter(k => wizInternalChecklist.items[k]).length;
+                      const total = INTERNAL_CHECKLIST_ITEM_KEYS.length;
+                      return (
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                          <span style={{
+                            fontSize: '12px', padding: '3px 10px', borderRadius: '6px',
+                            background: done > 0 ? 'rgba(16,185,129,0.12)' : 'rgba(255,255,255,0.05)',
+                            color: done > 0 ? 'var(--color-primary)' : 'var(--text-muted)',
+                            border: '1px solid rgba(255,255,255,0.08)'
+                          }}>
+                            {done}/{total} {language === 'es' ? 'marcados' : 'checked'}
+                          </span>
+                          <button type="button" className="btn-secondary" onClick={() => setWizShowInternalChecklist(true)}>
+                            📝 {language === 'es' ? 'Completar checklist' : 'Fill in checklist'}
+                          </button>
+                        </div>
+                      );
+                    })()}
+                  </div>
+
                   {/* Section 4: Instagram Photos */}
                   <div className="evidence-section">
                     <div className="evidence-section-title">
@@ -7925,10 +7725,8 @@ USING (true);`;
                               );
                             }
 
-                            return groupedList.map((group, index) => {
+                            return groupedList.map((group) => {
                               const prod = group[0];
-                              const isLastFew = index > 0 && index >= groupedList.length - 2;
-                              const hasRentals = group.some(p => (rentals || []).some(r => r && r.bike_id === p.id && r.status === 'Activo'));
                               const activeProd = group.find(p => p.status !== 'Vendida' && p.status !== 'Financiada' && p.status !== 'Robada' && p.status !== 'Perdida' && p.status !== 'Perdida/Garda') || prod;
                               const isConsolidated = group.some(p => p.custom_field_values?.location_distribution);
                               
@@ -7970,7 +7768,16 @@ USING (true);`;
                               const countDisp = group.filter(p => p.status === 'Disponible').length;
                               const countReqService = group.filter(p => p.status === 'Disponible' && p.maintenance_status === 'Requiere Service').length;
                               const countReviewed = group.filter(p => p.status === 'Disponible' && p.maintenance_status === 'Al día' && isWithinLast30Days(p.last_service_date)).length;
-                              const countRent = group.filter(p => p.status === 'Rentada').length;
+                              const groupProductIds = new Set(group.map(p => p.id));
+                              // For consolidated products, count rented units via active rental_items
+                              // (split products may not always reflect correct status after returns/re-rentals)
+                              const countRentFromItems = isConsolidated
+                                ? (rentalItems || []).filter(ri =>
+                                    groupProductIds.has(ri.product_id) &&
+                                    (rentals || []).some(r => r.id === ri.rental_id && r.status === 'Activo')
+                                  ).length
+                                : 0;
+                              const countRent = isConsolidated ? countRentFromItems : group.filter(p => p.status === 'Rentada').length;
                               const countShop = group.filter(p => p.status === 'Mantenimiento').length;
                               const countLost = group.filter(p => p.status === 'Robada' || p.status === 'Perdida' || p.status === 'Perdida/Garda').length;
                               const countSold = group.filter(p => p.status === 'Vendida' || p.status === 'Financiada').length;
@@ -8107,9 +7914,7 @@ USING (true);`;
                                         </span>
                                       );
                                     })() : (() => {
-                                      const displayRent = isConsolidated
-                                        ? (rentals || []).filter(r => group.some(p => p.id === r.bike_id) && r.status === 'Activo').length
-                                        : countRent;
+                                      const displayRent = countRent;
                                       const displayShop = isConsolidated ? countShop : countShop;
                                       const displayLost = isConsolidated ? countLost : countLost;
                                       const displaySold = isConsolidated ? countSold : countSold;
@@ -8216,386 +8021,8 @@ USING (true);`;
                                         >
                                           ➕ {language === 'es' ? 'Más' : 'More'}
                                         </button>
-
-                                        {activeStockMenuId === prod.id && (
-                                          <>
-                                            <div
-                                              style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 90, cursor: 'default' }}
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                setActiveStockMenuId(null);
-                                              }}
-                                            />
-                                            
-                                            <div 
-                                              style={{ 
-                                                position: 'absolute', 
-                                                ...(isLastFew ? { bottom: 'calc(100% + 4px)' } : { top: 'calc(100% + 4px)' }),
-                                                right: 0, 
-                                                background: 'rgba(23, 23, 37, 0.98)', 
-                                                backdropFilter: 'blur(12px)',
-                                                WebkitBackdropFilter: 'blur(12px)',
-                                                border: '1px solid rgba(255, 255, 255, 0.08)', 
-                                                borderRadius: '8px', 
-                                                padding: '6px', 
-                                                minWidth: '150px', 
-                                                zIndex: 100, 
-                                                boxShadow: '0 10px 25px rgba(0, 0, 0, 0.6)',
-                                                display: 'flex',
-                                                flexDirection: 'column',
-                                                gap: '4px'
-                                              }}
-                                            >
-                                              <button
-                                                className="dropdown-item"
-                                                style={{
-                                                  width: '100%',
-                                                  textAlign: 'left',
-                                                  background: 'transparent',
-                                                  border: 'none',
-                                                  borderRadius: '6px',
-                                                  padding: '8px 12px',
-                                                  fontSize: '12px',
-                                                  color: 'var(--text-muted)',
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease'
-                                                }}
-                                                onClick={() => {
-                                                  setActiveStockMenuId(null);
-                                                  openProductModal(prod);
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                  e.currentTarget.style.color = 'var(--text-bright)';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'var(--text-muted)';
-                                                }}
-                                              >
-                                                ✏️ {t.edit}
-                                              </button>
-
-                                              {prod.category_id === catLockId && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    if (prod.custom_field_values?.associated_bike_id) {
-                                                      setModalType('confirmUnlinkLock');
-                                                    } else {
-                                                      setModalType('linkLockToBike');
-                                                    }
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  {prod.custom_field_values?.associated_bike_id 
-                                                    ? (language === 'es' ? '🔗 Desvincular de Bike' : '🔗 Unlink from Bike')
-                                                    : (language === 'es' ? '🔗 Vincular a Bike' : '🔗 Link to Bike')
-                                                  }
-                                                </button>
-                                              )}
-
-                                              {prod.status !== 'Vendida' && prod.status !== 'Financiada' && (
-                                                <>
-                                                  <button
-                                                    className="dropdown-item"
-                                                    style={{ 
-                                                      width: '100%', 
-                                                      textAlign: 'left', 
-                                                      background: 'transparent', 
-                                                      border: 'none', 
-                                                      borderRadius: '6px', 
-                                                      padding: '8px 12px', 
-                                                      fontSize: '12px', 
-                                                      color: 'var(--text-muted)', 
-                                                      cursor: 'pointer',
-                                                      display: 'flex',
-                                                      alignItems: 'center',
-                                                      gap: '8px',
-                                                      transition: 'all 0.2s ease'
-                                                    }}
-                                                    onClick={() => {
-                                                      setActiveStockMenuId(null);
-                                                      setSelectedProductId(prod.id);
-                                                      setSelectedLocation((prod.custom_field_values?.location as string) || '');
-                                                      setSelectedLocationDate((prod.custom_field_values?.location_date as string) || new Date().toISOString().split('T')[0]);
-                                                      setModalType('changeLocation');
-                                                    }}
-                                                    onMouseEnter={(e) => {
-                                                      e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                      e.currentTarget.style.color = 'var(--text-bright)';
-                                                    }}
-                                                    onMouseLeave={(e) => {
-                                                      e.currentTarget.style.background = 'transparent';
-                                                      e.currentTarget.style.color = 'var(--text-muted)';
-                                                    }}
-                                                  >
-                                                    📍 {language === 'es' ? 'Ubicación' : 'Location'}
-                                                  </button>
-
-                                                  {(prod.category_id === catBikeId || prod.category_id === catBattId) && (
-                                                    <button 
-                                                      className="dropdown-item"
-                                                      style={{ 
-                                                        width: '100%', 
-                                                        textAlign: 'left', 
-                                                        background: 'transparent', 
-                                                        border: 'none', 
-                                                        borderRadius: '6px', 
-                                                        padding: '8px 12px', 
-                                                        fontSize: '12px', 
-                                                        color: 'var(--text-muted)', 
-                                                        cursor: 'pointer',
-                                                        display: 'flex',
-                                                        alignItems: 'center',
-                                                        gap: '8px',
-                                                        transition: 'all 0.2s ease'
-                                                      }}
-                                                      onClick={() => {
-                                                        setActiveStockMenuId(null);
-                                                        setSelectedProductId(prod.id);
-                                                        setSelectedCondition(prod.condition || 'bueno');
-                                                        setModalType('changeCondition');
-                                                      }}
-                                                      onMouseEnter={(e) => {
-                                                        e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                        e.currentTarget.style.color = 'var(--text-bright)';
-                                                      }}
-                                                      onMouseLeave={(e) => {
-                                                        e.currentTarget.style.background = 'transparent';
-                                                        e.currentTarget.style.color = 'var(--text-muted)';
-                                                      }}
-                                                    >
-                                                      ✨ {language === 'es' ? 'Condición' : 'Condition'}
-                                                    </button>
-                                                  )}
-                                                </>
-                                              )}
-
-                                              {(prod.category_id === catBikeId || prod.category_id === catBattId) && (prod.status || '') !== 'Vendida' && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    setModalType('bikeHistory');
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  🔧 Service
-                                                </button>
-                                              )}
-
-                                              {prod.category_id === catBikeId && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    setModalType('bikeHistory');
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  📊 {language === 'es' ? 'Ver Historial' : 'View History'}
-                                                </button>
-                                              )}
-
-                                              {prod.category_id === catBikeId && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    setModalType('bikeModifications');
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  🛠️ {language === 'es' ? 'Modificaciones' : 'Modifications'}
-                                                </button>
-                                              )}
-
-
-                                              <button 
-                                                className="dropdown-item"
-                                                style={{ 
-                                                  width: '100%', 
-                                                  textAlign: 'left', 
-                                                  background: 'transparent', 
-                                                  border: 'none', 
-                                                  borderRadius: '6px', 
-                                                  padding: '8px 12px', 
-                                                  fontSize: '12px', 
-                                                  color: 'var(--text-muted)', 
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease'
-                                                }}
-                                                onClick={() => {
-                                                  setActiveStockMenuId(null);
-                                                  setActiveNoteProduct(prod);
-                                                  setActiveNoteProductGroup(group);
-                                                  setProductNotesText(prod.notes || '');
-                                                  setModalType('productNotes');
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                  e.currentTarget.style.color = 'var(--text-bright)';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'var(--text-muted)';
-                                                }}
-                                              >
-                                                📝 {language === 'es' ? 'Notas' : 'Notes'}
-                                              </button>
-
-                                              <button 
-                                                className="dropdown-item-danger"
-                                                style={{ 
-                                                  width: '100%', 
-                                                  textAlign: 'left', 
-                                                  background: 'transparent', 
-                                                  border: 'none', 
-                                                  borderRadius: '6px', 
-                                                  padding: '8px 12px', 
-                                                  fontSize: '12px', 
-                                                  color: 'rgba(239, 68, 68, 0.85)', 
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease',
-                                                  borderTop: '1px solid rgba(255, 255, 255, 0.06)',
-                                                  marginTop: '4px',
-                                                  paddingTop: '8px'
-                                                }}
-                                                onClick={async () => {
-                                                  setActiveStockMenuId(null);
-                                                  const confirmMsg = totalCount > 1 
-                                                    ? (language === 'es' ? `⚠️ ¿Eliminar TODAS las ${totalCount} unidades de este lote?` : `⚠️ Delete ALL ${totalCount} units of this batch?`)
-                                                    : (language === 'es' ? '¿Eliminar este producto del inventario?' : 'Delete this product from inventory?');
-                                                  
-                                                  if (hasRentals) {
-                                                    if (!confirm(language === 'es' ? '⚠️ Este lote/producto tiene alquileres activos. ¿Eliminar de todos modos?' : '⚠️ This batch/product has active rentals. Delete anyway?')) return;
-                                                  } else {
-                                                    if (!confirm(confirmMsg)) return;
-                                                  }
-
-                                                  try {
-                                                    await Promise.all(group.map(p => deleteProduct(p.id)));
-                                                    showToast(language === 'es' ? 'Stock eliminado.' : 'Stock deleted.');
-                                                    triggerReload();
-                                                  } catch { showToast(language === 'es' ? 'Error al eliminar.' : 'Delete error.', 'error'); }
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(239, 68, 68, 0.12)';
-                                                  e.currentTarget.style.color = '#f87171';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'rgba(239, 68, 68, 0.85)';
-                                                }}
-                                              >
-                                                🗑️ {t.delete}
-                                              </button>
-                                            </div>
-                                          </>
-                                        )}
+                                        
+                                        
                                       </div>
                                     </div>
                                   </td>
@@ -8639,12 +8066,77 @@ USING (true);`;
                       <button className="btn-secondary" onClick={() => { setCatFormNameEs(''); setCatFormNameEn(''); setModalType('category'); }}>📁 {t.addCategory}</button>
                     </div>
                     <input className="form-control filter-input" placeholder={t.searchPlaceholder} value={searchStock} onChange={e => setSearchStock(e.target.value)} />
-                    <select className="form-control" style={{ width: 'auto' }} value={filterCategory} onChange={e => setFilterCategory(e.target.value)}>
-                      <option value="all">{language === 'es' ? 'Todas Categorías' : 'All Categories'}</option>
-                      {(categories || [])
-                        .filter(c => c && c.id)
-                        .map(c => <option key={c.id} value={c.id}>{language === 'es' ? (c.name_es || c.name_en || '') : (c.name_en || c.name_es || '')}</option>)}
-                    </select>
+                    <div className="filter-row-group" style={{ marginLeft: 'auto' }}>
+                      <select className="form-control" style={{ width: 'auto' }} value={filterCategory} onChange={e => setFilterCategory(e.target.value)}>
+                        <option value="all">{language === 'es' ? 'Todas Categorías' : 'All Categories'}</option>
+                        {(categories || [])
+                          .filter(c => c && c.id)
+                          .map(c => <option key={c.id} value={c.id}>{language === 'es' ? (c.name_es || c.name_en || '') : (c.name_en || c.name_es || '')}</option>)}
+                      </select>
+
+                      {/* Column Visibility Picker */}
+                      <div className="col-vis-wrapper">
+                        <button
+                          className={`col-vis-btn ${showColVisPicker ? 'active' : ''}`}
+                          onClick={() => setShowColVisPicker(v => !v)}
+                          title={language === 'es' ? 'Columnas visibles' : 'Visible columns'}
+                        >
+                          ⊞ {language === 'es' ? 'Columnas' : 'Columns'}
+                        </button>
+                        {showColVisPicker && (
+                          <>
+                            <div
+                              style={{ position: 'fixed', inset: 0, zIndex: 499 }}
+                              onClick={() => setShowColVisPicker(false)}
+                            />
+                            <div className="col-vis-dropdown">
+                              <div className="col-vis-dropdown-header">
+                                {language === 'es' ? 'Columnas visibles' : 'Visible columns'}
+                              </div>
+                              {/* Always-locked columns */}
+                              {[
+                                { key: '_code',  label: language === 'es' ? '🔒 Código' : '🔒 Code' },
+                                { key: '_brand', label: language === 'es' ? '🔒 Marca / Modelo' : '🔒 Brand / Model' },
+                                { key: '_actions', label: language === 'es' ? '🔒 Acciones' : '🔒 Actions' },
+                              ].map(col => (
+                                <div key={col.key} className="col-vis-item locked checked">
+                                  <div className="col-vis-check">✓</div>
+                                  <span>{col.label}</span>
+                                </div>
+                              ))}
+                              {/* Toggleable columns */}
+                              {[
+                                { key: 'location',      label: language === 'es' ? '📍 Ubicación'       : '📍 Location' },
+                                { key: 'price',         label: language === 'es' ? '💶 Precio Venta'      : '💶 Sale Price' },
+                                { key: 'cost',          label: language === 'es' ? '💰 Costo'             : '💰 Cost' },
+                                { key: 'condition',     label: language === 'es' ? '🔧 Condición'        : '🔧 Condition' },
+                                { key: 'status',        label: language === 'es' ? '📌 Estado'            : '📌 Status' },
+                                { key: 'frame_serial',  label: language === 'es' ? '🔢 Número de Cuadro' : '🔢 Frame Serial' },
+                                { key: 'motor',         label: language === 'es' ? '⚙️ Número de Motor'  : '⚙️ Motor Serial' },
+                                { key: 'odometer',      label: language === 'es' ? '📏 Kilometraje'       : '📏 Odometer' },
+                                { key: 'purchase_date', label: language === 'es' ? '🗓️ Fecha Compra'      : '🗓️ Purchase Date' },
+                                { key: 'arrival_date',  label: language === 'es' ? '🛬 Fecha Arribo'      : '🛬 Arrival Date' },
+                                { key: 'assembly_date', label: language === 'es' ? '🔩 Fecha Armado'      : '🔩 Assembly Date' },
+                                { key: 'modifications', label: language === 'es' ? '🛠️ Modificaciones'   : '🛠️ Modifications' },
+                                { key: 'roi',           label: '📊 ROI' },
+                              ].map(col => {
+                                const isChecked = !!stockVisibleCols[col.key];
+                                return (
+                                  <div
+                                    key={col.key}
+                                    className={`col-vis-item ${isChecked ? 'checked' : ''}`}
+                                    onClick={() => setStockVisibleCols(prev => ({ ...prev, [col.key]: !isChecked }))}
+                                  >
+                                    <div className="col-vis-check">{isChecked ? '✓' : ''}</div>
+                                    <span>{col.label}</span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    </div>
                   </div>
 
                   {/* Stock table */}
@@ -8706,10 +8198,8 @@ USING (true);`;
                               );
                             }
 
-                            return groupedList.map((group, index) => {
+                            return groupedList.map((group) => {
                               const prod = group[0];
-                              const isLastFew = index > 0 && index >= groupedList.length - 2;
-                              const hasRentals = group.some(p => (rentals || []).some(r => r && r.bike_id === p.id && r.status === 'Activo'));
                               const activeProd = group.find(p => p.status !== 'Vendida' && p.status !== 'Financiada' && p.status !== 'Robada' && p.status !== 'Perdida' && p.status !== 'Perdida/Garda') || prod;
                               const isConsolidated = group.some(p => p.custom_field_values?.location_distribution);
                               
@@ -8742,7 +8232,12 @@ USING (true);`;
                               const countDisp = isConsolidated ? totalCount : group.filter(p => p.status === 'Disponible').length;
                               const countReqService = isConsolidated ? 0 : group.filter(p => p.status === 'Disponible' && p.maintenance_status === 'Requiere Service').length;
                               const countReviewed = isConsolidated ? 0 : group.filter(p => p.status === 'Disponible' && p.maintenance_status === 'Al día' && isWithinLast30Days(p.last_service_date)).length;
-                              const countRent = isConsolidated ? 0 : group.filter(p => p.status === 'Rentada').length;
+                              const groupProductIds = new Set(group.map(p => p.id));
+                              const countRentFromItems = (rentalItems || []).filter(ri =>
+                                groupProductIds.has(ri.product_id) &&
+                                (rentals || []).some(r => r.id === ri.rental_id && r.status === 'Activo')
+                              ).length;
+                              const countRent = isConsolidated ? countRentFromItems : group.filter(p => p.status === 'Rentada').length;
                               const countShop = isConsolidated ? 0 : group.filter(p => p.status === 'Mantenimiento').length;
 
                               return (
@@ -8877,9 +8372,7 @@ USING (true);`;
                                       );
                                     })() : (() => {
                                       // "Stock" here = active stock only (sold/lost/stolen are already excluded from this tab).
-                                      const displayRent = isConsolidated
-                                        ? (rentals || []).filter(r => group.some(p => p.id === r.bike_id) && r.status === 'Activo').length
-                                        : countRent;
+                                      const displayRent = countRent;
                                       const displayShop = isConsolidated ? group.filter(p => p.status === 'Mantenimiento').length : countShop;
                                       const displayDisp = isConsolidated
                                         ? Math.max(0, totalCount - displayRent - displayShop)
@@ -8979,388 +8472,8 @@ USING (true);`;
                                         >
                                           ➕ {language === 'es' ? 'Más' : 'More'}
                                         </button>
-
-                                        {activeStockMenuId === prod.id && (
-                                          <>
-                                            {/* Click-away overlay */}
-                                            <div 
-                                              style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 90, cursor: 'default' }}
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                setActiveStockMenuId(null);
-                                              }}
-                                            />
-                                            
-                                            {/* Dropdown Menu */}
-                                            <div 
-                                              style={{ 
-                                                position: 'absolute', 
-                                                ...(isLastFew ? { bottom: 'calc(100% + 4px)' } : { top: 'calc(100% + 4px)' }),
-                                                right: 0, 
-                                                background: 'rgba(23, 23, 37, 0.98)', 
-                                                backdropFilter: 'blur(12px)',
-                                                WebkitBackdropFilter: 'blur(12px)',
-                                                border: '1px solid rgba(255, 255, 255, 0.08)', 
-                                                borderRadius: '8px', 
-                                                padding: '6px', 
-                                                minWidth: '150px', 
-                                                zIndex: 100, 
-                                                boxShadow: '0 10px 25px rgba(0, 0, 0, 0.6)',
-                                                display: 'flex',
-                                                flexDirection: 'column',
-                                                gap: '4px'
-                                              }}
-                                            >
-                                              <button
-                                                className="dropdown-item"
-                                                style={{
-                                                  width: '100%',
-                                                  textAlign: 'left',
-                                                  background: 'transparent',
-                                                  border: 'none',
-                                                  borderRadius: '6px',
-                                                  padding: '8px 12px',
-                                                  fontSize: '12px',
-                                                  color: 'var(--text-muted)',
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease'
-                                                }}
-                                                onClick={() => {
-                                                  setActiveStockMenuId(null);
-                                                  openProductModal(prod);
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                  e.currentTarget.style.color = 'var(--text-bright)';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'var(--text-muted)';
-                                                }}
-                                              >
-                                                ✏️ {t.edit}
-                                              </button>
-
-                                              {prod.category_id === catLockId && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    if (prod.custom_field_values?.associated_bike_id) {
-                                                      setModalType('confirmUnlinkLock');
-                                                    } else {
-                                                      setModalType('linkLockToBike');
-                                                    }
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  {prod.custom_field_values?.associated_bike_id 
-                                                    ? (language === 'es' ? '🔗 Desvincular de Bike' : '🔗 Unlink from Bike')
-                                                    : (language === 'es' ? '🔗 Vincular a Bike' : '🔗 Link to Bike')
-                                                  }
-                                                </button>
-                                              )}
-
-                                              {prod.status !== 'Vendida' && prod.status !== 'Financiada' && (
-                                                <>
-                                                  <button
-                                                    className="dropdown-item"
-                                                    style={{ 
-                                                      width: '100%', 
-                                                      textAlign: 'left', 
-                                                      background: 'transparent', 
-                                                      border: 'none', 
-                                                      borderRadius: '6px', 
-                                                      padding: '8px 12px', 
-                                                      fontSize: '12px', 
-                                                      color: 'var(--text-muted)', 
-                                                      cursor: 'pointer',
-                                                      display: 'flex',
-                                                      alignItems: 'center',
-                                                      gap: '8px',
-                                                      transition: 'all 0.2s ease'
-                                                    }}
-                                                    onClick={() => {
-                                                      setActiveStockMenuId(null);
-                                                      setSelectedProductId(prod.id);
-                                                      setSelectedLocation((prod.custom_field_values?.location as string) || '');
-                                                      setSelectedLocationDate((prod.custom_field_values?.location_date as string) || new Date().toISOString().split('T')[0]);
-                                                      setModalType('changeLocation');
-                                                    }}
-                                                    onMouseEnter={(e) => {
-                                                      e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                      e.currentTarget.style.color = 'var(--text-bright)';
-                                                    }}
-                                                    onMouseLeave={(e) => {
-                                                      e.currentTarget.style.background = 'transparent';
-                                                      e.currentTarget.style.color = 'var(--text-muted)';
-                                                    }}
-                                                  >
-                                                    📍 {language === 'es' ? 'Ubicación' : 'Location'}
-                                                  </button>
-
-                                                  {(prod.category_id === catBikeId || prod.category_id === catBattId) && (
-                                                    <button 
-                                                      className="dropdown-item"
-                                                      style={{ 
-                                                        width: '100%', 
-                                                        textAlign: 'left', 
-                                                        background: 'transparent', 
-                                                        border: 'none', 
-                                                        borderRadius: '6px', 
-                                                        padding: '8px 12px', 
-                                                        fontSize: '12px', 
-                                                        color: 'var(--text-muted)', 
-                                                        cursor: 'pointer',
-                                                        display: 'flex',
-                                                        alignItems: 'center',
-                                                        gap: '8px',
-                                                        transition: 'all 0.2s ease'
-                                                      }}
-                                                      onClick={() => {
-                                                        setActiveStockMenuId(null);
-                                                        setSelectedProductId(prod.id);
-                                                        setSelectedCondition(prod.condition || 'bueno');
-                                                        setModalType('changeCondition');
-                                                      }}
-                                                      onMouseEnter={(e) => {
-                                                        e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                        e.currentTarget.style.color = 'var(--text-bright)';
-                                                      }}
-                                                      onMouseLeave={(e) => {
-                                                        e.currentTarget.style.background = 'transparent';
-                                                        e.currentTarget.style.color = 'var(--text-muted)';
-                                                      }}
-                                                    >
-                                                      ✨ {language === 'es' ? 'Condición' : 'Condition'}
-                                                    </button>
-                                                  )}
-                                                </>
-                                              )}
-
-                                              {(prod.category_id === catBikeId || prod.category_id === catBattId) && (prod.status || '') !== 'Vendida' && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    setModalType('bikeHistory');
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  🔧 Service
-                                                </button>
-                                              )}
-
-                                              {prod.category_id === catBikeId && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    setModalType('bikeHistory');
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  📊 {language === 'es' ? 'Ver Historial' : 'View History'}
-                                                </button>
-                                              )}
-
-                                              {prod.category_id === catBikeId && (
-                                                <button 
-                                                  className="dropdown-item"
-                                                  style={{ 
-                                                    width: '100%', 
-                                                    textAlign: 'left', 
-                                                    background: 'transparent', 
-                                                    border: 'none', 
-                                                    borderRadius: '6px', 
-                                                    padding: '8px 12px', 
-                                                    fontSize: '12px', 
-                                                    color: 'var(--text-muted)', 
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    gap: '8px',
-                                                    transition: 'all 0.2s ease'
-                                                  }}
-                                                  onClick={() => {
-                                                    setActiveStockMenuId(null);
-                                                    setSelectedProductId(prod.id);
-                                                    setModalType('bikeModifications');
-                                                  }}
-                                                  onMouseEnter={(e) => {
-                                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                    e.currentTarget.style.color = 'var(--text-bright)';
-                                                  }}
-                                                  onMouseLeave={(e) => {
-                                                    e.currentTarget.style.background = 'transparent';
-                                                    e.currentTarget.style.color = 'var(--text-muted)';
-                                                  }}
-                                                >
-                                                  🛠️ {language === 'es' ? 'Modificaciones' : 'Modifications'}
-                                                </button>
-                                              )}
-
-
-                                              <button 
-                                                className="dropdown-item"
-                                                style={{ 
-                                                  width: '100%', 
-                                                  textAlign: 'left', 
-                                                  background: 'transparent', 
-                                                  border: 'none', 
-                                                  borderRadius: '6px', 
-                                                  padding: '8px 12px', 
-                                                  fontSize: '12px', 
-                                                  color: 'var(--text-muted)', 
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease'
-                                                }}
-                                                onClick={() => {
-                                                  setActiveStockMenuId(null);
-                                                  setActiveNoteProduct(prod);
-                                                  setActiveNoteProductGroup(group);
-                                                  setProductNotesText(prod.notes || '');
-                                                  setModalType('productNotes');
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
-                                                  e.currentTarget.style.color = 'var(--text-bright)';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'var(--text-muted)';
-                                                }}
-                                              >
-                                                📝 {language === 'es' ? 'Notas' : 'Notes'}
-                                              </button>
-
-                                              <button 
-                                                className="dropdown-item-danger"
-                                                style={{ 
-                                                  width: '100%', 
-                                                  textAlign: 'left', 
-                                                  background: 'transparent', 
-                                                  border: 'none', 
-                                                  borderRadius: '6px', 
-                                                  padding: '8px 12px', 
-                                                  fontSize: '12px', 
-                                                  color: 'rgba(239, 68, 68, 0.85)', 
-                                                  cursor: 'pointer',
-                                                  display: 'flex',
-                                                  alignItems: 'center',
-                                                  gap: '8px',
-                                                  transition: 'all 0.2s ease',
-                                                  borderTop: '1px solid rgba(255, 255, 255, 0.06)',
-                                                  marginTop: '4px',
-                                                  paddingTop: '8px'
-                                                }}
-                                                onClick={async () => {
-                                                  setActiveStockMenuId(null);
-                                                  const confirmMsg = totalCount > 1 
-                                                    ? (language === 'es' ? `⚠️ ¿Eliminar TODAS las ${totalCount} unidades de este lote?` : `⚠️ Delete ALL ${totalCount} units of this batch?`)
-                                                    : (language === 'es' ? '¿Eliminar este producto del inventario?' : 'Delete this product from inventory?');
-                                                  
-                                                  if (hasRentals) {
-                                                    if (!confirm(language === 'es' ? '⚠️ Este lote/producto tiene alquileres activos. ¿Eliminar de todos modos?' : '⚠️ This batch/product has active rentals. Delete anyway?')) return;
-                                                  } else {
-                                                    if (!confirm(confirmMsg)) return;
-                                                  }
-
-                                                  try {
-                                                    await Promise.all(group.map(p => deleteProduct(p.id)));
-                                                    showToast(language === 'es' ? 'Stock eliminado.' : 'Stock deleted.');
-                                                    triggerReload();
-                                                  } catch { showToast(language === 'es' ? 'Error al eliminar.' : 'Delete error.', 'error'); }
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                  e.currentTarget.style.background = 'rgba(239, 68, 68, 0.12)';
-                                                  e.currentTarget.style.color = '#f87171';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                  e.currentTarget.style.background = 'transparent';
-                                                  e.currentTarget.style.color = 'rgba(239, 68, 68, 0.85)';
-                                                }}
-                                              >
-                                                🗑️ {t.delete}
-                                              </button>
-                                            </div>
-                                          </>
-                                        )}
+                                        
+                                        
                                       </div>
                                     </div>
                                   </td>
@@ -10200,7 +9313,7 @@ USING (true);`;
                                     <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
                                       {activeRental && (
                                         <>
-                                          <button className="btn-secondary btn-xs" onClick={() => setActiveCustomerId(activeRental.customer_id)}>
+                                          <button className="btn-secondary btn-xs" onClick={() => { setActiveCustomerId(activeRental.customer_id); setProfileRentalId(null); }}>
                                             📋 {language === 'es' ? 'Ver Expediente' : 'View Profile'}
                                           </button>
                                           <button className="btn-danger btn-xs" onClick={() => openReturnModal(activeRental)}>
@@ -10312,6 +9425,22 @@ USING (true);`;
                       <input className="form-control filter-input" placeholder={t.searchPlaceholder} value={searchRider} onChange={e => setSearchRider(e.target.value)} style={{ margin: 0 }} />
                       <span style={{ fontSize: '13px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{customers.length} {language === 'es' ? 'riders registrados' : 'riders registered'}</span>
                     </div>
+                    <button
+                      className="btn-primary"
+                      onClick={() => {
+                        setQuickAddFirstName('');
+                        setQuickAddLastName('');
+                        setQuickAddPhone('');
+                        setQuickAddEmail('');
+                        setQuickAddNationality('Brasil');
+                        setQuickAddNotes('');
+                        setQuickAddSource('customers');
+                        setQuickAddRiderModalOpen(true);
+                      }}
+                      style={{ height: '38px', borderRadius: '8px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                    >
+                      👤 {language === 'es' ? 'Crear Usuario' : 'Create User'}
+                    </button>
                   </div>
                   <div className="glass-card">
                     <div className="table-container">
@@ -10440,7 +9569,7 @@ USING (true);`;
             return (
               <div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-                  <button className="btn-secondary btn-xs" onClick={() => setActiveCustomerId(null)}>
+                  <button className="btn-secondary btn-xs" onClick={() => { setActiveCustomerId(null); setProfileRentalId(null); }}>
                     ← {language === 'es' ? 'Volver a Clientes' : 'Back to Customers'}
                   </button>
                   {activeRentals.length > 0 && (() => {
@@ -11228,7 +10357,6 @@ USING (true);`;
                             </div>
                           </div>
 
-
                           {/* Delivery checklist (E-bike) */}
                           {(() => {
                             const cl = latestRental
@@ -11689,7 +10817,11 @@ USING (true);`;
                                         <span style={{ color: 'var(--text-light)', fontWeight: '500' }}>{ev.text}</span>
                                         {ev.type === 'maintenance' && ev.desc && (
                                           <button 
-                                            onClick={() => window.alert(language === 'es' ? `Detalle del arreglo:\n\n${ev.desc}` : `Repair details:\n\n${ev.desc}`)}
+                                            onClick={() => window.alert(language === 'es' ? `Detalle del arreglo:\
+\
+${ev.desc}` : `Repair details:\
+\
+${ev.desc}`)}
                                             style={{
                                               background: 'none', border: 'none', cursor: 'pointer',
                                               color: 'var(--color-accent)', fontSize: '11px', textDecoration: 'underline', padding: 0, marginLeft: '4px'
@@ -11853,7 +10985,8 @@ USING (true);`;
                                 
                                 const nextDate = upcomingEvent ? upcomingEvent.event_date : lead.follow_up_date;
                                 const nextAction = upcomingEvent 
-                                  ? (upcomingEvent.description ? upcomingEvent.description.split('\n')[0] : 'Seguimiento')
+                                  ? (upcomingEvent.description ? upcomingEvent.description.split('\
+')[0] : 'Seguimiento')
                                   : lead.follow_up_action;
 
                                 return nextDate ? (
@@ -12826,10 +11959,10 @@ USING (true);`;
                    return (
                      <div key={status} className="glass-card" style={{ borderTop: `4px solid ${border}` }}>
                        <h3 style={{ marginBottom: '16px', color }}>{label}</h3>
-                       <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', maxHeight: '450px', overflowY: 'auto', paddingRight: '6px' }}>
+                       <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                          {filteredBikes.length === 0
                            ? <p style={{ fontSize: '13px', color: 'var(--text-muted)' }}>{language === 'es' ? 'No hay vehículos o baterías en esta categoría' : 'No vehicles or batteries in this category'}</p>
-                           : filteredBikes.map(bike => (
+                           : filteredBikes.slice(0, 5).map(bike => (
                              <div key={bike.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(0,0,0,0.1)', padding: '10px 14px', borderRadius: '8px' }}>
                                <div>
                                  <strong>{bike.serial_number}</strong> — {bike.name}
@@ -14079,38 +13212,32 @@ USING (true);`;
                 setUserFormPhone(cust.phone);
                 setUserFormRole(cust.last_name || '');
                 setUserFormNotes(cust.notes || '');
-                setUserFormCode(cust.customer_code ? cust.customer_code.replace(/^US-?/i, '') : '');
-                setUserFormNationality(cust.nationality || '');
                 
-                const ref = cust.referral_source || '';
-                setUserFormReferral(ref);
-                if (ref === 'Instagram') {
-                  setUserFormRefType('Instagram');
-                } else if (ref === 'Web') {
-                  setUserFormRefType('Web');
-                } else if (ref === 'Sin referido') {
-                  setUserFormRefType('Sin referido');
-                } else if (ref.startsWith('WhatsApp Group:')) {
+                const codeSuffix = cust.customer_code ? cust.customer_code.replace(/^US-?/i, '') : '';
+                setUserFormCode(codeSuffix);
+                setUserFormNationality(cust.nationality || 'Brasil');
+                
+                const refRaw = cust.referral_source || '';
+                setUserFormReferral(refRaw);
+                if (refRaw.startsWith('WhatsApp Group: ')) {
                   setUserFormRefType('WhatsApp Group');
-                  setUserFormRefWhatsApp(ref.replace('WhatsApp Group:', '').trim());
-                } else if (ref.startsWith('Usuario:')) {
+                  setUserFormRefWhatsApp(refRaw.replace('WhatsApp Group: ', ''));
+                } else if (refRaw.startsWith('Usuario: ')) {
                   setUserFormRefType('Usuario');
-                  const userPart = ref.replace('Usuario:', '').trim();
-                  setUserFormRefUserQuery(userPart);
-                  const matchedUser = customers.find(c => `${c.first_name} ${c.last_name} (${c.customer_code})`.toLowerCase() === userPart.toLowerCase());
-                  if (matchedUser) {
-                    setUserFormRefUserSelected(matchedUser);
-                  } else {
-                    setUserFormRefUserSelected(null);
-                  }
-                } else if (ref.startsWith('Otro:')) {
+                  const uQuery = refRaw.replace('Usuario: ', '');
+                  setUserFormRefUserQuery(uQuery);
+                  const matchedCust = customers.find(c => `${c.first_name} ${c.last_name} (${c.customer_code})` === uQuery);
+                  setUserFormRefUserSelected(matchedCust || null);
+                } else if (refRaw.startsWith('Otro: ')) {
                   setUserFormRefType('Otro');
-                  setUserFormRefOther(ref.replace('Otro:', '').trim());
-                } else if (ref) {
+                  setUserFormRefOther(refRaw.replace('Otro: ', ''));
+                } else if (refRaw === 'Instagram' || refRaw === 'Web' || refRaw === 'Sin referido') {
+                  setUserFormRefType(refRaw);
+                } else if (refRaw) {
                   setUserFormRefType('Otro');
-                  setUserFormRefOther(ref);
+                  setUserFormRefOther(refRaw);
                 } else {
-                  setUserFormRefType('Instagram');
+                  setUserFormRefType('Sin referido');
                 }
               } else {
                 setEditingUserId(null);
@@ -14121,12 +13248,12 @@ USING (true);`;
                 setUserFormNotes('');
                 setUserFormCode(String(customers.length + 1).padStart(3, '0'));
                 setUserFormNationality('Brasil');
+                setUserFormReferral('Instagram');
                 setUserFormRefType('Instagram');
                 setUserFormRefWhatsApp('');
-                setUserFormRefOther('');
                 setUserFormRefUserQuery('');
                 setUserFormRefUserSelected(null);
-                setUserFormReferral('Instagram');
+                setUserFormRefOther('');
               }
               setUserModalOpen(true);
             };
@@ -14371,6 +13498,31 @@ USING (true);`;
                         <button className="btn-secondary btn-xs" onClick={() => setUserModalOpen(false)}>✕</button>
                       </div>
                       <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                        <div className="form-group">
+                          <label className="form-label">{language === 'es' ? 'Código de Usuario' : 'User Code'} *</label>
+                          <div style={{ display: 'flex' }}>
+                            <span style={{ 
+                              background: 'rgba(255,255,255,0.06)', 
+                              border: '1px solid var(--border-color)', 
+                              borderRight: 'none', 
+                              padding: '0 12px', 
+                              display: 'flex', 
+                              alignItems: 'center', 
+                              borderTopLeftRadius: '8px', 
+                              borderBottomLeftRadius: '8px', 
+                              fontSize: '13px', 
+                              color: 'var(--text-muted)',
+                              userSelect: 'none'
+                            }}>US-</span>
+                            <input 
+                              className="form-control" 
+                              placeholder="1001" 
+                              value={userFormCode} 
+                              onChange={e => setUserFormCode(e.target.value.replace(/^US-?/i, ''))} 
+                              style={{ borderTopLeftRadius: 0, borderBottomLeftRadius: 0 }}
+                            />
+                          </div>
+                        </div>
                         <div className="form-grid">
                           <div className="form-group">
                             <label className="form-label">{language === 'es' ? 'Nombre' : 'First Name'} *</label>
@@ -14379,60 +13531,6 @@ USING (true);`;
                           <div className="form-group">
                             <label className="form-label">{language === 'es' ? 'Apellido' : 'Last Name'}</label>
                             <input className="form-control" value={userFormRole} onChange={e => setUserFormRole(e.target.value)} placeholder="García" />
-                          </div>
-                        </div>
-                        <div className="form-grid">
-                          <div className="form-group">
-                            <label className="form-label">{language === 'es' ? 'Código de Usuario' : 'User Code'}</label>
-                            <div style={{ display: 'flex' }}>
-                              <span style={{ 
-                                background: 'rgba(255,255,255,0.06)', 
-                                border: '1px solid var(--border-color)', 
-                                borderRight: 'none', 
-                                padding: '0 12px', 
-                                display: 'flex', 
-                                alignItems: 'center', 
-                                borderTopLeftRadius: '8px', 
-                                borderBottomLeftRadius: '8px', 
-                                fontSize: '13px', 
-                                color: 'var(--text-muted)',
-                                userSelect: 'none'
-                              }}>US-</span>
-                              <input 
-                                type="text" 
-                                className="form-control" 
-                                value={userFormCode} 
-                                onChange={e => setUserFormCode(e.target.value.replace(/^US-?/i, ''))} 
-                                style={{ height: '38px', fontSize: '13px', borderTopLeftRadius: 0, borderBottomLeftRadius: 0 }}
-                              />
-                            </div>
-                          </div>
-                          <div className="form-group">
-                            <label className="form-label">{t.nationality}</label>
-                            <select
-                              className="form-control"
-                              value={userFormNationality}
-                              onChange={e => setUserFormNationality(e.target.value)}
-                              style={{ width: '100%', height: '38px', fontSize: '13px' }}
-                            >
-                              {userFormNationality && !NATIONALITIES.some(n => n.value === userFormNationality) && (
-                                <option value={userFormNationality}>{userFormNationality}</option>
-                              )}
-                              <optgroup label={language === 'es' ? 'Nacionalidades Populares' : 'Popular Nationalities'}>
-                                {POPULAR_NATIONALITIES.map(n => (
-                                  <option key={`pop-user-${n.value}`} value={n.value}>
-                                    {language === 'es' ? n.labelEs : n.labelEn}
-                                  </option>
-                                ))}
-                              </optgroup>
-                              <optgroup label={language === 'es' ? 'Todas las Nacionalidades' : 'All Nationalities'}>
-                                {sortedNationalities.map(n => (
-                                  <option key={`all-user-${n.value}`} value={n.value}>
-                                    {language === 'es' ? n.labelEs : n.labelEn}
-                                  </option>
-                                ))}
-                              </optgroup>
-                            </select>
                           </div>
                         </div>
                         <div className="form-group">
@@ -14444,12 +13542,41 @@ USING (true);`;
                           <input className="form-control" value={userFormPhone} onChange={e => setUserFormPhone(e.target.value)} placeholder="+353 87..." />
                         </div>
                         <div className="form-group">
-                          <label className="form-label">{t.referralSource}</label>
+                          <label className="form-label">{language === 'es' ? 'Nacionalidad' : 'Nationality'}</label>
+                          <select
+                            className="form-control"
+                            value={userFormNationality}
+                            onChange={e => setUserFormNationality(e.target.value)}
+                            style={{ width: '100%', height: '42px' }}
+                          >
+                            {userFormNationality && !NATIONALITIES.some(n => n.value === userFormNationality) && (
+                              <option value={userFormNationality}>{userFormNationality}</option>
+                            )}
+
+                            <optgroup label={language === 'es' ? 'Nacionalidades Populares' : 'Popular Nationalities'}>
+                              {POPULAR_NATIONALITIES.map(n => (
+                                <option key={`pop-modal-${n.value}`} value={n.value}>
+                                  {language === 'es' ? n.labelEs : n.labelEn}
+                                </option>
+                              ))}
+                            </optgroup>
+
+                            <optgroup label={language === 'es' ? 'Todas las Nacionalidades' : 'All Nationalities'}>
+                              {sortedNationalities.map(n => (
+                                <option key={`all-modal-${n.value}`} value={n.value}>
+                                  {language === 'es' ? n.labelEs : n.labelEn}
+                                </option>
+                              ))}
+                            </optgroup>
+                          </select>
+                        </div>
+                        <div className="form-group">
+                          <label className="form-label">{language === 'es' ? 'Origen / Referido' : 'Referral Source'}</label>
                           <select 
                             className="form-control" 
                             value={userFormRefType} 
-                            onChange={e => handleUserRefTypeChange(e.target.value)}
-                            style={{ height: '38px' }}
+                            onChange={e => handleUserFormRefTypeChange(e.target.value)}
+                            style={{ height: '42px' }}
                           >
                             <option value="Instagram">Instagram</option>
                             <option value="Web">Web</option>
@@ -14460,29 +13587,29 @@ USING (true);`;
                           </select>
 
                           {userFormRefType === 'WhatsApp Group' && (
-                            <div className="wizard-referral-row" style={{ marginTop: '8px' }}>
+                            <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '8px' }}>
                               <input 
                                 type="text" 
                                 className="form-control" 
                                 value={userFormRefWhatsApp} 
-                                onChange={e => handleUserRefWhatsAppChange(e.target.value)} 
+                                onChange={e => handleUserFormRefWhatsAppChange(e.target.value)} 
                                 placeholder={language === 'es' ? 'Ej: Repartidores Dublín' : 'E.g.: Dublin Delivery Group'}
                                 style={{ height: '38px', flex: 1 }}
                               />
-                              <label className="form-label" style={{ margin: 0, whiteSpace: 'nowrap', fontSize: '12px', color: 'var(--text-muted)' }}>
+                              <label className="form-label" style={{ margin: 0, whiteSpace: 'nowrap', fontSize: '11px', color: 'var(--text-muted)' }}>
                                 {language === 'es' ? 'Nombre del Grupo de WhatsApp' : 'WhatsApp Group Name'}
                               </label>
                             </div>
                           )}
 
                           {userFormRefType === 'Usuario' && (
-                            <div className="wizard-referral-row" style={{ marginTop: '8px' }}>
+                            <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '8px' }}>
                               <div style={{ position: 'relative', flex: 1 }}>
                                 <input 
                                   type="text" 
                                   className="form-control" 
                                   value={userFormRefUserQuery} 
-                                  onChange={e => handleUserRefUserQueryChange(e.target.value)} 
+                                  onChange={e => handleUserFormRefUserQueryChange(e.target.value)} 
                                   placeholder={language === 'es' ? '🔍 Escribe 3 letras para buscar...' : '🔍 Type 3 letters to search...'}
                                   style={{ height: '38px', width: '100%' }}
                                 />
@@ -14533,25 +13660,19 @@ USING (true);`;
                                   })()
                                 )}
                               </div>
-                              <label className="form-label" style={{ margin: 0, whiteSpace: 'nowrap', fontSize: '12px', color: 'var(--text-muted)' }}>
-                                {language === 'es' ? 'Seleccionar Usuario' : 'Select User'}
-                              </label>
                             </div>
                           )}
 
                           {userFormRefType === 'Otro' && (
-                            <div className="wizard-referral-row" style={{ marginTop: '8px' }}>
+                            <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '8px' }}>
                               <input 
                                 type="text" 
                                 className="form-control" 
                                 value={userFormRefOther} 
-                                onChange={e => handleUserRefOtherChange(e.target.value)} 
-                                placeholder={language === 'es' ? 'Ej: Recomendación de un amigo, cartel publicitario' : 'E.g.: Friend recommendation, billboard'}
+                                onChange={e => handleUserFormRefOtherChange(e.target.value)} 
+                                placeholder={language === 'es' ? 'Ej: Recomendación de un amigo' : 'E.g.: Friend recommendation'}
                                 style={{ height: '38px', flex: 1 }}
                               />
-                              <label className="form-label" style={{ margin: 0, whiteSpace: 'nowrap', fontSize: '12px', color: 'var(--text-muted)' }}>
-                                {language === 'es' ? 'Especificar origen / información extra' : 'Specify source / extra info'}
-                              </label>
                             </div>
                           )}
                         </div>
@@ -14570,20 +13691,22 @@ USING (true);`;
                             if (!userFormName.trim()) { showToast(language === 'es' ? 'El nombre es obligatorio.' : 'Name is required.', 'error'); return; }
                             try {
                               const existing = editingUserId ? customers.find(c => c.id === editingUserId) : null;
-                              const finalCode = 'US-' + userFormCode.trim().replace(/^US-?/i, '');
+                              const nextCode = userFormCode.trim() 
+                                ? 'US-' + userFormCode.trim().replace(/^US-?/i, '')
+                                : (existing?.customer_code || `US-${String(customers.length + 1).padStart(3, '0')}`);
                               const initialNotesJson = !existing && userFormNotes.trim()
                                 ? JSON.stringify([{ id: crypto.randomUUID(), date: new Date().toISOString(), content: userFormNotes.trim() }])
                                 : (existing?.notes || '');
                               await upsertCustomer({
                                 id: existing?.id || crypto.randomUUID(),
-                                customer_code: finalCode,
+                                customer_code: nextCode,
                                 first_name: userFormName.trim(),
                                 last_name: userFormRole.trim(),
                                 email: userFormEmail.trim(),
                                 phone: userFormPhone.trim(),
                                 id_document_url: existing?.id_document_url || '',
                                 referral_source: userFormReferral.trim(),
-                                nationality: userFormNationality.trim(),
+                                nationality: userFormNationality || '',
                                 notes: initialNotesJson,
                                 created_at: existing?.created_at || new Date().toISOString(),
                               });
@@ -15526,26 +14649,26 @@ USING (true);`;
                     <label className="form-label">{prodFormIsGeneric ? (language === 'es' ? 'Costo por unidad (€)' : 'Unit Cost (€)') : (language === 'es' ? 'Costo (€)' : 'Acquisition Cost (€)')}</label>
                     <input type="number" className="form-control" value={prodFormPricePaid} onChange={e => setProdFormPricePaid(Number(e.target.value))} />
                     <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px', cursor: 'pointer', fontSize: '13px', color: 'var(--text-bright)' }}>
-                      <input type="checkbox" checked={prodFormAddVat} onChange={e => setProdFormAddVat(e.target.checked)} style={{ width: '16px', height: '16px', cursor: 'pointer' }} />
-                      {language === 'es' ? 'Agregar VAT (23% impuestos)' : 'Add VAT (23% tax)'}
-                    </label>
-                    {(prodFormAddVat || prodFormIsGeneric) && (() => {
-                      const base = prodFormPricePaid || 0;
-                      const qty = prodFormQuantity > 0 ? prodFormQuantity : 1;
-                      const vat = prodFormAddVat ? Math.round(base * 0.23 * 100) / 100 : 0;
-                      const unitCost = base + vat;
-                      const purchaseTotal = unitCost * qty;
-                      return (
-                        <div style={{ marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '2px', fontSize: '12px', color: 'var(--text-muted)', background: 'rgba(16, 185, 129, 0.05)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(16, 185, 129, 0.1)' }}>
-                          {prodFormAddVat && (
-                            <>
-                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>{language === 'es' ? 'Coste por unidad' : 'Unit cost'}</span><span>€{base.toLocaleString()}</span></div>
-                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>VAT (23%)</span><span>€{vat.toLocaleString()}</span></div>
-                              <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '3px', marginTop: '2px', color: 'var(--text-bright)', fontWeight: 700 }}>
-                                <span>{prodFormIsGeneric ? (language === 'es' ? 'Total por unidad' : 'Unit total') : 'Total'}</span><span>€{unitCost.toLocaleString()}</span>
-                              </div>
-                            </>
-                          )}
+                    <input type="checkbox" checked={prodFormAddVat} onChange={e => setProdFormAddVat(e.target.checked)} style={{ width: '16px', height: '16px', cursor: 'pointer' }} />
+                    {language === 'es' ? 'Agregar VAT (23% impuestos)' : 'Add VAT (23% tax)'}
+                  </label>
+                  {(prodFormAddVat || prodFormIsGeneric) && (() => {
+                    const base = prodFormPricePaid || 0;
+                    const qty = prodFormQuantity > 0 ? prodFormQuantity : 1;
+                    const vat = prodFormAddVat ? Math.round(base * 0.23 * 100) / 100 : 0;
+                    const unitCost = base + vat;
+                    const purchaseTotal = unitCost * qty;
+                    return (
+                      <div style={{ marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '2px', fontSize: '12px', color: 'var(--text-muted)', background: 'rgba(16, 185, 129, 0.05)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(16, 185, 129, 0.1)' }}>
+                        {prodFormAddVat && (
+                          <>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>{language === 'es' ? 'Coste por unidad' : 'Unit cost'}</span><span>€{base.toLocaleString()}</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>VAT (23%)</span><span>€{vat.toLocaleString()}</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '3px', marginTop: '2px', color: 'var(--text-bright)', fontWeight: 700 }}>
+                              <span>{prodFormIsGeneric ? (language === 'es' ? 'Total por unidad' : 'Unit total') : 'Total'}</span><span>€{unitCost.toLocaleString()}</span>
+                            </div>
+                          </>
+                        )}
                           {prodFormIsGeneric && (
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: prodFormAddVat ? '1px solid rgba(255,255,255,0.08)' : 'none', paddingTop: prodFormAddVat ? '4px' : '0', marginTop: prodFormAddVat ? '2px' : '0' }}>
                               <span>{language === 'es' ? 'Total de la compra' : 'Total purchase'} ({qty} {language === 'es' ? 'uds' : 'units'} × €{unitCost.toLocaleString()})</span>
@@ -15815,7 +14938,7 @@ USING (true);`;
                       imageUrl = null;
                     }
 
-                    // BAT (23% tax): the input holds the base cost; the stored price_paid includes the tax.
+                    // VAT (23% tax): the input holds the base cost; the stored price_paid includes the tax.
                     const vatAmount = prodFormAddVat ? Math.round(prodFormPricePaid * 0.23 * 100) / 100 : 0;
                     const effectiveCost = prodFormPricePaid + vatAmount;
                     const newProdBase = {
@@ -16061,31 +15184,7 @@ USING (true);`;
                             }}
                           />
                           {soldProducts.length > 1 && (
-                            <button className="btn-xs btn-secondary" style={{ color: '#ef4444', padding: '2px 6px', height: '26px' }} onClick={async () => {
-                              if (p.category_id === catLockId) {
-                                const bikeId = p.custom_field_values?.associated_bike_id as string;
-                                if (bikeId && soldProducts.some(item => item.id === bikeId)) {
-                                  const msg = language === 'es'
-                                    ? '¿Deseas desvincular el candado de la bicicleta para vender la bicicleta sola?'
-                                    : 'Do you want to unlink the lock from the bike to sell the bike alone?';
-                                  if (!window.confirm(msg)) {
-                                    return;
-                                  }
-                                  try {
-                                    const updatedLock = {
-                                      ...p,
-                                      custom_field_values: {
-                                        ...p.custom_field_values,
-                                        associated_bike_id: undefined
-                                      }
-                                    };
-                                    await upsertProduct(updatedLock);
-                                    triggerReload();
-                                  } catch (err) {
-                                    console.error('Error unlinking lock from sold list:', err);
-                                  }
-                                }
-                              }
+                            <button className="btn-xs btn-secondary" style={{ color: '#ef4444', padding: '2px 6px', height: '26px' }} onClick={() => {
                               const filtered = soldProducts.filter(item => item.id !== p.id);
                               setSoldProducts(filtered);
                               setSoldProductPrices(prev => {
@@ -17091,19 +16190,6 @@ USING (true);`;
                       const itemUpdates = rItems.map(item => {
                         const prod = products.find(p => p.id === item.product_id);
                         if (prod && prod.status === 'Rentada') {
-                          if (prod.category_id === catLockId) {
-                            const keep = prod.custom_field_values?.keep_associated;
-                            const updatedLock = {
-                              ...prod,
-                              status: 'Disponible' as const,
-                              custom_field_values: {
-                                ...prod.custom_field_values,
-                                associated_bike_id: keep ? prod.custom_field_values?.associated_bike_id : undefined,
-                                keep_associated: keep ? true : undefined
-                              }
-                            };
-                            return upsertProduct(updatedLock);
-                          }
                           return upsertProduct({ ...prod, status: 'Disponible' });
                         }
                         return Promise.resolve();
@@ -17955,10 +17041,7 @@ USING (true);`;
         const bike = selectedProductId ? products.find(p => p.id === selectedProductId) : null;
         if (!bike) return null;
 
-        const stats = calculateProductROI(bike.id, products, categories, rentals, rentalItems, payments, expenses, records);
-        const totalRevenues = stats ? stats.totalPaid + (bike.status === 'Vendida' ? (bike.price_sold || 0) : 0) : 0;
-        const totalExpenses = stats ? stats.cost + stats.totalExp : 0;
-        const netProfit = totalRevenues - totalExpenses;
+        const totalCost = selectedBikeHistory.reduce((sum, item) => sum + (item.cost || 0), 0);
         const lastService = bike.last_service_date || '-';
         const currentOdometer = bike.odometer || 0;
         const status = bike.maintenance_status || 'Al día';
@@ -17980,7 +17063,7 @@ USING (true);`;
                 <h3 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                   📂 {t.maintHistory}: <span style={{ color: 'var(--color-primary)' }}>{bike.serial_number}</span> — {bike.name}
                 </h3>
-                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedProductId(null); }}>✕</button>
+                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedProductId(null); setShowBikeUsers(false); }}>✕</button>
               </div>
 
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '20px', marginTop: '15px' }}>
@@ -18001,9 +17084,7 @@ USING (true);`;
                   </div>
                   <div style={{ background: 'rgba(255, 255, 255, 0.03)', border: '1px solid rgba(255, 255, 255, 0.06)', padding: '12px', borderRadius: '10px', textAlign: 'center' }}>
                     <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px 0' }}>{t.totalInvested}</p>
-                    <p style={{ fontSize: '16px', fontWeight: 'bold', color: netProfit >= 0 ? '#10b981' : '#ef4444', margin: 0 }}>
-                      {netProfit >= 0 ? '+' : '-'}€{Math.abs(netProfit)}
-                    </p>
+                    <p style={{ fontSize: '16px', fontWeight: 'bold', color: 'var(--color-primary)', margin: 0 }}>€{totalCost}</p>
                   </div>
                   <div style={{ background: 'rgba(255, 255, 255, 0.03)', border: '1px solid rgba(255, 255, 255, 0.06)', padding: '12px', borderRadius: '10px', textAlign: 'center' }}>
                     <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px 0' }}>{t.lastService}</p>
@@ -18011,8 +17092,8 @@ USING (true);`;
                   </div>
                 </div>
 
-                {/* Action button to schedule service */}
-                <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                {/* Action buttons */}
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
                   <button
                     className="btn-secondary"
                     style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', padding: '8px 16px', fontSize: '13px' }}
@@ -18084,7 +17165,6 @@ USING (true);`;
                   );
                 })()}
 
-
                 {/* Chronological Timeline */}
                 <div style={{ marginTop: '10px' }}>
                   <h4 style={{ color: 'var(--text-bright)', marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '14px' }}>
@@ -18106,13 +17186,6 @@ USING (true);`;
                               item.type === 'service' ? 'var(--color-primary)' 
                               : item.type === 'expense' ? 'var(--color-accent)' 
                               : item.type === 'rental_start' ? '#6366f1' 
-                              : item.type === 'rental_end' ? '#3b82f6'
-                              : item.type === 'purchase' ? '#10b981'
-                              : item.type === 'arrival' ? '#f59e0b'
-                              : item.type === 'assembly' ? '#ec4899'
-                              : item.type === 'sale' ? '#8b5cf6'
-                              : item.type === 'note' ? '#6b7280'
-                              : item.type === 'lock_link' ? '#06b6d4'
                               : '#3b82f6'
                             }`,
                             borderRadius: '8px',
@@ -18133,49 +17206,21 @@ USING (true);`;
                                   background: item.type === 'service' ? 'rgba(239, 131, 35, 0.15)' 
                                             : item.type === 'expense' ? 'rgba(16, 185, 129, 0.15)' 
                                             : item.type === 'rental_start' ? 'rgba(99, 102, 241, 0.15)' 
-                                            : item.type === 'rental_end' ? 'rgba(59, 130, 246, 0.15)'
-                                            : item.type === 'purchase' ? 'rgba(16, 185, 129, 0.15)'
-                                            : item.type === 'arrival' ? 'rgba(245, 158, 11, 0.15)'
-                                            : item.type === 'assembly' ? 'rgba(236, 72, 153, 0.15)'
-                                            : item.type === 'sale' ? 'rgba(139, 92, 246, 0.15)'
-                                            : item.type === 'note' ? 'rgba(107, 114, 128, 0.15)'
-                                            : item.type === 'lock_link' ? 'rgba(6, 182, 212, 0.15)'
                                             : 'rgba(59, 130, 246, 0.15)',
                                   color: item.type === 'service' ? 'var(--color-primary)' 
                                        : item.type === 'expense' ? 'var(--color-accent)' 
                                        : item.type === 'rental_start' ? '#818cf8' 
-                                       : item.type === 'rental_end' ? '#60a5fa'
-                                       : item.type === 'purchase' ? '#34d399'
-                                       : item.type === 'arrival' ? '#fbbf24'
-                                       : item.type === 'assembly' ? '#f472b6'
-                                       : item.type === 'sale' ? '#a78bfa'
-                                       : item.type === 'note' ? '#9ca3af'
-                                       : item.type === 'lock_link' ? '#22d3ee'
                                        : '#60a5fa',
                                   border: item.type === 'service' ? '1px solid rgba(239, 131, 35, 0.2)' 
                                         : item.type === 'expense' ? '1px solid rgba(16, 185, 129, 0.2)' 
                                         : item.type === 'rental_start' ? '1px solid rgba(99, 102, 241, 0.2)' 
-                                        : item.type === 'rental_end' ? '1px solid rgba(59, 130, 246, 0.2)'
-                                        : item.type === 'purchase' ? '1px solid rgba(16, 185, 129, 0.2)'
-                                        : item.type === 'arrival' ? '1px solid rgba(245, 158, 11, 0.2)'
-                                        : item.type === 'assembly' ? '1px solid rgba(236, 72, 153, 0.2)'
-                                        : item.type === 'sale' ? '1px solid rgba(139, 92, 246, 0.2)'
-                                        : item.type === 'note' ? '1px solid rgba(107, 114, 128, 0.2)'
-                                        : item.type === 'lock_link' ? '1px solid rgba(6, 182, 212, 0.2)'
                                         : '1px solid rgba(59, 130, 246, 0.2)'
                                 }}
                               >
                                 {item.type === 'service' ? t.serviceType 
                                  : item.type === 'expense' ? t.expenseType 
                                  : item.type === 'rental_start' ? (language === 'es' ? '🚀 Alquiler (Inicio)' : '🚀 Rented (Start)') 
-                                 : item.type === 'rental_end' ? (language === 'es' ? '🔄 Devolución (Fin)' : '🔄 Returned (End)')
-                                 : item.type === 'purchase' ? (language === 'es' ? '🛒 Compra' : '🛒 Purchase')
-                                 : item.type === 'arrival' ? (language === 'es' ? '📦 Arribo' : '📦 Arrival')
-                                 : item.type === 'assembly' ? (language === 'es' ? '🔧 Armado' : '🔧 Assembly')
-                                 : item.type === 'sale' ? (language === 'es' ? '💰 Venta' : '💰 Sale')
-                                 : item.type === 'note' ? (language === 'es' ? '📝 Bitácora' : '📝 Notes')
-                                 : item.type === 'lock_link' ? (language === 'es' ? '🔗 Candado' : '🔗 Lock')
-                                 : (language === 'es' ? '📈 Estado' : '📈 Status')}
+                                 : (language === 'es' ? '🔄 Devolución (Fin)' : '🔄 Returned (End)')}
                               </span>
                             </div>
                             {item.cost !== undefined && (
@@ -18693,173 +17738,6 @@ USING (true);`;
         );
       })()}
 
-      {/* MODAL: Link Lock to Bike */}
-      {modalType === 'linkLockToBike' && (() => {
-        const lock = selectedProductId ? products.find(p => p.id === selectedProductId) : null;
-        if (!lock) return null;
-
-        // Get already linked bikes (1-to-1 association strict check)
-        const linkedBikeIds = new Set(
-          products
-            .filter(p => p.category_id === catLockId && p.custom_field_values?.associated_bike_id)
-            .map(p => p.custom_field_values.associated_bike_id as string)
-        );
-
-        // Filter active bikes that do not have any lock linked
-        const availableBikes = products.filter(p => {
-          const isActive = p.category_id === catBikeId && p.status !== 'Vendida' && p.status !== 'Perdida' && p.status !== 'Robada' && p.status !== 'Perdida/Garda';
-          const isNotLinked = !linkedBikeIds.has(p.id);
-          const matchesQuery = !linkBikeSearchQuery.trim() || 
-            `${p.name} ${p.serial_number} ${p.notes || ''}`.toLowerCase().includes(linkBikeSearchQuery.toLowerCase());
-          return isActive && isNotLinked && matchesQuery;
-        }).sort((a, b) => a.name.localeCompare(b.name));
-
-        const handleSave = async (bikeId: string) => {
-          try {
-            const updatedLock = {
-              ...lock,
-              custom_field_values: {
-                ...lock.custom_field_values,
-                associated_bike_id: bikeId
-              }
-            };
-            await upsertProduct(updatedLock);
-            triggerReload();
-            setModalType(null);
-            setSelectedProductId(null);
-            setLinkBikeSearchQuery('');
-            showToast(language === 'es' ? 'Candado vinculado correctamente.' : 'Lock linked successfully.', 'success');
-          } catch (err) {
-            console.error('Error linking lock:', err);
-            showToast(language === 'es' ? 'Error al vincular el candado.' : 'Error linking the lock.', 'error');
-          }
-        };
-
-        return (
-          <div className="modal-overlay" style={{ zIndex: 1200 }} onClick={() => { setModalType(null); setSelectedProductId(null); setLinkBikeSearchQuery(''); }}>
-            <div className="modal-content" style={{ maxWidth: '500px', padding: '24px' }} onClick={e => e.stopPropagation()}>
-              <div className="modal-header">
-                <h3>🔗 {language === 'es' ? 'Vincular Candado a Bicicleta' : 'Link Lock to Bike'}</h3>
-                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedProductId(null); setLinkBikeSearchQuery(''); }}>✕</button>
-              </div>
-              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                <p style={{ fontSize: '13px', color: 'var(--text-muted)', margin: 0 }}>
-                  {language === 'es' 
-                    ? `Selecciona la bicicleta a la que deseas vincular el candado "${lock.name}" (${lock.serial_number}).` 
-                    : `Select the bike to link the lock "${lock.name}" (${lock.serial_number}) to.`
-                  }
-                </p>
-                <input
-                  type="text"
-                  className="form-control"
-                  placeholder={language === 'es' ? '🔍 Buscar por serial o nombre...' : '🔍 Search by serial or name...'}
-                  value={linkBikeSearchQuery}
-                  onChange={e => setLinkBikeSearchQuery(e.target.value)}
-                  style={{ height: '38px' }}
-                />
-                <div style={{ maxHeight: '250px', overflowY: 'auto', border: '1px solid var(--border-color)', borderRadius: '8px', padding: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                  {availableBikes.length === 0 ? (
-                    <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '16px', fontSize: '13px', fontStyle: 'italic' }}>
-                      {language === 'es' ? 'No hay bicicletas activas disponibles sin candado.' : 'No available active bikes without locks.'}
-                    </div>
-                  ) : availableBikes.map(bike => (
-                    <div 
-                      key={bike.id} 
-                      style={{ 
-                        display: 'flex', 
-                        alignItems: 'center', 
-                        justifyContent: 'space-between', 
-                        padding: '10px 12px', 
-                        background: 'rgba(255, 255, 255, 0.02)', 
-                        border: '1px solid rgba(255, 255, 255, 0.05)', 
-                        borderRadius: '8px',
-                        transition: 'background 0.2s'
-                      }}
-                      onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.06)'}
-                      onMouseLeave={e => e.currentTarget.style.background = 'rgba(255, 255, 255, 0.02)'}
-                    >
-                      <div>
-                        <strong style={{ color: 'var(--text-bright)', fontSize: '13px' }}>{bike.name}</strong>
-                        <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{bike.serial_number} · Status: {bike.status}</div>
-                      </div>
-                      <button className="btn-primary btn-xs" onClick={() => handleSave(bike.id)}>
-                        {language === 'es' ? 'Vincular' : 'Link'}
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-              <div className="modal-footer" style={{ marginTop: '16px' }}>
-                <button className="btn-secondary" onClick={() => { setModalType(null); setSelectedProductId(null); setLinkBikeSearchQuery(''); }}>
-                  {t.cancel}
-                </button>
-              </div>
-            </div>
-          </div>
-        );
-      })()}
-
-      {/* MODAL: Confirm Unlink Lock */}
-      {modalType === 'confirmUnlinkLock' && (() => {
-        const lock = selectedProductId ? products.find(p => p.id === selectedProductId) : null;
-        if (!lock) return null;
-        const bikeId = lock.custom_field_values?.associated_bike_id as string;
-        const bike = products.find(p => p.id === bikeId);
-
-        const handleUnlink = async () => {
-          try {
-            const updatedLock = {
-              ...lock,
-              custom_field_values: {
-                ...lock.custom_field_values,
-                associated_bike_id: undefined
-              }
-            };
-            await upsertProduct(updatedLock);
-            triggerReload();
-            setModalType(null);
-            setSelectedProductId(null);
-            showToast(language === 'es' ? 'Candado desvinculado correctamente.' : 'Lock unlinked successfully.', 'success');
-          } catch (err) {
-            console.error('Error unlinking lock:', err);
-            showToast(language === 'es' ? 'Error al desvincular el candado.' : 'Error unlinking the lock.', 'error');
-          }
-        };
-
-        return (
-          <div className="modal-overlay" style={{ zIndex: 1200 }} onClick={() => { setModalType(null); setSelectedProductId(null); }}>
-            <div className="modal-content" style={{ maxWidth: '450px', padding: '24px' }} onClick={e => e.stopPropagation()}>
-              <div className="modal-header">
-                <h3>🔗 {language === 'es' ? 'Desvincular Candado' : 'Unlink Lock'}</h3>
-                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedProductId(null); }}>✕</button>
-              </div>
-              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-                <p style={{ fontSize: '13px', color: 'var(--text-bright)', margin: 0 }}>
-                  {language === 'es'
-                    ? `¿Estás seguro de que deseas desvincular el candado "${lock.name}" de la bicicleta "${bike ? bike.name : 'desconocida'}"?`
-                    : `Are you sure you want to unlink the lock "${lock.name}" from the bike "${bike ? bike.name : 'unknown'}"?`
-                  }
-                </p>
-                <p style={{ fontSize: '12px', color: 'var(--text-muted)', margin: 0 }}>
-                  {language === 'es'
-                    ? 'Esta acción eliminará la asociación permanente entre ambos artículos.'
-                    : 'This action will remove the permanent association between both items.'
-                  }
-                </p>
-              </div>
-              <div className="modal-footer" style={{ marginTop: '16px' }}>
-                <button className="btn-secondary" onClick={() => { setModalType(null); setSelectedProductId(null); }}>
-                  {t.cancel}
-                </button>
-                <button className="btn-primary" style={{ background: '#f87171', borderColor: '#f87171' }} onClick={handleUnlink}>
-                  {language === 'es' ? 'Desvincular' : 'Unlink'}
-                </button>
-              </div>
-            </div>
-          </div>
-        );
-      })()}
-
       {/* MODAL: Change Product Condition */}
       {modalType === 'changeCondition' && (() => {
         const prod = selectedProductId ? products.find(p => p.id === selectedProductId) : null;
@@ -19154,7 +18032,8 @@ USING (true);`;
                         whiteSpace: 'pre-wrap',
                         wordBreak: 'break-all'
                       }}>
-                        {`CREATE TABLE public.bike_modifications (...);\n-- (Haz clic en Copiar SQL para obtener el script completo)`}
+                        {`CREATE TABLE public.bike_modifications (...);\
+-- (Haz clic en Copiar SQL para obtener el script completo)`}
                       </pre>
                     </div>
 
@@ -19385,7 +18264,8 @@ USING (true);`;
                   await upsertEvent({
                     id: mainEvId,
                     title: `[Service] ${bikeSerial}`,
-                    description: `${servFormDesc}\nService ID: ${recId}`,
+                    description: `${servFormDesc}\
+Service ID: ${recId}`,
                     event_date: servFormDate,
                     remind_one_week: servFormRemindWeek,
                     remind_one_day: servFormRemindDay,
@@ -19401,7 +18281,9 @@ USING (true);`;
                     await upsertEvent({
                       id: customEvId,
                       title: `[Service] ${bikeSerial}`,
-                      description: `${language === 'es' ? 'Recordatorio personalizado' : 'Custom reminder'}\n${servFormDesc}\nService ID: ${recId}`,
+                      description: `${language === 'es' ? 'Recordatorio personalizado' : 'Custom reminder'}\
+${servFormDesc}\
+Service ID: ${recId}`,
                       event_date: servFormRemindCustomDate,
                       remind_one_week: false,
                       remind_one_day: true,
@@ -19869,7 +18751,8 @@ USING (true);`;
                             const reminderEvent: CompanyEvent = {
                               id: newEventId,
                               title: `Seguimiento: ${lead.name}`,
-                              description: `${newFollowUpReminderAction || 'Seguimiento Lead'}\n[LeadID: ${lead.id}]`,
+                              description: `${newFollowUpReminderAction || 'Seguimiento Lead'}\
+[LeadID: ${lead.id}]`,
                               event_date: newFollowUpReminderDate,
                               remind_one_week: false,
                               remind_one_day: true,
@@ -19943,7 +18826,8 @@ USING (true);`;
                                   📅 {e.event_date} {e.status === 'Realizado' && `(✓ ${language === 'es' ? 'Realizado' : 'Done'})`}
                                 </div>
                                 <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '2px' }}>
-                                  {e.description ? e.description.split('\n')[0] : ''}
+                                  {e.description ? e.description.split('\
+')[0] : ''}
                                 </div>
                               </div>
                               {e.status === 'Pendiente' && (
@@ -20806,9 +19690,16 @@ USING (true);`;
                         const isPositive = item.amount >= 0;
                         const amtColor = isPositive ? '#34d399' : '#f87171';
                         return (
-                          <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(0,0,0,0.12)', padding: '10px 14px', borderRadius: '8px', fontSize: '13px', borderLeft: `3px solid ${amtColor}` }}>
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                              <span style={{ color: 'var(--text-bright)', fontWeight: 500 }}>{item.description}</span>
+                          <div
+                            key={idx}
+                            onClick={() => setLedgerDetail(item)}
+                            title={language === 'es' ? 'Ver detalle' : 'View detail'}
+                            style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(0,0,0,0.12)', padding: '10px 14px', borderRadius: '8px', fontSize: '13px', borderLeft: `3px solid ${amtColor}`, cursor: 'pointer' }}
+                          >
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 }}>
+                              <span style={{ color: 'var(--text-bright)', fontWeight: 500 }}>
+                                {item.description.length > 60 ? `${item.description.slice(0, 60)}...` : item.description}
+                              </span>
                               <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>📅 {formatDate(item.date)}</span>
                             </div>
                             <strong style={{ color: amtColor, fontSize: '14px', whiteSpace: 'nowrap', marginLeft: '12px' }}>
@@ -20909,6 +19800,7 @@ USING (true);`;
                                     className="btn-secondary btn-xs"
                                     onClick={() => {
                                       setActiveCustomerId(rider.id);
+                                      setProfileRentalId(null);
                                       setModalType(null);
                                     }}
                                   >
@@ -22284,6 +21176,9 @@ USING (true);`;
                         if (p.category_id === catBikeId || p.category_id === catBattId || p.category_id === catLockId) return false;
                         // Only available
                         if (p.status !== 'Disponible') return false;
+                        // Exclude consolidated products with 0 units
+                        const _dist = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
+                        if (_dist != null && Object.values(_dist).reduce((a, b) => a + b, 0) <= 0) return false;
                         // Exclude already selected kit items
                         if (wizKitProductIds.includes(p.id)) return false;
                         // Exclude already selected bike/battery/lock in wizard
@@ -22315,9 +21210,26 @@ USING (true);`;
                       }
 
                       return Array.from(groupsMap.entries()).map(([serial, groupProds]) => {
-                        const representativeItem = groupProds[0];
+                        // Prefer the consolidated record (the one carrying a distribution) as the
+                        // representative so the rental references the real stock row.
+                        const representativeItem =
+                          groupProds.find(p => p.custom_field_values?.location_distribution != null) || groupProds[0];
                         const catName = categories.find(c => c.id === representativeItem.category_id);
-                        const count = groupProds.length;
+                        // Count available UNITS, not records: a row with a distribution counts its summed
+                        // quantity; a plain single-unit row (e.g. a legacy split) counts as 1.
+                        const totalUnits = groupProds.reduce((sum, p) => {
+                          const d = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
+                          return sum + (d != null ? Object.values(d).reduce((a, b) => a + (Number(b) || 0), 0) : 1);
+                        }, 0);
+                        // Subtract units already out on an active rental (tracked via rental_items).
+                        const grpIds = new Set(groupProds.map(p => p.id));
+                        const activeRented = (rentalItems || []).filter(ri =>
+                          grpIds.has(ri.product_id) &&
+                          (rentals || []).some(r => r.id === ri.rental_id && r.status === 'Activo')
+                        ).length;
+                        const count = Math.max(0, totalUnits - activeRented);
+                        // No real stock left → don't offer it.
+                        if (count <= 0) return null;
                         return (
                           <tr key={representativeItem.id}>
                             <td>
@@ -22638,12 +21550,11 @@ USING (true);`;
         </div>
       )}
 
-
       {lightboxUrl && (
-        <div 
-          className="modal-overlay" 
-          onClick={() => setLightboxUrl(null)} 
-          style={{ 
+        <div
+          className="modal-overlay"
+          onClick={() => setLightboxUrl(null)}
+          style={{
             position: 'fixed',
             top: 0,
             left: 0,
@@ -22859,7 +21770,7 @@ USING (true);`;
                     ))}
                   </optgroup>
                   <optgroup label={language === 'es' ? 'Todas' : 'All'}>
-                    {NATIONALITIES.map(n => (
+                    {sortedNationalities.map(n => (
                       <option key={n.value} value={n.value}>{language === 'es' ? n.labelEs : n.labelEn}</option>
                     ))}
                   </optgroup>
@@ -23437,9 +22348,7 @@ USING (true);`;
                         e.currentTarget.style.color = 'var(--text-muted)';
                       }}
                     >
-                      ✨ {language === 'es' ? 'Condición' : 'Condition'}
-                    </button>
-                  )}
+
                 </>
               )}
 
@@ -23745,7 +22654,8 @@ USING (true);`;
                       whiteSpace: 'pre-wrap',
                       wordBreak: 'break-all'
                     }}>
-                      {`CREATE TABLE public.allowed_emails (...);\n-- (Haz clic en Copiar SQL para obtener el script completo)`}
+                      {`CREATE TABLE public.allowed_emails (...);\
+-- (Haz clic en Copiar SQL para obtener el script completo)`}
                     </pre>
                   </div>
 

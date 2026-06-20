@@ -1,0 +1,39 @@
+  // Create or update an internal technical checklist row, including the inspector
+  // signature (uploaded after the row exists so it has an id for the storage path).
+  const persistInternalChecklist = async (params: {
+    existingId: string | null;
+    rentalId: string;
+    customerName: string;
+    bikeModel: string;
+    bikeSerial: string;
+    deliveryDate: string;
+    value: InternalChecklistValue;
+  }): Promise<void> => {
+    const { value } = params;
+    const allChecked = INTERNAL_CHECKLIST_ITEM_KEYS.every(k => value.items[k]);
+    const anyChecked = INTERNAL_CHECKLIST_ITEM_KEYS.some(k => value.items[k]);
+    const status: 'pending' | 'completed' = allChecked && anyChecked ? 'completed' : 'pending';
+    let id = params.existingId;
+    if (!id) {
+      const row = await createInternalChecklist({
+        rental_id: params.rentalId,
+        customer_name: params.customerName,
+        bike_model: params.bikeModel,
+        bike_serial: params.bikeSerial,
+        delivery_date: params.deliveryDate,
+        battery_level: value.battery_level,
+        items: value.items,
+        notes: value.notes,
+        status,
+      });
+      id = row.id;
+    } else {
+      await updateDeliveryChecklist(id, {
+        items: value.items, notes: value.notes, battery_level: value.battery_level, status,
+      });
+    }
+    if (value.signatureDataUrl) {
+      const url = await uploadChecklistSignature(id, value.signatureDataUrl);
+      await updateDeliveryChecklist(id, { signature_url: url });
+    }
+  };

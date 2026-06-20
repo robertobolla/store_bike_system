@@ -1,0 +1,221 @@
+  // ============================================================
+  // PUBLIC DELIVERY CHECKLIST PAGE (detect ?checklist=CHECKLIST_ID)
+  // ============================================================
+  const checklistId = useMemo(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('checklist');
+  }, []);
+
+  const checklistCanvasRef = useRef<HTMLCanvasElement>(null);
+  const [checklistIsDrawing, setChecklistIsDrawing] = useState(false);
+  const [checklistHasSignature, setChecklistHasSignature] = useState(false);
+  const [checklistData, setChecklistData] = useState<DeliveryChecklist | null>(null);
+  const [checklistLoading, setChecklistLoading] = useState(true);
+  const [checklistSuccess, setChecklistSuccess] = useState(false);
+  const [checklistSubmitting, setChecklistSubmitting] = useState(false);
+  const [checklistItems, setChecklistItems] = useState<Record<string, boolean>>({});
+  const [checklistBattery, setChecklistBattery] = useState('');
+
+  useEffect(() => {
+    if (!checklistId) return;
+    (async () => {
+      try {
+        const cl = await getDeliveryChecklist(checklistId);
+        setChecklistData(cl);
+      } catch { /* ignore */ }
+      setChecklistLoading(false);
+    })();
+  }, [checklistId]);
+
+  const startChecklistSign = (e: React.TouchEvent<HTMLCanvasElement> | React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = checklistCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    setChecklistIsDrawing(true);
+    setChecklistHasSignature(true);
+    const { x, y } = getCanvasPoint(canvas, e);
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+  };
+
+  const drawChecklistSign = (e: React.TouchEvent<HTMLCanvasElement> | React.MouseEvent<HTMLCanvasElement>) => {
+    if (!checklistIsDrawing) return;
+    const canvas = checklistCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const { x, y } = getCanvasPoint(canvas, e);
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#10b981';
+    ctx.lineTo(x, y);
+    ctx.stroke();
+  };
+
+  const stopChecklistSign = () => setChecklistIsDrawing(false);
+
+  const clearChecklistSign = () => {
+    const canvas = checklistCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    setChecklistHasSignature(false);
+  };
+
+  const allChecklistItemsChecked = DELIVERY_CHECKLIST_CHECKBOX_KEYS.every(k => checklistItems[k]);
+
+  const submitChecklist = async () => {
+    const canvas = checklistCanvasRef.current;
+    if (!canvas || !checklistData) return;
+    if (!allChecklistItemsChecked) {
+      alert('Please tick every box to confirm your acceptance.');
+      return;
+    }
+    if (!checklistHasSignature) {
+      alert('Please sign before submitting.');
+      return;
+    }
+    setChecklistSubmitting(true);
+    try {
+      const dataUrl = canvas.toDataURL('image/png');
+      const signatureUrl = await uploadChecklistSignature(checklistData.id, dataUrl);
+      const payload = { items: checklistItems, battery_level: checklistBattery, signature_url: signatureUrl };
+      const ok = await submitDeliveryChecklist(checklistData.id, payload);
+      if (!ok) {
+        // Row was no longer 'pending' (already submitted) – do not re-send.
+        setChecklistData({ ...checklistData, status: 'completed' });
+        setChecklistSubmitting(false);
+        return;
+      }
+      sendDeliveryChecklistCopyEmail(checklistData, payload, checklistData.email_lang);
+      setChecklistSuccess(true);
+    } catch (err) {
+      console.error('Checklist submit failed:', err);
+      alert('Error submitting the checklist. Please try again.');
+    }
+    setChecklistSubmitting(false);
+  };
+
+  // Render delivery checklist page if ?checklist= is present (no auth required).
+  // The checklist document is always in English (matches the PDF model).
+  if (checklistId) {
+    return (
+      <div className="sign-page">
+        <div className="sign-page-card">
+          <div className="sign-logo">
+            <p style={{ fontSize: '28px', marginBottom: '4px' }}>🐏</p>
+            <h2>The Fast Sheep</h2>
+            <p style={{ fontSize: '12px', color: 'var(--text-muted)' }}>E-Bike Delivery Checklist</p>
+            <p style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Customer Acknowledgement &amp; Liability Waiver</p>
+          </div>
+
+          {checklistLoading ? (
+            <div style={{ textAlign: 'center', padding: '40px' }}>
+              <p style={{ color: 'var(--text-muted)' }}>⏳ Loading checklist...</p>
+            </div>
+          ) : !checklistData ? (
+            <div style={{ textAlign: 'center', padding: '40px' }}>
+              <p style={{ fontSize: '48px', marginBottom: '12px' }}>❌</p>
+              <h3 style={{ marginBottom: '8px' }}>Checklist not found</h3>
+              <p style={{ color: 'var(--text-muted)', fontSize: '13px' }}>This link is invalid or has expired.</p>
+            </div>
+          ) : checklistSuccess || checklistData.status === 'completed' ? (
+            <div className="sign-success">
+              <span className="check-icon">✅</span>
+              <h3>Checklist submitted successfully!</h3>
+              <p>Thank you, {checklistData.customer_name}. Your acceptance has been registered and a copy has been emailed to you.</p>
+              <p style={{ marginTop: '12px', fontSize: '12px', color: 'var(--text-muted)' }}>This form can no longer be submitted. You can close this window.</p>
+            </div>
+          ) : (
+            <>
+              <div className="contract-details">
+                {[
+                  ['E-Bike Model', checklistData.bike_model || '—'],
+                  ['E-Bike Serial Number', checklistData.bike_serial || '—'],
+                  ['Date', checklistData.delivery_date],
+                  ['Customer Name', checklistData.customer_name],
+                ].map(([label, val]) => (
+                  <div key={label} className="detail-row">
+                    <span className="detail-label">{label}</span>
+                    <span className="detail-value">{val}</span>
+                  </div>
+                ))}
+              </div>
+
+              <div className="checklist-field">
+                <label htmlFor="battery-level">🔋 Battery Charge Level</label>
+                <input
+                  id="battery-level"
+                  type="text"
+                  inputMode="numeric"
+                  placeholder="e.g. 100%"
+                  value={checklistBattery}
+                  onChange={(e) => setChecklistBattery(e.target.value)}
+                />
+              </div>
+
+              {DELIVERY_CHECKLIST_GROUPS.map(group => (
+                <div key={group.key} className="checklist-group">
+                  <p className="checklist-group-title">{group.title}</p>
+                  {group.kind === 'checkbox'
+                    ? group.items.map(item => (
+                        <label key={item.key} className={`checklist-item ${checklistItems[item.key] ? 'checked' : ''}`}>
+                          <input
+                            type="checkbox"
+                            checked={!!checklistItems[item.key]}
+                            onChange={(e) => setChecklistItems(prev => ({ ...prev, [item.key]: e.target.checked }))}
+                          />
+                          <span>{item.text}</span>
+                        </label>
+                      ))
+                    : group.items.map(item => (
+                        <p key={item.key} className="checklist-declaration">{item.text}</p>
+                      ))}
+                </div>
+              ))}
+
+              <p className="checklist-signing-note">
+                By signing below, the customer confirms acceptance of all the aforementioned conditions and declarations.
+              </p>
+
+              <div className="sign-canvas-container">
+                <label>✍️ Sign here (use your finger or mouse):</label>
+                <canvas
+                  ref={checklistCanvasRef}
+                  width={480}
+                  height={160}
+                  onMouseDown={startChecklistSign}
+                  onMouseMove={drawChecklistSign}
+                  onMouseUp={stopChecklistSign}
+                  onMouseLeave={stopChecklistSign}
+                  onTouchStart={startChecklistSign}
+                  onTouchMove={drawChecklistSign}
+                  onTouchEnd={stopChecklistSign}
+                />
+              </div>
+
+              {!allChecklistItemsChecked && (
+                <p style={{ fontSize: '12px', color: 'var(--text-muted)', textAlign: 'center', margin: '4px 0 0' }}>
+                  Tick all boxes and sign to enable submission.
+                </p>
+              )}
+              <div className="sign-actions">
+                <button className="btn-secondary" style={{ flex: 1 }} onClick={clearChecklistSign}>🗑️ Clear</button>
+                <button
+                  className="btn-primary"
+                  style={{ flex: 2 }}
+                  disabled={checklistSubmitting || !allChecklistItemsChecked || !checklistHasSignature}
+                  onClick={submitChecklist}
+                >
+                  {checklistSubmitting ? '⏳ Submitting...' : '✅ Confirm & Submit'}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+

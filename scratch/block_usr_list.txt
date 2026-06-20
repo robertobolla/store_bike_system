@@ -1,0 +1,53 @@
+                {/* Riders who used this bike (only rentals already returned) */}
+                {showBikeUsers && (() => {
+                  const returnedRentals = rentals
+                    .filter(r => r.bike_id === bike.id && r.status === 'Inactivo')
+                    .sort((a, b) => (b.end_date || b.scheduled_return_date || '').localeCompare(a.end_date || a.scheduled_return_date || ''));
+                  return (
+                    <div style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: '10px', padding: '12px' }}>
+                      <h4 style={{ color: 'var(--text-bright)', margin: '0 0 10px', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '14px' }}>
+                        👥 {language === 'es' ? 'Usuarios que usaron esta bicicleta' : 'Riders who used this bike'}
+                      </h4>
+                      {returnedRentals.length === 0 ? (
+                        <p style={{ color: 'var(--text-muted)', fontSize: '13px', margin: 0, fontStyle: 'italic' }}>
+                          {language === 'es' ? 'Aún no hay usuarios con devolución registrada.' : 'No riders with a recorded return yet.'}
+                        </p>
+                      ) : (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '260px', overflowY: 'auto', paddingRight: '4px' }}>
+                          {returnedRentals.map(r => {
+                            const c = customers.find(cu => cu.id === r.customer_id);
+                            const returnDate = r.end_date || r.scheduled_return_date;
+                            return (
+                              <button
+                                key={r.id}
+                                onClick={() => {
+                                  setActiveCustomerId(r.customer_id);
+                                  setProfileRentalId(r.id);
+                                  setShowBikeUsers(false);
+                                  setModalType(null);
+                                  setSelectedProductId(null);
+                                  setShowRentalWizard(false);
+                                  setCurrentTab('rental_wizard');
+                                }}
+                                style={{
+                                  display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px',
+                                  background: 'rgba(0,0,0,0.15)', border: '1px solid rgba(255,255,255,0.06)',
+                                  borderRadius: '8px', padding: '10px 14px', cursor: 'pointer', textAlign: 'left',
+                                  color: 'var(--text-bright)', width: '100%'
+                                }}
+                              >
+                                <span style={{ fontSize: '13px', fontWeight: 600 }}>
+                                  👤 {c ? `${c.first_name} ${c.last_name}` : (language === 'es' ? 'Cliente eliminado' : 'Deleted customer')}
+                                </span>
+                                <span style={{ fontSize: '12px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+                                  🔄 {language === 'es' ? 'Devuelta:' : 'Returned:'} {formatDateDMYY(returnDate)}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+

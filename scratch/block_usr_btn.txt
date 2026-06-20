@@ -1,0 +1,7 @@
+                  <button
+                    className="btn-secondary"
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', padding: '8px 16px', fontSize: '13px' }}
+                    onClick={() => setShowBikeUsers(v => !v)}
+                  >
+                    👥 {language === 'es' ? 'Usuarios' : 'Users'}
+                  </button>

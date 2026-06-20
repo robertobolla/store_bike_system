@@ -1,0 +1,286 @@
+      {/* MODAL: Balance transaction detail */}
+      {txDetail && (() => {
+        const isPositive = txDetail.type === 'income';
+        const amtColor = isPositive ? '#10b981' : '#ef4444';
+        const viaLabel = txDetail.received_via
+          ? (txDetail.received_via === 'efectivo' ? (language === 'es' ? '💵 Efectivo' : '💵 Cash') : (language === 'es' ? '🏦 Transferencia' : '🏦 Transfer'))
+          : '—';
+        const dFmt = (() => { const p = txDetail.date.split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0].slice(-2)}` : txDetail.date; })();
+        return (
+          <div className="modal-overlay" onClick={() => setTxDetail(null)} style={{ zIndex: 9999 }}>
+            <div className="modal-content" style={{ maxWidth: '540px' }} onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <h3>🧾 {language === 'es' ? 'Detalle de Transacción' : 'Transaction Detail'}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setTxDetail(null)}>✕</button>
+              </div>
+              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderLeft: `4px solid ${amtColor}`, paddingLeft: '12px' }}>
+                  <span className="badge">{txDetail.category}</span>
+                  <strong style={{ color: amtColor, fontSize: '20px' }}>{isPositive ? '+' : '-'}€{txDetail.amount}</strong>
+                </div>
+                <div>
+                  <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{language === 'es' ? 'Descripción' : 'Description'}</p>
+                  <p style={{ fontSize: '14px', color: 'var(--text-bright)', margin: 0, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{txDetail.description}</p>
+                </div>
+                <div style={{ display: 'flex', gap: '24px', flexWrap: 'wrap' }}>
+                  <div>
+                    <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{language === 'es' ? 'Fecha' : 'Date'}</p>
+                    <p style={{ fontSize: '14px', color: 'var(--text-bright)', margin: 0 }}>📅 {dFmt}</p>
+                  </div>
+                  <div>
+                    <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{language === 'es' ? 'Medio' : 'Method'}</p>
+                    <p style={{ fontSize: '14px', color: 'var(--text-bright)', margin: 0 }}>{viaLabel}</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* MODAL: Ledger transaction detail */}
+      {ledgerDetail && (() => {
+        const isPositive = ledgerDetail.amount >= 0;
+        const amtColor = isPositive ? '#34d399' : '#f87171';
+        const typeLabels: Record<string, { es: string; en: string }> = {
+          cost: { es: 'Costo de compra', en: 'Purchase cost' },
+          sale: { es: 'Venta', en: 'Sale' },
+          payment: { es: 'Pago', en: 'Payment' },
+          deposit: { es: 'Depósito', en: 'Deposit' },
+          expense: { es: 'Gasto', en: 'Expense' },
+        };
+        const typeLabel = typeLabels[ledgerDetail.type] ? (language === 'es' ? typeLabels[ledgerDetail.type].es : typeLabels[ledgerDetail.type].en) : ledgerDetail.type;
+        return (
+          <div className="modal-overlay" onClick={() => setLedgerDetail(null)} style={{ zIndex: 9999 }}>
+            <div className="modal-content" style={{ maxWidth: '520px' }} onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <h3>🧾 {language === 'es' ? 'Detalle de Transacción' : 'Transaction Detail'}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setLedgerDetail(null)}>✕</button>
+              </div>
+              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderLeft: `4px solid ${amtColor}`, paddingLeft: '12px' }}>
+                  <span style={{ fontSize: '12px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{typeLabel}</span>
+                  <strong style={{ color: amtColor, fontSize: '20px' }}>{isPositive ? '+' : ''}€{ledgerDetail.amount}</strong>
+                </div>
+                <div>
+                  <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{language === 'es' ? 'Descripción' : 'Description'}</p>
+                  <p style={{ fontSize: '14px', color: 'var(--text-bright)', margin: 0, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{ledgerDetail.description}</p>
+                </div>
+                <div>
+                  <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{language === 'es' ? 'Fecha' : 'Date'}</p>
+                  <p style={{ fontSize: '14px', color: 'var(--text-bright)', margin: 0 }}>📅 {(() => { const p = ledgerDetail.date.split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0].slice(-2)}` : ledgerDetail.date; })()}</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Internal checklist modal used inside the rental wizard (edits wizard state, saved on confirm) */}
+      {wizShowInternalChecklist && (() => {
+        const wizBike = products.find(p => p.id === wizBikeId);
+        return (
+          <div
+            className="modal-overlay"
+            onClick={() => setWizShowInternalChecklist(false)}
+            style={{
+              position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+              background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(10px)',
+              display: 'flex', justifyContent: 'center', alignItems: 'flex-start',
+              zIndex: 9999, padding: '24px', overflowY: 'auto'
+            }}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="sign-page-card"
+              style={{ width: '100%', maxWidth: '640px', margin: 'auto', background: 'var(--bg-elevated, #1e293b)' }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+                <h3 style={{ margin: 0 }}>🔧 {language === 'es' ? 'Checklist Técnica (Interno)' : 'Technical Checklist (Internal)'}</h3>
+                <button className="btn-secondary btn-xs" style={{ padding: '4px 10px' }} onClick={() => setWizShowInternalChecklist(false)}>✕</button>
+              </div>
+              <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: 0 }}>
+                {language === 'es' ? 'Inspección previa a la entrega — uso interno' : 'Pre-delivery inspection — internal use'}
+              </p>
+              <div className="contract-details" style={{ background: 'rgba(0,0,0,0.2)', borderRadius: '12px', padding: '12px 16px', margin: '12px 0' }}>
+                {[
+                  ['E-Bike Model', wizBike?.name || '—'],
+                  ['E-Bike Serial Number', wizBike?.serial_number || '—'],
+                  ['Date', new Date().toISOString().split('T')[0]],
+                ].map(([label, val]) => (
+                  <div key={label} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0', fontSize: '13px' }}>
+                    <span style={{ color: 'var(--text-muted)' }}>{label}</span>
+                    <span style={{ fontWeight: 600 }}>{val}</span>
+                  </div>
+                ))}
+              </div>
+
+              <InternalChecklistEditor
+                value={wizInternalChecklist}
+                onChange={setWizInternalChecklist}
+              />
+
+              <div className="sign-actions" style={{ marginTop: '16px' }}>
+                <button className="btn-primary" style={{ flex: 1 }} onClick={() => setWizShowInternalChecklist(false)}>
+                  ✅ {language === 'es' ? 'Listo' : 'Done'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {editInternalChecklist && (
+        <div
+          className="modal-overlay"
+          onClick={() => setEditInternalChecklist(null)}
+          style={{
+            position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+            background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(10px)',
+            display: 'flex', justifyContent: 'center', alignItems: 'flex-start',
+            zIndex: 9999, padding: '24px', overflowY: 'auto'
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="sign-page-card"
+            style={{ width: '100%', maxWidth: '640px', margin: 'auto', background: 'var(--bg-elevated, #1e293b)' }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+              <h3 style={{ margin: 0 }}>🔧 {language === 'es' ? 'Checklist Técnica (Interno)' : 'Technical Checklist (Internal)'}</h3>
+              <button className="btn-secondary btn-xs" style={{ padding: '4px 10px' }} onClick={() => setEditInternalChecklist(null)}>✕</button>
+            </div>
+            <div className="contract-details" style={{ background: 'rgba(0,0,0,0.2)', borderRadius: '12px', padding: '12px 16px', margin: '12px 0' }}>
+              {[
+                ['E-Bike Model', editInternalChecklist.bikeModel || '—'],
+                ['E-Bike Serial Number', editInternalChecklist.bikeSerial || '—'],
+                ['Date', editInternalChecklist.deliveryDate],
+              ].map(([label, val]) => (
+                <div key={label} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0', fontSize: '13px' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>{label}</span>
+                  <span style={{ fontWeight: 600 }}>{val}</span>
+                </div>
+              ))}
+            </div>
+
+            <InternalChecklistEditor
+              value={editInternalValue}
+              onChange={setEditInternalValue}
+            />
+
+            <div className="sign-actions" style={{ marginTop: '16px' }}>
+              <button className="btn-secondary" style={{ flex: 1 }} onClick={() => setEditInternalChecklist(null)}>
+                {language === 'es' ? 'Cancelar' : 'Cancel'}
+              </button>
+              <button
+                className="btn-primary"
+                style={{ flex: 2 }}
+                disabled={editInternalSaving}
+                onClick={async () => {
+                  if (!editInternalChecklist) return;
+                  setEditInternalSaving(true);
+                  try {
+                    await persistInternalChecklist({
+                      existingId: editInternalChecklist.existingId,
+                      rentalId: editInternalChecklist.rentalId,
+                      customerName: editInternalChecklist.customerName,
+                      bikeModel: editInternalChecklist.bikeModel,
+                      bikeSerial: editInternalChecklist.bikeSerial,
+                      deliveryDate: editInternalChecklist.deliveryDate,
+                      value: editInternalValue,
+                    });
+                    setEditInternalChecklist(null);
+                    triggerReload();
+                    showToast(language === 'es' ? 'Checklist técnica guardada.' : 'Technical checklist saved.', 'success');
+                  } catch (err) {
+                    console.error('Failed to save internal checklist:', err);
+                    showToast(language === 'es' ? 'Error al guardar la checklist.' : 'Error saving checklist.', 'error');
+                  }
+                  setEditInternalSaving(false);
+                }}
+              >
+                {editInternalSaving ? (language === 'es' ? '⏳ Guardando...' : '⏳ Saving...') : (language === 'es' ? '💾 Guardar' : '💾 Save')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {viewChecklist && (
+        <div
+          className="modal-overlay"
+          onClick={() => setViewChecklist(null)}
+          style={{
+            position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+            background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(10px)',
+            display: 'flex', justifyContent: 'center', alignItems: 'flex-start',
+            zIndex: 9999, padding: '24px', overflowY: 'auto'
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: '100%', maxWidth: '640px', background: 'var(--bg-elevated, #1e293b)',
+              border: '1px solid rgba(255,255,255,0.1)', borderRadius: '16px',
+              padding: '24px', boxShadow: '0 20px 60px rgba(0,0,0,0.4)', margin: 'auto'
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+              <h3 style={{ margin: 0 }}>📋 E-Bike Delivery Checklist</h3>
+              <button className="btn-secondary btn-xs" style={{ padding: '4px 10px' }} onClick={() => setViewChecklist(null)}>✕</button>
+            </div>
+            <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: 0 }}>Customer Acknowledgement &amp; Liability Waiver</p>
+
+            <div className="contract-details" style={{ background: 'rgba(0,0,0,0.2)', borderRadius: '12px', padding: '16px', margin: '16px 0' }}>
+              {[
+                ['E-Bike Model', viewChecklist.bike_model || '—'],
+                ['E-Bike Serial Number', viewChecklist.bike_serial || '—'],
+                ['Date', viewChecklist.delivery_date],
+                ['Battery Charge Level', viewChecklist.battery_level || '—'],
+                ['Customer Name', viewChecklist.customer_name],
+                ['Status', viewChecklist.status === 'completed' ? (language === 'es' ? '✓ Completada' : '✓ Completed') : (language === 'es' ? '⏳ Pendiente' : '⏳ Pending')],
+              ].map(([label, val]) => (
+                <div key={label} style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0', fontSize: '13px', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>{label}</span>
+                  <span style={{ fontWeight: 600 }}>{val}</span>
+                </div>
+              ))}
+            </div>
+
+            {DELIVERY_CHECKLIST_GROUPS.map(group => (
+              <div key={group.key} style={{ marginBottom: '14px' }}>
+                <p style={{ fontSize: '13px', fontWeight: 700, color: 'var(--color-primary)', margin: '0 0 6px' }}>{group.title}</p>
+                {group.items.map(item => (
+                  <p key={item.key} style={{ fontSize: '12px', lineHeight: 1.5, margin: '4px 0', color: 'var(--text-main)' }}>
+                    {group.kind === 'checkbox'
+                      ? <span style={{ color: viewChecklist.items?.[item.key] ? 'var(--color-primary)' : 'var(--text-muted)', fontWeight: 700, marginRight: '6px' }}>{viewChecklist.items?.[item.key] ? '✔' : '☐'}</span>
+                      : <span style={{ color: 'var(--text-muted)', marginRight: '6px' }}>•</span>}
+                    {item.text}
+                  </p>
+                ))}
+              </div>
+            ))}
+
+            <p style={{ fontSize: '12px', fontStyle: 'italic', color: 'var(--text-muted)', margin: '12px 0' }}>
+              By signing below, the customer confirms acceptance of all the aforementioned conditions and declarations.
+            </p>
+
+            <p style={{ fontSize: '13px', fontWeight: 600, margin: '0 0 6px' }}>Customer Signature</p>
+            {viewChecklist.signature_url ? (
+              <img
+                src={viewChecklist.signature_url}
+                alt="signature"
+                style={{ maxWidth: '320px', width: '100%', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px', background: '#fff' }}
+              />
+            ) : (
+              <p style={{ fontSize: '12px', color: 'var(--text-muted)', fontStyle: 'italic' }}>{language === 'es' ? 'Sin firma todavía' : 'Not signed yet'}</p>
+            )}
+            {viewChecklist.completed_at && (
+              <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '8px' }}>
+                {language === 'es' ? 'Aceptada el' : 'Accepted on'} {new Date(viewChecklist.completed_at).toLocaleString()} {language === 'es' ? 'por' : 'by'} {viewChecklist.customer_name}.
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+

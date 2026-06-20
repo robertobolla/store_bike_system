@@ -1,0 +1,43 @@
+                    <button
+                      disabled={backupRunning}
+                      onClick={async () => {
+                        setShowSettingsDropdown(false);
+                        setBackupRunning(true);
+                        showToast(language === 'es' ? '⏳ Generando backup...' : '⏳ Generating backup...');
+                        try {
+                          const bikeMods = await getAllBikeModifications();
+                          const filename = downloadBackupXlsx({
+                            categories, products, productModels, customers, rentals, rentalItems,
+                            payments, sales, saleItems, financingPlans, financingPayments: financingPaymentsData,
+                            expenses, records, bikeModifications: bikeMods, leads, leadCategories: leadCats,
+                            suppliers, supplierProducts, appAccounts, accountNotes, accountEarnings,
+                            platforms, vehicles, transactions: balanceData.txs,
+                          });
+                          showToast((language === 'es' ? '✅ Backup descargado: ' : '✅ Backup downloaded: ') + filename, 'success');
+                        } catch (err) {
+                          console.error('Backup failed:', err);
+                          showToast(language === 'es' ? 'Error al generar el backup.' : 'Backup failed.', 'error');
+                        }
+                        setBackupRunning(false);
+                      }}
+                      style={{
+                        width: '100%',
+                        background: 'transparent',
+                        border: 'none',
+                        color: 'var(--text-bright)',
+                        padding: '10px 12px',
+                        textAlign: 'left',
+                        cursor: backupRunning ? 'wait' : 'pointer',
+                        fontSize: '13px',
+                        fontWeight: 500,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px',
+                        borderRadius: '6px',
+                        transition: 'background 0.2s'
+                      }}
+                      onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(99, 102, 241, 0.15)'}
+                      onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+                    >
+                      {backupRunning ? '⏳' : '📥'} {language === 'es' ? 'Backup a Excel' : 'Backup to Excel'}
+                    </button>

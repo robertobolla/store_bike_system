@@ -1,0 +1,109 @@
+
+                          {/* Delivery checklist (E-bike) */}
+                          {(() => {
+                            const cl = latestRental
+                              ? deliveryChecklists.find(c => c.rental_id === latestRental.id && c.audience === 'customer')
+                              : null;
+                            return (
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '10px' }}>
+                                <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>📋 {language === 'es' ? 'Checklist E-bike:' : 'E-bike Checklist:'}</span>
+                                <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                                  {cl ? (
+                                    <>
+                                      <span style={{
+                                        fontSize: '11px', padding: '2px 8px', borderRadius: '6px',
+                                        background: cl.status === 'completed' ? 'rgba(16,185,129,0.15)' : 'rgba(251,146,60,0.15)',
+                                        color: cl.status === 'completed' ? 'var(--color-primary)' : '#fb923c',
+                                        border: '1px solid rgba(255,255,255,0.08)'
+                                      }}>
+                                        {cl.status === 'completed' ? (language === 'es' ? '✓ Completada' : '✓ Completed') : (language === 'es' ? '⏳ Pendiente' : '⏳ Pending')}
+                                      </span>
+                                      {cl.status === 'completed' ? (
+                                        <button
+                                          className="btn-secondary btn-xs"
+                                          style={{ padding: '2px 8px', height: '22px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px' }}
+                                          onClick={() => setViewChecklist(cl)}
+                                        >
+                                          👁️ {language === 'es' ? 'Ver' : 'View'}
+                                        </button>
+                                      ) : (
+                                        <button
+                                          className="btn-secondary btn-xs"
+                                          style={{ padding: '2px 8px', height: '22px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px' }}
+                                          onClick={async () => {
+                                            const url = `${window.location.origin}${window.location.pathname}?checklist=${cl.id}`;
+                                            try { await navigator.clipboard.writeText(url); } catch { /* ignore */ }
+                                            showToast(language === 'es' ? '🔗 Enlace de checklist copiado' : '🔗 Checklist link copied', 'success');
+                                          }}
+                                        >
+                                          🔗 {language === 'es' ? 'Copiar enlace' : 'Copy link'}
+                                        </button>
+                                      )}
+                                    </>
+                                  ) : (
+                                    <span style={{ color: 'var(--text-muted)', fontSize: '12px', fontStyle: 'italic' }}>
+                                      {language === 'es' ? 'Sin checklist' : 'No checklist'}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })()}
+
+                          {/* Internal technical checklist */}
+                          {(() => {
+                            const icl = latestRental
+                              ? deliveryChecklists.find(c => c.rental_id === latestRental.id && c.audience === 'internal')
+                              : null;
+                            const checkedCount = icl ? INTERNAL_CHECKLIST_ITEM_KEYS.filter(k => icl.items?.[k]).length : 0;
+                            const total = INTERNAL_CHECKLIST_ITEM_KEYS.length;
+                            const openEditor = () => {
+                              if (!latestRental) return;
+                              const bike = products.find(p => p.id === latestRental.bike_id);
+                              setEditInternalChecklist({
+                                rentalId: latestRental.id,
+                                existingId: icl ? icl.id : null,
+                                customerName: `${cust.first_name} ${cust.last_name}`.trim(),
+                                bikeModel: icl?.bike_model || bike?.name || '',
+                                bikeSerial: icl?.bike_serial || bike?.serial_number || '',
+                                deliveryDate: icl?.delivery_date || new Date().toISOString().split('T')[0],
+                              });
+                              setEditInternalValue(icl
+                                ? { battery_level: icl.battery_level || '', items: icl.items || {}, notes: icl.notes || {}, signatureUrl: icl.signature_url, signatureDataUrl: null }
+                                : emptyInternalChecklist());
+                            };
+                            return (
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '10px' }}>
+                                <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>🔧 {language === 'es' ? 'Checklist técnica (interno):' : 'Technical checklist (internal):'}</span>
+                                <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                                  {icl ? (
+                                    <>
+                                      <span style={{
+                                        fontSize: '11px', padding: '2px 8px', borderRadius: '6px',
+                                        background: checkedCount === total ? 'rgba(16,185,129,0.15)' : 'rgba(251,146,60,0.15)',
+                                        color: checkedCount === total ? 'var(--color-primary)' : '#fb923c',
+                                        border: '1px solid rgba(255,255,255,0.08)'
+                                      }}>
+                                        {checkedCount}/{total} {checkedCount === total ? '✓' : ''}
+                                      </span>
+                                      <button
+                                        className="btn-secondary btn-xs"
+                                        style={{ padding: '2px 8px', height: '22px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px' }}
+                                        onClick={openEditor}
+                                      >
+                                        👁️ {language === 'es' ? 'Ver/Editar' : 'View/Edit'}
+                                      </button>
+                                    </>
+                                  ) : (
+                                    <button
+                                      className="btn-secondary btn-xs"
+                                      style={{ padding: '2px 8px', height: '22px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px' }}
+                                      onClick={openEditor}
+                                    >
+                                      ➕ {language === 'es' ? 'Completar' : 'Fill in'}
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })()}

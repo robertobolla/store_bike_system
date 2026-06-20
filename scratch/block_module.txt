@@ -1,0 +1,396 @@
+// DELIVERY CHECKLIST – content & emails
+// Items mirror public/CHECKLIST2-bikeDelivery.pdf
+// ----------------------------------------------------
+// The delivery checklist document is always in English (matches the PDF model).
+const DELIVERY_CHECKLIST_GROUPS: {
+  key: string;
+  title: string;
+  kind: 'checkbox' | 'declaration';
+  items: { key: string; text: string }[];
+}[] = [
+  {
+    key: 'condition',
+    title: 'Condition & Equipment',
+    kind: 'checkbox',
+    items: [
+      {
+        key: 'working_condition',
+        text: 'I confirm that the e-bike has been inspected and delivered in good working condition, including brakes, tyres, wheels, steering, drivetrain, saddle, lights, electrical system, battery security and safety equipment.',
+      },
+      {
+        key: 'accessories',
+        text: 'I confirm that I have received all accessories provided with the rental, including any keys, lock, charger and other listed equipment, and that their condition is satisfactory.',
+      },
+      {
+        key: 'defects_recorded',
+        text: 'I confirm that any existing scratches, damage or cosmetic defects have been identified, recorded and explained to me. Photographs of the e-bike have been taken and attached to the rental record.',
+      },
+      {
+        key: 'instructions',
+        text: 'I confirm that I have received instructions regarding the safe operation of the e-bike, including braking, gear shifting, electric assistance, battery use, lock operation, estimated range, road safety and applicable traffic regulations.',
+      },
+    ],
+  },
+  {
+    key: 'declaration',
+    title: 'Customer Declaration',
+    kind: 'declaration',
+    items: [
+      {
+        key: 'accept_condition',
+        text: 'I acknowledge that I have inspected the e-bike and accept its condition at the time of delivery.',
+      },
+      {
+        key: 'safety_instructions',
+        text: 'I acknowledge that I have received safety instructions, including recommendations regarding helmet use, visibility and compliance with local traffic regulations.',
+      },
+      {
+        key: 'responsible_use',
+        text: 'I accept responsibility for operating the e-bike in a safe and lawful manner during the rental period.',
+      },
+      {
+        key: 'return_condition',
+        text: 'I agree to return the e-bike and all accessories in the same condition as received, excluding normal wear and tear. I understand that I may be charged for loss, theft, damage or missing accessories in accordance with the Rental Agreement.',
+      },
+    ],
+  },
+];
+
+// Only the 'checkbox' groups are individually ticked by the customer; the
+// 'declaration' groups are statements accepted via the signature.
+const DELIVERY_CHECKLIST_CHECKBOX_KEYS = DELIVERY_CHECKLIST_GROUPS
+  .filter(g => g.kind === 'checkbox')
+  .flatMap(g => g.items.map(i => i.key));
+
+// ----------------------------------------------------
+// INTERNAL TECHNICAL INSPECTION CHECKLIST (operator-filled)
+// Mirrors public/Checklist-Technical-inspection.pdf. Items with `input`
+// also show a free-text field stored under notes[input].
+// ----------------------------------------------------
+type InternalChecklistItem = { key: string; text: string; input?: string };
+const INTERNAL_CHECKLIST_GROUPS: { key: string; title: string; items: InternalChecklistItem[] }[] = [
+  { key: 'brakes', title: 'Brakes', items: [
+    { key: 'brake_front', text: 'Front brake operates correctly' },
+    { key: 'brake_rear', text: 'Rear brake operates correctly' },
+    { key: 'brake_noise', text: 'No unusual noises detected' },
+    { key: 'brake_levers', text: 'Brake levers feel firm and responsive' },
+  ]},
+  { key: 'wheels', title: 'Wheels & Tyres', items: [
+    { key: 'tyre_pressure', text: 'Correct tyre pressure on both wheels' },
+    { key: 'tyre_wear', text: 'Tyres show no significant cuts or excessive wear' },
+    { key: 'wheels_secured', text: 'Wheels are properly secured' },
+    { key: 'spokes', text: 'No broken spokes' },
+  ]},
+  { key: 'lights', title: 'Lights & Safety', items: [
+    { key: 'light_front', text: 'Front light operates correctly' },
+    { key: 'light_rear', text: 'Rear light operates correctly' },
+    { key: 'horn', text: 'Horn/Bell operates correctly' },
+    { key: 'reflectors', text: 'Reflectors are present and in good condition' },
+    { key: 'advise_helmet', text: 'Customer has been advised to wear a helmet while riding' },
+    { key: 'advise_reflective', text: 'Customer has been advised to wear reflective clothing' },
+    { key: 'advise_lights', text: 'Customer has been advised to use lights when riding in low-light conditions' },
+  ]},
+  { key: 'drivetrain', title: 'Chain & Drivetrain', items: [
+    { key: 'chain_lube', text: 'Chain is properly lubricated' },
+    { key: 'gears', text: 'Gears shift correctly' },
+    { key: 'pedals', text: 'Pedals are securely attached' },
+    { key: 'pedal_noise', text: 'No unusual noises while pedalling' },
+  ]},
+  { key: 'steering', title: 'Steering & Handlebar', items: [
+    { key: 'handlebar_fastened', text: 'Handlebar is securely fastened' },
+    { key: 'steering_smooth', text: 'Steering turns smoothly' },
+    { key: 'grips', text: 'Grips are in good condition' },
+  ]},
+  { key: 'saddle', title: 'Saddle', items: [
+    { key: 'saddle_height', text: 'Saddle height adjusted for the customer' },
+    { key: 'saddle_fastened', text: 'Saddle is securely fastened' },
+    { key: 'seatpost', text: 'Seat post is properly tightened' },
+  ]},
+  { key: 'electrical', title: 'Electrical System', items: [
+    { key: 'battery_locked', text: 'Battery is securely installed and locked' },
+    { key: 'display', text: 'Display functions correctly' },
+    { key: 'assist', text: 'Electric assistance functions correctly' },
+    { key: 'no_errors', text: 'No visible error codes displayed' },
+  ]},
+  { key: 'accessories', title: 'Accessories Provided', items: [
+    { key: 'acc_lock', text: 'Lock' },
+    { key: 'acc_lock_keys', text: 'Lock keys' },
+    { key: 'acc_battery_keys', text: 'Battery keys' },
+    { key: 'acc_phone_holder', text: 'Phone holder' },
+    { key: 'acc_charger', text: 'Battery charger' },
+    { key: 'acc_pump', text: 'Tyre pump' },
+    { key: 'acc_multitool', text: 'Multi-tool' },
+    { key: 'acc_usb', text: 'USB charging port' },
+    { key: 'acc_other', text: 'Other:', input: 'other_accessory' },
+  ]},
+  { key: 'visual', title: 'Visual Condition', items: [
+    { key: 'frame_inspected', text: 'Frame inspected' },
+    { key: 'fork_inspected', text: 'Fork inspected' },
+    { key: 'battery_casing', text: 'Battery casing inspected' },
+    { key: 'photos_taken', text: 'Photos taken before delivery and attached to rental record' },
+    { key: 'damage_recorded', text: 'Existing scratches or damage recorded:', input: 'existing_damage' },
+  ]},
+  { key: 'briefing', title: 'Customer Briefing', items: [
+    { key: 'brief_brakes', text: 'Brake operation explained' },
+    { key: 'brief_gears', text: 'Gear shifting explained' },
+    { key: 'brief_lock', text: 'Lock usage explained' },
+    { key: 'brief_assist', text: 'Electric assistance explained' },
+    { key: 'brief_range', text: 'Approximate battery range explained' },
+    { key: 'brief_safety', text: 'Basic road safety and traffic rules explained' },
+  ]},
+  { key: 'final', title: 'Final Confirmation', items: [
+    { key: 'certify', text: 'I certify that the above inspection has been completed and that the e-bike was inspected prior to delivery. All applicable items were checked and found to be in satisfactory working condition at the time of handover.' },
+  ]},
+];
+const INTERNAL_CHECKLIST_ITEM_KEYS = INTERNAL_CHECKLIST_GROUPS.flatMap(g => g.items.map(i => i.key));
+
+interface InternalChecklistValue {
+  battery_level: string;
+  items: Record<string, boolean>;
+  notes: Record<string, string>;
+  signatureUrl?: string | null;      // already-saved inspector signature (for display)
+  signatureDataUrl?: string | null;  // freshly drawn signature to upload on save
+}
+const emptyInternalChecklist = (): InternalChecklistValue => ({
+  battery_level: '', items: {},
+  notes: { inspected_date: new Date().toISOString().split('T')[0] },
+  signatureUrl: null, signatureDataUrl: null,
+});
+
+// Reusable editor used both in the rental wizard (step 7) and the customer profile.
+// The checklist is an internal English document, so all its labels are in English.
+function InternalChecklistEditor({ value, onChange }: {
+  value: InternalChecklistValue;
+  onChange: (v: InternalChecklistValue) => void;
+}) {
+  const allChecked = INTERNAL_CHECKLIST_ITEM_KEYS.every(k => value.items[k]);
+  const toggleAll = () => {
+    const next = !allChecked;
+    const items: Record<string, boolean> = {};
+    INTERNAL_CHECKLIST_ITEM_KEYS.forEach(k => { items[k] = next; });
+    onChange({ ...value, items });
+  };
+  const toggleItem = (k: string) => onChange({ ...value, items: { ...value.items, [k]: !value.items[k] } });
+  const setNote = (field: string, val: string) => onChange({ ...value, notes: { ...value.notes, [field]: val } });
+  const checkedCount = INTERNAL_CHECKLIST_ITEM_KEYS.filter(k => value.items[k]).length;
+
+  // Inspector signature (finger / mouse). The drawn image is kept on the canvas
+  // and pushed to the value as a data URL; the save handler uploads it.
+  const sigCanvasRef = useRef<HTMLCanvasElement>(null);
+  const [sigDrawing, setSigDrawing] = useState(false);
+  const [reSign, setReSign] = useState(false);
+  const sigPoint = (canvas: HTMLCanvasElement, e: React.TouchEvent | React.MouseEvent) => {
+    const rect = canvas.getBoundingClientRect();
+    const sx = canvas.width / rect.width, sy = canvas.height / rect.height;
+    if ('touches' in e) return { x: (e.touches[0].clientX - rect.left) * sx, y: (e.touches[0].clientY - rect.top) * sy };
+    return { x: ((e as React.MouseEvent).clientX - rect.left) * sx, y: ((e as React.MouseEvent).clientY - rect.top) * sy };
+  };
+  const sigStart = (e: React.TouchEvent<HTMLCanvasElement> | React.MouseEvent<HTMLCanvasElement>) => {
+    const c = sigCanvasRef.current; if (!c) return;
+    const ctx = c.getContext('2d'); if (!ctx) return;
+    setSigDrawing(true);
+    const { x, y } = sigPoint(c, e); ctx.beginPath(); ctx.moveTo(x, y);
+  };
+  const sigMove = (e: React.TouchEvent<HTMLCanvasElement> | React.MouseEvent<HTMLCanvasElement>) => {
+    if (!sigDrawing) return;
+    const c = sigCanvasRef.current; if (!c) return;
+    const ctx = c.getContext('2d'); if (!ctx) return;
+    const { x, y } = sigPoint(c, e);
+    ctx.lineWidth = 2.5; ctx.lineCap = 'round'; ctx.strokeStyle = '#10b981'; ctx.lineTo(x, y); ctx.stroke();
+  };
+  const sigEnd = () => {
+    setSigDrawing(false);
+    const c = sigCanvasRef.current; if (!c) return;
+    onChange({ ...value, signatureDataUrl: c.toDataURL('image/png') });
+  };
+  const sigClear = () => {
+    const c = sigCanvasRef.current; if (!c) return;
+    const ctx = c.getContext('2d'); if (ctx) ctx.clearRect(0, 0, c.width, c.height);
+    onChange({ ...value, signatureDataUrl: null });
+  };
+
+  return (
+    <div className="checklist-scope">
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', marginBottom: '12px', flexWrap: 'wrap' }}>
+        <div className="checklist-field" style={{ margin: 0, flex: 1, minWidth: '160px' }}>
+          <label>🔋 Battery Charge Level</label>
+          <input type="text" inputMode="numeric" placeholder="e.g. 100%" value={value.battery_level} onChange={(e) => onChange({ ...value, battery_level: e.target.value })} />
+        </div>
+        <button type="button" className="btn-secondary" style={{ whiteSpace: 'nowrap', alignSelf: 'flex-end' }} onClick={toggleAll}>
+          {allChecked ? '☐ Uncheck all' : '☑ Check all'}
+        </button>
+      </div>
+      <p style={{ fontSize: '12px', color: 'var(--text-muted)', margin: '0 0 10px' }}>
+        {checkedCount}/{INTERNAL_CHECKLIST_ITEM_KEYS.length} checked
+      </p>
+
+      {INTERNAL_CHECKLIST_GROUPS.map(group => (
+        <div key={group.key} className="checklist-group">
+          <p className="checklist-group-title">{group.title}</p>
+          {group.items.map(item => (
+            <div key={item.key}>
+              <label className={`checklist-item ${value.items[item.key] ? 'checked' : ''}`}>
+                <input type="checkbox" checked={!!value.items[item.key]} onChange={() => toggleItem(item.key)} />
+                <span>{item.text}</span>
+              </label>
+              {item.input && (
+                <input
+                  type="text"
+                  value={value.notes[item.input] ?? ''}
+                  onChange={(e) => setNote(item.input!, e.target.value)}
+                  placeholder="Detail..."
+                  style={{ width: '100%', padding: '8px 10px', margin: '2px 0 8px', border: '1px solid var(--border-color)', borderRadius: '8px', background: 'rgba(0,0,0,0.2)', color: 'inherit', fontSize: '13px' }}
+                />
+              )}
+            </div>
+          ))}
+          {group.key === 'final' && (
+            <>
+              <div className="checklist-field" style={{ marginTop: '8px' }}>
+                <label>Inspected By</label>
+                <input type="text" value={value.notes.inspected_by ?? ''} onChange={(e) => setNote('inspected_by', e.target.value)} placeholder="Name" />
+              </div>
+              <div className="checklist-field">
+                <label>✍️ Signature</label>
+                {value.signatureUrl && !reSign ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', alignItems: 'flex-start' }}>
+                    <img src={value.signatureUrl} alt="signature" style={{ maxWidth: '280px', width: '100%', border: '1px solid var(--border-color)', borderRadius: '8px', background: '#fff' }} />
+                    <button type="button" className="btn-secondary btn-xs" onClick={() => setReSign(true)}>✏️ Re-sign</button>
+                  </div>
+                ) : (
+                  <>
+                    <canvas
+                      ref={sigCanvasRef}
+                      width={480}
+                      height={150}
+                      style={{ width: '100%', height: '150px', border: '2px dashed var(--border-color)', borderRadius: '10px', background: 'rgba(0,0,0,0.2)', cursor: 'crosshair', touchAction: 'none' }}
+                      onMouseDown={sigStart}
+                      onMouseMove={sigMove}
+                      onMouseUp={sigEnd}
+                      onMouseLeave={() => sigDrawing && sigEnd()}
+                      onTouchStart={sigStart}
+                      onTouchMove={sigMove}
+                      onTouchEnd={sigEnd}
+                    />
+                    <button type="button" className="btn-secondary btn-xs" style={{ marginTop: '6px' }} onClick={sigClear}>🗑️ Clear signature</button>
+                  </>
+                )}
+              </div>
+              <div className="checklist-field">
+                <label>Date</label>
+                <input
+                  type="text"
+                  readOnly
+                  value={value.notes.inspected_date || new Date().toISOString().split('T')[0]}
+                  style={{ opacity: 0.7, cursor: 'default' }}
+                />
+              </div>
+            </>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Localized framing strings for the checklist emails. The checklist DOCUMENT
+// itself (titles, field labels, acknowledgement items, signature) is always in
+// English; only the surrounding email copy follows the configured language.
+const CHECKLIST_EMAIL_T = {
+  es: {
+    inviteSubject: 'Checklist de entrega de tu e-bike - The Fast Sheep',
+    greeting: (n: string) => `Hola ${n},`,
+    intro: (m: string, s: string) => `Antes de retirar tu e-bike <strong>${m}</strong> (${s}), por favor revisá y confirmá el checklist de entrega.`,
+    button: 'Abrir checklist y firmar',
+    fallback: 'Si el botón no funciona, copiá y pegá este enlace en tu navegador:',
+    copySubject: 'Copia de tu checklist de entrega aceptado - The Fast Sheep',
+    copyIntro: (n: string) => `Hola ${n}, a continuación encontrarás una copia del checklist de entrega que aceptaste y firmaste.`,
+  },
+  en: {
+    inviteSubject: 'E-Bike Delivery Checklist - The Fast Sheep',
+    greeting: (n: string) => `Hi ${n},`,
+    intro: (m: string, s: string) => `Before taking your e-bike <strong>${m}</strong> (${s}), please review and confirm the delivery checklist.`,
+    button: 'Open checklist &amp; sign',
+    fallback: 'If the button does not work, copy and paste this link into your browser:',
+    copySubject: 'Copy of your accepted delivery checklist - The Fast Sheep',
+    copyIntro: (n: string) => `Hi ${n}, below is a copy of the delivery checklist you accepted and signed.`,
+  },
+  pt: {
+    inviteSubject: 'Checklist de entrega da tua e-bike - The Fast Sheep',
+    greeting: (n: string) => `Olá ${n},`,
+    intro: (m: string, s: string) => `Antes de levantar a tua e-bike <strong>${m}</strong> (${s}), por favor revê e confirma o checklist de entrega.`,
+    button: 'Abrir checklist e assinar',
+    fallback: 'Se o botão não funcionar, copia e cola este link no teu navegador:',
+    copySubject: 'Cópia do teu checklist de entrega aceite - The Fast Sheep',
+    copyIntro: (n: string) => `Olá ${n}, em baixo encontras uma cópia do checklist de entrega que aceitaste e assinaste.`,
+  },
+} as const;
+
+// Email 1: invitation with link to the public checklist page (localized cover note)
+function sendDeliveryChecklistInviteEmail(checklist: DeliveryChecklist, url: string, lang: 'es' | 'en' | 'pt') {
+  const t = CHECKLIST_EMAIL_T[lang] ?? CHECKLIST_EMAIL_T.en;
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 560px; margin: 0 auto; color: #1f2937;">
+      <div style="text-align:center; padding: 16px 0;">
+        <div style="font-size: 28px;">🐏</div>
+        <h2 style="margin: 4px 0;">The Fast Sheep</h2>
+      </div>
+      <p>${t.greeting(checklist.customer_name)}</p>
+      <p>${t.intro(checklist.bike_model, checklist.bike_serial)}</p>
+      <div style="text-align:center; margin: 28px 0;">
+        <a href="${url}" style="background:#10b981; color:#fff; text-decoration:none; padding: 14px 28px; border-radius: 10px; font-weight: 600; display:inline-block;">
+          ${t.button}
+        </a>
+      </div>
+      <p style="font-size: 12px; color:#6b7280;">${t.fallback}<br>
+        <a href="${url}" style="color:#10b981;">${url}</a></p>
+      <hr style="border:none; border-top:1px solid #e5e7eb; margin: 20px 0;">
+      <p style="font-size: 11px; color:#9ca3af; text-align:center;">THE FAST SHEEP LIMITED — 802654<br>www.thefastsheep.com · +353 83 042 9732</p>
+    </div>`;
+  executeEmailSend(checklist.customer_email, t.inviteSubject, html);
+}
+
+// Email 2: accepted copy of the document. Subject + intro follow the configured
+// language; the reproduced document below stays in English (matches the PDF).
+function sendDeliveryChecklistCopyEmail(
+  checklist: DeliveryChecklist,
+  payload: { items: Record<string, boolean>; battery_level: string; signature_url: string },
+  lang: 'es' | 'en' | 'pt'
+) {
+  const t = CHECKLIST_EMAIL_T[lang] ?? CHECKLIST_EMAIL_T.en;
+  const subject = t.copySubject;
+
+  const groupsHtml = DELIVERY_CHECKLIST_GROUPS.map(g => `
+    <h3 style="font-size:14px; margin: 18px 0 6px;">${g.title}</h3>
+    ${g.items.map(it => g.kind === 'checkbox'
+      ? `<p style="margin: 4px 0; font-size: 12px; line-height: 1.5;"><span style="color:#10b981; font-weight:700;">✔</span> ${it.text}</p>`
+      : `<p style="margin: 4px 0; font-size: 12px; line-height: 1.5;">${it.text}</p>`).join('')}
+  `).join('');
+
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #1f2937;">
+      <div style="text-align:center; padding: 16px 0;">
+        <div style="font-size: 28px;">🐏</div>
+        <h2 style="margin: 4px 0;">The Fast Sheep</h2>
+        <p style="margin:0; font-size: 13px; color:#6b7280;">E-Bike Delivery Checklist</p>
+        <p style="margin:0; font-size: 12px; color:#9ca3af;">Customer Acknowledgement &amp; Liability Waiver</p>
+      </div>
+      <p style="font-size: 13px;">${t.copyIntro(checklist.customer_name)}</p>
+      <table style="width:100%; font-size: 13px; border-collapse: collapse; margin-bottom: 8px;">
+        <tr><td style="padding:4px 0; color:#6b7280;">E-Bike Model</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.bike_model}</td></tr>
+        <tr><td style="padding:4px 0; color:#6b7280;">E-Bike Serial Number</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.bike_serial}</td></tr>
+        <tr><td style="padding:4px 0; color:#6b7280;">Date</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.delivery_date}</td></tr>
+        <tr><td style="padding:4px 0; color:#6b7280;">Battery Charge Level</td><td style="padding:4px 0; text-align:right; font-weight:600;">${payload.battery_level || '—'}</td></tr>
+        <tr><td style="padding:4px 0; color:#6b7280;">Customer Name</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.customer_name}</td></tr>
+      </table>
+      ${groupsHtml}
+      <p style="font-size: 12px; line-height: 1.5; margin: 14px 0;">By signing below, the customer confirms acceptance of all the aforementioned conditions and declarations.</p>
+      <h3 style="font-size:14px; margin: 18px 0 6px;">Customer Signature</h3>
+      <img src="${payload.signature_url}" alt="signature" style="max-width: 320px; border:1px solid #e5e7eb; border-radius: 8px; background:#fff;" />
+      <p style="font-size: 12px; color:#6b7280; margin-top: 8px;">Accepted on ${checklist.delivery_date} by ${checklist.customer_name}.</p>
+      <hr style="border:none; border-top:1px solid #e5e7eb; margin: 20px 0;">
+      <p style="font-size: 11px; color:#9ca3af; text-align:center;">THE FAST SHEEP LIMITED — 802654<br>Explore the world and enjoy cycling<br>www.thefastsheep.com · +353 83 042 9732 · T23 AT2P</p>
+    </div>`;
+  executeEmailSend(checklist.customer_email, subject, html);
+}
+

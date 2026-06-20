@@ -22,6 +22,8 @@ import {
   getPayments, insertPayment, deletePayment,
   getExpenses, insertExpense,
   uploadRentalPhoto, uploadRiderDocument, uploadContractPhoto, uploadSignatureImage,
+  uploadChecklistSignature, createDeliveryChecklist, getDeliveryChecklist, getDeliveryChecklists, submitDeliveryChecklist,
+  createInternalChecklist, updateDeliveryChecklist,
   getLeadCategories, getLeads, upsertLead, deleteLead, insertLeadCategory,
   getSuppliers, upsertSupplier, deleteSupplier, getSupplierProducts, upsertSupplierProduct, deleteSupplierProduct,
   getPlatforms, getVehicles, getAppAccounts, upsertAppAccount, deleteAppAccount, insertPlatform, insertVehicle, updatePlatform, deletePlatform, updateVehicle, deleteVehicle,
@@ -40,8 +42,6 @@ import {
   getTaskCards, upsertTaskCard, deleteTaskCard,
   getTaskItems, upsertTaskItem, deleteTaskItem,
   getColorTags, upsertColorTag, deleteColorTag,
-  uploadChecklistSignature, createDeliveryChecklist, getDeliveryChecklist, getDeliveryChecklists, submitDeliveryChecklist,
-  createInternalChecklist, updateDeliveryChecklist,
 } from './db';
 import type { AllowedEmail, BikeModification, DeliveryChecklist } from './db';
 import { downloadBackupXlsx } from './backup';
@@ -274,6 +274,7 @@ async function executeEmailSend(to: string, subject: string, html: string) {
   }
 }
 
+// ----------------------------------------------------
 // DELIVERY CHECKLIST – content & emails
 // Items mirror public/CHECKLIST2-bikeDelivery.pdf
 // ----------------------------------------------------
@@ -669,7 +670,6 @@ function sendDeliveryChecklistCopyEmail(
     </div>`;
   executeEmailSend(checklist.customer_email, subject, html);
 }
-
 
 // ----------------------------------------------------
 // EMAIL TEMPLATES & MOCK DELIVERY SYSTEM (Resend ready)
@@ -2972,6 +2972,11 @@ USING (true);`;
     // Dynamic seasonality from real rental data
     const monthCounts: Record<number, number> = {};
     rentals.forEach(r => {
+      if (!r.bike_id || !r.customer_id) return;
+      const bikeExists = products.some(p => p.id === r.bike_id);
+      const customerExists = customers.some(c => c.id === r.customer_id);
+      if (!bikeExists || !customerExists) return;
+
       const m = new Date(r.start_date).getMonth();
       monthCounts[m] = (monthCounts[m] || 0) + 1;
     });
@@ -3704,7 +3709,7 @@ USING (true);`;
       : (prefixes.find(p => p.prefix === (catId === catBikeId ? 'B-' : catId === catBattId ? 'BAT-' : catId === catLockId ? 'L-' : ''))?.id ?? prefixes.find(p => p.prefix === 'B-')?.id ?? '');
     setProdFormCategory(catId);
     setProdFormPrefixId(prefId);
-    const vatApplied = (prod?.custom_field_values?.vat_applied ?? prod?.custom_field_values?.bat_applied) === true;
+    const vatApplied = prod?.custom_field_values?.vat_applied === true;
     setProdFormAddVat(vatApplied);
     // When VAT was applied, the input shows the base cost; price_paid already includes the tax.
     setProdFormPricePaid(vatApplied ? ((prod?.custom_field_values?.cost_base as number) ?? prod?.price_paid ?? 1000) : (prod?.price_paid ?? 1000));
@@ -4170,7 +4175,7 @@ USING (true);`;
   const [quickAddEmail, setQuickAddEmail] = useState('');
   const [quickAddNationality, setQuickAddNationality] = useState('Brasil');
   const [quickAddNotes, setQuickAddNotes] = useState('');
-  const [quickAddSource, setQuickAddSource] = useState<'wizard' | 'edit'>('wizard');
+  const [quickAddSource, setQuickAddSource] = useState<'wizard' | 'edit' | 'customers'>('wizard');
 
   // ----------------------------------------------------------
   // CONDITIONAL REFERRAL LOGIC
@@ -4418,7 +4423,7 @@ USING (true);`;
         setWizRefUserQuery(displayName);
         setWizRefUserSelected(newRider);
         setWizReferral(`Usuario: ${displayName}`);
-      } else {
+      } else if (quickAddSource === 'edit') {
         setEditRefUserQuery(displayName);
         setEditRefUserSelected(newRider);
         setEditReferral(`Usuario: ${displayName}`);
@@ -4808,9 +4813,9 @@ USING (true);`;
         condition_photos: conditionPhotoUrls,
         instagram_photos: instagramPhotoUrls,
         has_kit: wizHasKit,
-        kit_details: wizHasKit && wizKitProductIds.length > 0
-          ? wizKitProductIds.map(id => { const p = products.find(pr => pr.id === id); return p ? `${p.serial_number} (${p.name})` : ''; }).filter(Boolean).join(', ')
-          : wizKitDetails,
+        // Kit items are tracked as rental_items and listed on the card from there; kit_details is
+        // reserved for free-text notes only, to avoid duplicating the item list.
+        kit_details: wizKitDetails,
         deposit_refunded: null, damage_report: null, created_at: new Date().toISOString(),
         deposit_received_via: wizDepositPaymentMethod,
       };
@@ -4866,26 +4871,9 @@ USING (true);`;
         if (!kitProduct) continue;
         const dist = kitProduct.custom_field_values?.location_distribution as Record<string, number> | undefined;
         const totalQty = dist ? Object.values(dist).reduce((a, b) => a + b, 0) : 0;
-        if (dist && totalQty > 1) {
-          const splitId = crypto.randomUUID();
-          const mainLoc = Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central';
-          updates.push(upsertProduct({
-            ...kitProduct,
-            id: splitId,
-            status: 'Rentada',
-            custom_field_values: { ...kitProduct.custom_field_values, location: mainLoc, location_distribution: undefined },
-          }));
-          const updatedDist = { ...dist };
-          const locToDecrement = Object.keys(updatedDist).find(k => updatedDist[k] > 0) || mainLoc;
-          updatedDist[locToDecrement] = (updatedDist[locToDecrement] || 1) - 1;
-          Object.keys(updatedDist).forEach(k => { if (updatedDist[k] <= 0) delete updatedDist[k]; });
-          const newTotal = Object.values(updatedDist).reduce((a, b) => a + b, 0);
-          if (newTotal <= 0) {
-            updates.push(upsertProduct({ ...kitProduct, status: 'Rentada', custom_field_values: { ...kitProduct.custom_field_values, location_distribution: undefined } }));
-          } else {
-            updates.push(upsertProduct({ ...kitProduct, custom_field_values: { ...kitProduct.custom_field_values, location_distribution: updatedDist } }));
-          }
-          resolvedKitIds.push(splitId);
+        if (dist && totalQty >= 1) {
+          // Consolidated: reference it via rental_item only; do not mutate the product.
+          resolvedKitIds.push(kitId);
         } else {
           updates.push(upsertProduct({ ...kitProduct, status: 'Rentada' }));
           resolvedKitIds.push(kitId);
@@ -4978,7 +4966,6 @@ USING (true);`;
         console.error('Failed to create internal checklist:', err);
       }
 
-
       // Reset wizard
       setWizBikeId(''); setWizBatteryIds([]); setWizLockId(''); setWizGigAccountId(null);
       setWizFirstName(''); setWizLastName(''); setWizEmail('');
@@ -4990,17 +4977,13 @@ USING (true);`;
       setWizInstagramFiles([]); setWizInstagramPreviews([]);
       setWizIdDocFile(null); setWizIdDocPreview('');
       setWizContractMode(null); setWizPhysicalContractFiles([]); setWizPhysicalContractPreviews([]);
-      setWizUploadingEvidence(false);
       setWizSendDeliveryChecklist(true);
-      setWizInternalChecklist(emptyInternalChecklist());
-      setWizShowInternalChecklist(false);
+      setWizInternalChecklist(emptyInternalChecklist()); setWizShowInternalChecklist(false);
+      setWizUploadingEvidence(false);
       setWizardStep(1); triggerReload(); setCurrentTab('rental_wizard'); setShowRentalWizard(false);
       showToast('¡Alquiler registrado exitosamente!', 'success');
     } catch (err) {
       setWizUploadingEvidence(false);
-      setWizSendDeliveryChecklist(true);
-      setWizInternalChecklist(emptyInternalChecklist());
-      setWizShowInternalChecklist(false);
       showToast('Error al registrar el alquiler. Intenta de nuevo.', 'error');
     }
   };
@@ -5401,7 +5384,6 @@ USING (true);`;
       </div>
     );
   }
-
 
   // Render signing page if ?firmar= is present (no auth required)
   if (signRentalId) {
@@ -6466,8 +6448,12 @@ USING (true);`;
                                   {tx.category}
                                 </span>
                               </td>
-                              <td>
-                                {tx.description}
+                              <td
+                                onClick={() => setTxDetail(tx)}
+                                title={language === 'es' ? 'Ver detalle completo' : 'View full detail'}
+                                style={{ cursor: 'pointer' }}
+                              >
+                                {tx.description.length > 60 ? `${tx.description.slice(0, 60)}...` : tx.description}
                               </td>
                               <td>
                                 {tx.received_via ? (
@@ -7589,6 +7575,74 @@ USING (true);`;
                     )}
                   </div>
 
+                  {/* Section 3b: Delivery Checklist (customer) */}
+                  <div className="evidence-section">
+                    <div className="evidence-section-title">
+                      ✅ {language === 'es' ? 'Checklist de Entrega (Cliente)' : 'Delivery Checklist (Customer)'}
+                    </div>
+                    <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '12px' }}>
+                      {language === 'es'
+                        ? 'Se enviará al rider un correo con un enlace para revisar el estado de la e-bike, marcar su conformidad y firmar digitalmente. Al enviarlo recibirá una copia del documento aceptado.'
+                        : 'The rider will receive an email with a link to review the e-bike condition, confirm acceptance and sign digitally. On submission they receive a copy of the accepted document.'}
+                    </p>
+                    <label
+                      style={{
+                        display: 'flex', alignItems: 'flex-start', gap: '10px', cursor: wizEmail ? 'pointer' : 'not-allowed',
+                        padding: '12px', borderRadius: '10px', border: '1px solid var(--border-color)',
+                        background: wizSendDeliveryChecklist && wizEmail ? 'rgba(16,185,129,0.08)' : 'transparent',
+                        opacity: wizEmail ? 1 : 0.6,
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={wizSendDeliveryChecklist && !!wizEmail}
+                        disabled={!wizEmail}
+                        onChange={(e) => setWizSendDeliveryChecklist(e.target.checked)}
+                        style={{ marginTop: '2px', width: '18px', height: '18px', accentColor: 'var(--color-primary)' }}
+                      />
+                      <span style={{ fontSize: '13px' }}>
+                        <strong>{language === 'es' ? 'Enviar checklist de entrega al cliente por email' : 'Email the delivery checklist to the customer'}</strong>
+                        <br />
+                        <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                          {wizEmail
+                            ? (language === 'es' ? `Se enviará a ${wizEmail} al confirmar el alquiler.` : `Will be sent to ${wizEmail} when the rental is confirmed.`)
+                            : (language === 'es' ? '⚠️ Agrega el email del rider para habilitar el envío.' : '⚠️ Add the rider email to enable sending.')}
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+
+                  {/* Section 3c: Internal Technical Inspection Checklist */}
+                  <div className="evidence-section">
+                    <div className="evidence-section-title">
+                      🔧 {language === 'es' ? 'Checklist Técnica (Interno)' : 'Technical Checklist (Internal)'}
+                    </div>
+                    <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '12px' }}>
+                      {language === 'es'
+                        ? 'Inspección técnica previa a la entrega (uso interno). Podés completarla ahora o más tarde desde el expediente del rider.'
+                        : 'Pre-delivery technical inspection (internal use). You can complete it now or later from the rider profile.'}
+                    </p>
+                    {(() => {
+                      const done = INTERNAL_CHECKLIST_ITEM_KEYS.filter(k => wizInternalChecklist.items[k]).length;
+                      const total = INTERNAL_CHECKLIST_ITEM_KEYS.length;
+                      return (
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                          <span style={{
+                            fontSize: '12px', padding: '3px 10px', borderRadius: '6px',
+                            background: done > 0 ? 'rgba(16,185,129,0.12)' : 'rgba(255,255,255,0.05)',
+                            color: done > 0 ? 'var(--color-primary)' : 'var(--text-muted)',
+                            border: '1px solid rgba(255,255,255,0.08)'
+                          }}>
+                            {done}/{total} {language === 'es' ? 'marcados' : 'checked'}
+                          </span>
+                          <button type="button" className="btn-secondary" onClick={() => setWizShowInternalChecklist(true)}>
+                            📝 {language === 'es' ? 'Completar checklist' : 'Fill in checklist'}
+                          </button>
+                        </div>
+                      );
+                    })()}
+                  </div>
+
                   {/* Section 4: Instagram Photos */}
                   <div className="evidence-section">
                     <div className="evidence-section-title">
@@ -7970,7 +8024,16 @@ USING (true);`;
                               const countDisp = group.filter(p => p.status === 'Disponible').length;
                               const countReqService = group.filter(p => p.status === 'Disponible' && p.maintenance_status === 'Requiere Service').length;
                               const countReviewed = group.filter(p => p.status === 'Disponible' && p.maintenance_status === 'Al día' && isWithinLast30Days(p.last_service_date)).length;
-                              const countRent = group.filter(p => p.status === 'Rentada').length;
+                              const groupProductIds = new Set(group.map(p => p.id));
+                              // For consolidated products, count rented units via active rental_items
+                              // (split products may not always reflect correct status after returns/re-rentals)
+                              const countRentFromItems = isConsolidated
+                                ? (rentalItems || []).filter(ri =>
+                                    groupProductIds.has(ri.product_id) &&
+                                    (rentals || []).some(r => r.id === ri.rental_id && r.status === 'Activo')
+                                  ).length
+                                : 0;
+                              const countRent = isConsolidated ? countRentFromItems : group.filter(p => p.status === 'Rentada').length;
                               const countShop = group.filter(p => p.status === 'Mantenimiento').length;
                               const countLost = group.filter(p => p.status === 'Robada' || p.status === 'Perdida' || p.status === 'Perdida/Garda').length;
                               const countSold = group.filter(p => p.status === 'Vendida' || p.status === 'Financiada').length;
@@ -8107,9 +8170,7 @@ USING (true);`;
                                         </span>
                                       );
                                     })() : (() => {
-                                      const displayRent = isConsolidated
-                                        ? (rentals || []).filter(r => group.some(p => p.id === r.bike_id) && r.status === 'Activo').length
-                                        : countRent;
+                                      const displayRent = countRent;
                                       const displayShop = isConsolidated ? countShop : countShop;
                                       const displayLost = isConsolidated ? countLost : countLost;
                                       const displaySold = isConsolidated ? countSold : countSold;
@@ -8639,12 +8700,77 @@ USING (true);`;
                       <button className="btn-secondary" onClick={() => { setCatFormNameEs(''); setCatFormNameEn(''); setModalType('category'); }}>📁 {t.addCategory}</button>
                     </div>
                     <input className="form-control filter-input" placeholder={t.searchPlaceholder} value={searchStock} onChange={e => setSearchStock(e.target.value)} />
-                    <select className="form-control" style={{ width: 'auto' }} value={filterCategory} onChange={e => setFilterCategory(e.target.value)}>
-                      <option value="all">{language === 'es' ? 'Todas Categorías' : 'All Categories'}</option>
-                      {(categories || [])
-                        .filter(c => c && c.id)
-                        .map(c => <option key={c.id} value={c.id}>{language === 'es' ? (c.name_es || c.name_en || '') : (c.name_en || c.name_es || '')}</option>)}
-                    </select>
+                    <div className="filter-row-group" style={{ marginLeft: 'auto' }}>
+                      <select className="form-control" style={{ width: 'auto' }} value={filterCategory} onChange={e => setFilterCategory(e.target.value)}>
+                        <option value="all">{language === 'es' ? 'Todas Categorías' : 'All Categories'}</option>
+                        {(categories || [])
+                          .filter(c => c && c.id)
+                          .map(c => <option key={c.id} value={c.id}>{language === 'es' ? (c.name_es || c.name_en || '') : (c.name_en || c.name_es || '')}</option>)}
+                      </select>
+
+                      {/* Column Visibility Picker */}
+                      <div className="col-vis-wrapper">
+                        <button
+                          className={`col-vis-btn ${showColVisPicker ? 'active' : ''}`}
+                          onClick={() => setShowColVisPicker(v => !v)}
+                          title={language === 'es' ? 'Columnas visibles' : 'Visible columns'}
+                        >
+                          ⊞ {language === 'es' ? 'Columnas' : 'Columns'}
+                        </button>
+                        {showColVisPicker && (
+                          <>
+                            <div
+                              style={{ position: 'fixed', inset: 0, zIndex: 499 }}
+                              onClick={() => setShowColVisPicker(false)}
+                            />
+                            <div className="col-vis-dropdown">
+                              <div className="col-vis-dropdown-header">
+                                {language === 'es' ? 'Columnas visibles' : 'Visible columns'}
+                              </div>
+                              {/* Always-locked columns */}
+                              {[
+                                { key: '_code',  label: language === 'es' ? '🔒 Código' : '🔒 Code' },
+                                { key: '_brand', label: language === 'es' ? '🔒 Marca / Modelo' : '🔒 Brand / Model' },
+                                { key: '_actions', label: language === 'es' ? '🔒 Acciones' : '🔒 Actions' },
+                              ].map(col => (
+                                <div key={col.key} className="col-vis-item locked checked">
+                                  <div className="col-vis-check">✓</div>
+                                  <span>{col.label}</span>
+                                </div>
+                              ))}
+                              {/* Toggleable columns */}
+                              {[
+                                { key: 'location',      label: language === 'es' ? '📍 Ubicación'       : '📍 Location' },
+                                { key: 'price',         label: language === 'es' ? '💶 Precio Venta'      : '💶 Sale Price' },
+                                { key: 'cost',          label: language === 'es' ? '💰 Costo'             : '💰 Cost' },
+                                { key: 'condition',     label: language === 'es' ? '🔧 Condición'        : '🔧 Condition' },
+                                { key: 'status',        label: language === 'es' ? '📌 Estado'            : '📌 Status' },
+                                { key: 'frame_serial',  label: language === 'es' ? '🔢 Número de Cuadro' : '🔢 Frame Serial' },
+                                { key: 'motor',         label: language === 'es' ? '⚙️ Número de Motor'  : '⚙️ Motor Serial' },
+                                { key: 'odometer',      label: language === 'es' ? '📏 Kilometraje'       : '📏 Odometer' },
+                                { key: 'purchase_date', label: language === 'es' ? '🗓️ Fecha Compra'      : '🗓️ Purchase Date' },
+                                { key: 'arrival_date',  label: language === 'es' ? '🛬 Fecha Arribo'      : '🛬 Arrival Date' },
+                                { key: 'assembly_date', label: language === 'es' ? '🔩 Fecha Armado'      : '🔩 Assembly Date' },
+                                { key: 'modifications', label: language === 'es' ? '🛠️ Modificaciones'   : '🛠️ Modifications' },
+                                { key: 'roi',           label: '📊 ROI' },
+                              ].map(col => {
+                                const isChecked = !!stockVisibleCols[col.key];
+                                return (
+                                  <div
+                                    key={col.key}
+                                    className={`col-vis-item ${isChecked ? 'checked' : ''}`}
+                                    onClick={() => setStockVisibleCols(prev => ({ ...prev, [col.key]: !isChecked }))}
+                                  >
+                                    <div className="col-vis-check">{isChecked ? '✓' : ''}</div>
+                                    <span>{col.label}</span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    </div>
                   </div>
 
                   {/* Stock table */}
@@ -8742,7 +8868,12 @@ USING (true);`;
                               const countDisp = isConsolidated ? totalCount : group.filter(p => p.status === 'Disponible').length;
                               const countReqService = isConsolidated ? 0 : group.filter(p => p.status === 'Disponible' && p.maintenance_status === 'Requiere Service').length;
                               const countReviewed = isConsolidated ? 0 : group.filter(p => p.status === 'Disponible' && p.maintenance_status === 'Al día' && isWithinLast30Days(p.last_service_date)).length;
-                              const countRent = isConsolidated ? 0 : group.filter(p => p.status === 'Rentada').length;
+                              const groupProductIds = new Set(group.map(p => p.id));
+                              const countRentFromItems = (rentalItems || []).filter(ri =>
+                                groupProductIds.has(ri.product_id) &&
+                                (rentals || []).some(r => r.id === ri.rental_id && r.status === 'Activo')
+                              ).length;
+                              const countRent = isConsolidated ? countRentFromItems : group.filter(p => p.status === 'Rentada').length;
                               const countShop = isConsolidated ? 0 : group.filter(p => p.status === 'Mantenimiento').length;
 
                               return (
@@ -8877,9 +9008,7 @@ USING (true);`;
                                       );
                                     })() : (() => {
                                       // "Stock" here = active stock only (sold/lost/stolen are already excluded from this tab).
-                                      const displayRent = isConsolidated
-                                        ? (rentals || []).filter(r => group.some(p => p.id === r.bike_id) && r.status === 'Activo').length
-                                        : countRent;
+                                      const displayRent = countRent;
                                       const displayShop = isConsolidated ? group.filter(p => p.status === 'Mantenimiento').length : countShop;
                                       const displayDisp = isConsolidated
                                         ? Math.max(0, totalCount - displayRent - displayShop)
@@ -10200,7 +10329,7 @@ USING (true);`;
                                     <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
                                       {activeRental && (
                                         <>
-                                          <button className="btn-secondary btn-xs" onClick={() => setActiveCustomerId(activeRental.customer_id)}>
+                                          <button className="btn-secondary btn-xs" onClick={() => { setActiveCustomerId(activeRental.customer_id); setProfileRentalId(null); }}>
                                             📋 {language === 'es' ? 'Ver Expediente' : 'View Profile'}
                                           </button>
                                           <button className="btn-danger btn-xs" onClick={() => openReturnModal(activeRental)}>
@@ -10312,6 +10441,22 @@ USING (true);`;
                       <input className="form-control filter-input" placeholder={t.searchPlaceholder} value={searchRider} onChange={e => setSearchRider(e.target.value)} style={{ margin: 0 }} />
                       <span style={{ fontSize: '13px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{customers.length} {language === 'es' ? 'riders registrados' : 'riders registered'}</span>
                     </div>
+                    <button
+                      className="btn-primary"
+                      onClick={() => {
+                        setQuickAddFirstName('');
+                        setQuickAddLastName('');
+                        setQuickAddPhone('');
+                        setQuickAddEmail('');
+                        setQuickAddNationality('Brasil');
+                        setQuickAddNotes('');
+                        setQuickAddSource('customers');
+                        setQuickAddRiderModalOpen(true);
+                      }}
+                      style={{ height: '38px', borderRadius: '8px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                    >
+                      👤 {language === 'es' ? 'Crear Usuario' : 'Create User'}
+                    </button>
                   </div>
                   <div className="glass-card">
                     <div className="table-container">
@@ -10440,7 +10585,7 @@ USING (true);`;
             return (
               <div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-                  <button className="btn-secondary btn-xs" onClick={() => setActiveCustomerId(null)}>
+                  <button className="btn-secondary btn-xs" onClick={() => { setActiveCustomerId(null); setProfileRentalId(null); }}>
                     ← {language === 'es' ? 'Volver a Clientes' : 'Back to Customers'}
                   </button>
                   {activeRentals.length > 0 && (() => {
@@ -11227,7 +11372,6 @@ USING (true);`;
                               )}
                             </div>
                           </div>
-
 
                           {/* Delivery checklist (E-bike) */}
                           {(() => {
@@ -14371,6 +14515,31 @@ USING (true);`;
                         <button className="btn-secondary btn-xs" onClick={() => setUserModalOpen(false)}>✕</button>
                       </div>
                       <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                        <div className="form-group">
+                          <label className="form-label">{language === 'es' ? 'Código de Usuario' : 'User Code'} *</label>
+                          <div style={{ display: 'flex' }}>
+                            <span style={{ 
+                              background: 'rgba(255,255,255,0.06)', 
+                              border: '1px solid var(--border-color)', 
+                              borderRight: 'none', 
+                              padding: '0 12px', 
+                              display: 'flex', 
+                              alignItems: 'center', 
+                              borderTopLeftRadius: '8px', 
+                              borderBottomLeftRadius: '8px', 
+                              fontSize: '13px', 
+                              color: 'var(--text-muted)',
+                              userSelect: 'none'
+                            }}>US-</span>
+                            <input 
+                              className="form-control" 
+                              placeholder="1001" 
+                              value={userFormCode} 
+                              onChange={e => setUserFormCode(e.target.value.replace(/^US-?/i, ''))} 
+                              style={{ borderTopLeftRadius: 0, borderBottomLeftRadius: 0 }}
+                            />
+                          </div>
+                        </div>
                         <div className="form-grid">
                           <div className="form-group">
                             <label className="form-label">{language === 'es' ? 'Nombre' : 'First Name'} *</label>
@@ -15526,26 +15695,26 @@ USING (true);`;
                     <label className="form-label">{prodFormIsGeneric ? (language === 'es' ? 'Costo por unidad (€)' : 'Unit Cost (€)') : (language === 'es' ? 'Costo (€)' : 'Acquisition Cost (€)')}</label>
                     <input type="number" className="form-control" value={prodFormPricePaid} onChange={e => setProdFormPricePaid(Number(e.target.value))} />
                     <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px', cursor: 'pointer', fontSize: '13px', color: 'var(--text-bright)' }}>
-                      <input type="checkbox" checked={prodFormAddVat} onChange={e => setProdFormAddVat(e.target.checked)} style={{ width: '16px', height: '16px', cursor: 'pointer' }} />
-                      {language === 'es' ? 'Agregar VAT (23% impuestos)' : 'Add VAT (23% tax)'}
-                    </label>
-                    {(prodFormAddVat || prodFormIsGeneric) && (() => {
-                      const base = prodFormPricePaid || 0;
-                      const qty = prodFormQuantity > 0 ? prodFormQuantity : 1;
-                      const vat = prodFormAddVat ? Math.round(base * 0.23 * 100) / 100 : 0;
-                      const unitCost = base + vat;
-                      const purchaseTotal = unitCost * qty;
-                      return (
-                        <div style={{ marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '2px', fontSize: '12px', color: 'var(--text-muted)', background: 'rgba(16, 185, 129, 0.05)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(16, 185, 129, 0.1)' }}>
-                          {prodFormAddVat && (
-                            <>
-                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>{language === 'es' ? 'Coste por unidad' : 'Unit cost'}</span><span>€{base.toLocaleString()}</span></div>
-                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>VAT (23%)</span><span>€{vat.toLocaleString()}</span></div>
-                              <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '3px', marginTop: '2px', color: 'var(--text-bright)', fontWeight: 700 }}>
-                                <span>{prodFormIsGeneric ? (language === 'es' ? 'Total por unidad' : 'Unit total') : 'Total'}</span><span>€{unitCost.toLocaleString()}</span>
-                              </div>
-                            </>
-                          )}
+                    <input type="checkbox" checked={prodFormAddVat} onChange={e => setProdFormAddVat(e.target.checked)} style={{ width: '16px', height: '16px', cursor: 'pointer' }} />
+                    {language === 'es' ? 'Agregar VAT (23% impuestos)' : 'Add VAT (23% tax)'}
+                  </label>
+                  {(prodFormAddVat || prodFormIsGeneric) && (() => {
+                    const base = prodFormPricePaid || 0;
+                    const qty = prodFormQuantity > 0 ? prodFormQuantity : 1;
+                    const vat = prodFormAddVat ? Math.round(base * 0.23 * 100) / 100 : 0;
+                    const unitCost = base + vat;
+                    const purchaseTotal = unitCost * qty;
+                    return (
+                      <div style={{ marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '2px', fontSize: '12px', color: 'var(--text-muted)', background: 'rgba(16, 185, 129, 0.05)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(16, 185, 129, 0.1)' }}>
+                        {prodFormAddVat && (
+                          <>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>{language === 'es' ? 'Coste por unidad' : 'Unit cost'}</span><span>€{base.toLocaleString()}</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>VAT (23%)</span><span>€{vat.toLocaleString()}</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '3px', marginTop: '2px', color: 'var(--text-bright)', fontWeight: 700 }}>
+                              <span>{prodFormIsGeneric ? (language === 'es' ? 'Total por unidad' : 'Unit total') : 'Total'}</span><span>€{unitCost.toLocaleString()}</span>
+                            </div>
+                          </>
+                        )}
                           {prodFormIsGeneric && (
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: prodFormAddVat ? '1px solid rgba(255,255,255,0.08)' : 'none', paddingTop: prodFormAddVat ? '4px' : '0', marginTop: prodFormAddVat ? '2px' : '0' }}>
                               <span>{language === 'es' ? 'Total de la compra' : 'Total purchase'} ({qty} {language === 'es' ? 'uds' : 'units'} × €{unitCost.toLocaleString()})</span>
@@ -15815,7 +15984,7 @@ USING (true);`;
                       imageUrl = null;
                     }
 
-                    // BAT (23% tax): the input holds the base cost; the stored price_paid includes the tax.
+                    // VAT (23% tax): the input holds the base cost; the stored price_paid includes the tax.
                     const vatAmount = prodFormAddVat ? Math.round(prodFormPricePaid * 0.23 * 100) / 100 : 0;
                     const effectiveCost = prodFormPricePaid + vatAmount;
                     const newProdBase = {
@@ -17980,7 +18149,7 @@ USING (true);`;
                 <h3 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                   📂 {t.maintHistory}: <span style={{ color: 'var(--color-primary)' }}>{bike.serial_number}</span> — {bike.name}
                 </h3>
-                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedProductId(null); }}>✕</button>
+                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setSelectedProductId(null); setShowBikeUsers(false); }}>✕</button>
               </div>
 
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '20px', marginTop: '15px' }}>
@@ -18011,8 +18180,8 @@ USING (true);`;
                   </div>
                 </div>
 
-                {/* Action button to schedule service */}
-                <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                {/* Action buttons */}
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
                   <button
                     className="btn-secondary"
                     style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', padding: '8px 16px', fontSize: '13px' }}
@@ -18083,7 +18252,6 @@ USING (true);`;
                     </div>
                   );
                 })()}
-
 
                 {/* Chronological Timeline */}
                 <div style={{ marginTop: '10px' }}>
@@ -20806,9 +20974,16 @@ USING (true);`;
                         const isPositive = item.amount >= 0;
                         const amtColor = isPositive ? '#34d399' : '#f87171';
                         return (
-                          <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(0,0,0,0.12)', padding: '10px 14px', borderRadius: '8px', fontSize: '13px', borderLeft: `3px solid ${amtColor}` }}>
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                              <span style={{ color: 'var(--text-bright)', fontWeight: 500 }}>{item.description}</span>
+                          <div
+                            key={idx}
+                            onClick={() => setLedgerDetail(item)}
+                            title={language === 'es' ? 'Ver detalle' : 'View detail'}
+                            style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(0,0,0,0.12)', padding: '10px 14px', borderRadius: '8px', fontSize: '13px', borderLeft: `3px solid ${amtColor}`, cursor: 'pointer' }}
+                          >
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 }}>
+                              <span style={{ color: 'var(--text-bright)', fontWeight: 500 }}>
+                                {item.description.length > 60 ? `${item.description.slice(0, 60)}...` : item.description}
+                              </span>
                               <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>📅 {formatDate(item.date)}</span>
                             </div>
                             <strong style={{ color: amtColor, fontSize: '14px', whiteSpace: 'nowrap', marginLeft: '12px' }}>
@@ -20909,6 +21084,7 @@ USING (true);`;
                                     className="btn-secondary btn-xs"
                                     onClick={() => {
                                       setActiveCustomerId(rider.id);
+                                      setProfileRentalId(null);
                                       setModalType(null);
                                     }}
                                   >
@@ -22284,6 +22460,9 @@ USING (true);`;
                         if (p.category_id === catBikeId || p.category_id === catBattId || p.category_id === catLockId) return false;
                         // Only available
                         if (p.status !== 'Disponible') return false;
+                        // Exclude consolidated products with 0 units
+                        const _dist = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
+                        if (_dist != null && Object.values(_dist).reduce((a, b) => a + b, 0) <= 0) return false;
                         // Exclude already selected kit items
                         if (wizKitProductIds.includes(p.id)) return false;
                         // Exclude already selected bike/battery/lock in wizard
@@ -22315,9 +22494,26 @@ USING (true);`;
                       }
 
                       return Array.from(groupsMap.entries()).map(([serial, groupProds]) => {
-                        const representativeItem = groupProds[0];
+                        // Prefer the consolidated record (the one carrying a distribution) as the
+                        // representative so the rental references the real stock row.
+                        const representativeItem =
+                          groupProds.find(p => p.custom_field_values?.location_distribution != null) || groupProds[0];
                         const catName = categories.find(c => c.id === representativeItem.category_id);
-                        const count = groupProds.length;
+                        // Count available UNITS, not records: a row with a distribution counts its summed
+                        // quantity; a plain single-unit row (e.g. a legacy split) counts as 1.
+                        const totalUnits = groupProds.reduce((sum, p) => {
+                          const d = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
+                          return sum + (d != null ? Object.values(d).reduce((a, b) => a + (Number(b) || 0), 0) : 1);
+                        }, 0);
+                        // Subtract units already out on an active rental (tracked via rental_items).
+                        const grpIds = new Set(groupProds.map(p => p.id));
+                        const activeRented = (rentalItems || []).filter(ri =>
+                          grpIds.has(ri.product_id) &&
+                          (rentals || []).some(r => r.id === ri.rental_id && r.status === 'Activo')
+                        ).length;
+                        const count = Math.max(0, totalUnits - activeRented);
+                        // No real stock left → don't offer it.
+                        if (count <= 0) return null;
                         return (
                           <tr key={representativeItem.id}>
                             <td>
@@ -22638,12 +22834,11 @@ USING (true);`;
         </div>
       )}
 
-
       {lightboxUrl && (
-        <div 
-          className="modal-overlay" 
-          onClick={() => setLightboxUrl(null)} 
-          style={{ 
+        <div
+          className="modal-overlay"
+          onClick={() => setLightboxUrl(null)}
+          style={{
             position: 'fixed',
             top: 0,
             left: 0,
@@ -22859,7 +23054,7 @@ USING (true);`;
                     ))}
                   </optgroup>
                   <optgroup label={language === 'es' ? 'Todas' : 'All'}>
-                    {NATIONALITIES.map(n => (
+                    {sortedNationalities.map(n => (
                       <option key={n.value} value={n.value}>{language === 'es' ? n.labelEs : n.labelEn}</option>
                     ))}
                   </optgroup>

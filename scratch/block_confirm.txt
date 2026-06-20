@@ -1,0 +1,39 @@
+      // Create & send the customer delivery checklist (link emailed to the rider)
+      if (wizSendDeliveryChecklist && wizEmail) {
+        try {
+          const checklist = await createDeliveryChecklist({
+            rental_id: newRentId,
+            audience: 'customer',
+            customer_name: `${rider.first_name} ${rider.last_name}`.trim(),
+            customer_email: wizEmail,
+            email_lang: wizEmailLang,
+            bike_model: bikeProduct?.name ?? '',
+            bike_serial: bikeProduct?.serial_number ?? '',
+            delivery_date: new Date().toISOString().split('T')[0],
+          });
+          const checklistUrl = `${window.location.origin}${window.location.pathname}?checklist=${checklist.id}`;
+          sendDeliveryChecklistInviteEmail(checklist, checklistUrl, wizEmailLang);
+          showToast(`✅ ${language === 'es' ? 'Checklist enviada' : 'Checklist sent'}: ${checklistUrl}`, 'success');
+          try { await navigator.clipboard.writeText(checklistUrl); } catch { /* ignore */ }
+        } catch (err) {
+          console.error('Failed to create/send delivery checklist:', err);
+          showToast(language === 'es' ? 'No se pudo enviar la checklist de entrega.' : 'Could not send the delivery checklist.', 'error');
+        }
+      }
+
+      // Create the internal technical inspection checklist (operator-filled).
+      // Always created so it is available in the rider profile, even if completed later.
+      try {
+        await persistInternalChecklist({
+          existingId: null,
+          rentalId: newRentId,
+          customerName: `${rider.first_name} ${rider.last_name}`.trim(),
+          bikeModel: bikeProduct?.name ?? '',
+          bikeSerial: bikeProduct?.serial_number ?? '',
+          deliveryDate: new Date().toISOString().split('T')[0],
+          value: wizInternalChecklist,
+        });
+      } catch (err) {
+        console.error('Failed to create internal checklist:', err);
+      }
+
