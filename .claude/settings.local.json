@@ -32,7 +32,10 @@
       "Bash(grep -vE \"^\\\\>\\\\s*$\")",
       "Bash(grep -vE \"^<\\\\s*$\")",
       "Bash(git add *)",
-      "Bash(git commit -q -m 'feat: agrega checklist \\(cliente+interno\\) + backup Excel + boton Usuarios; renombra BAT->VAT *)"
+      "Bash(git commit -q -m 'feat: agrega checklist \\(cliente+interno\\) + backup Excel + boton Usuarios; renombra BAT->VAT *)",
+      "Bash(grep -oE \".{0,80}\\(rental_items|product_id|bike_id===|Activo\\).{0,80}\" scratch/bundle_rent_logic.txt)",
+      "Bash(grep -oE \".{0,90}\\(Activo|product_id|bike_id|location_distribution|filter\\).{0,40}\" scratch/bundle_stock_calc.txt)",
+      "Bash(cd \"C:\\\\roberto\\\\webs\\\\the_fast_sheep\" && git diff HEAD -- src/App.tsx > /tmp/agdiff.txt 2>&1; echo \"=== nuevos useState agregados ===\" && grep -E \"^\\\\+\" /tmp/agdiff.txt | grep -oE \"const \\\\[[a-zA-Z]+, set[A-Za-z]+\\\\]\" | sort -u | head -40; echo \"\"; echo \"=== nuevas funciones agregadas ===\" && grep -E \"^\\\\+\" /tmp/agdiff.txt | grep -oE \"const [a-zA-Z]+ = \\(async \\)?\\\\\\(|function [a-zA-Z]+\" | sort -u | head -30)"
     ]
   }
 }

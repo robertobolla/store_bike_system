@@ -50,6 +50,17 @@ import { downloadBackupXlsx } from './backup';
 
 import heic2any from 'heic2any';
 
+const parseMixtoAmounts = (notes: string | null | undefined, totalAmount: number): { cash: number; transfer: number } => {
+  if (!notes) return { cash: totalAmount, transfer: 0 };
+  const match = notes.match(/\[Pago Mixto\] Efectivo:\s*€?([0-9.]+)\s*\|\s*Transferencia:\s*€?([0-9.]+)/i);
+  if (match) {
+    const cash = parseFloat(match[1]) || 0;
+    const transfer = parseFloat(match[2]) || 0;
+    return { cash, transfer };
+  }
+  return { cash: totalAmount, transfer: 0 };
+};
+
 const convertHeicToJpgIfNeeded = async (file: File): Promise<File> => {
   let activeBlob: Blob = file;
   
@@ -2246,6 +2257,29 @@ USING (true);`;
     return p.prefix_id === null && p.category_id !== catBikeId && p.category_id !== catBattId && p.category_id !== catLockId;
   }, [catBikeId, catBattId, catLockId]);
 
+  // Return a previously sold/financed unit to available stock. For generic items the unit
+  // is merged back into its group's master distribution (instead of leaving an orphan
+  // single-unit row), keeping stock normalised.
+  const restoreSoldUnitToStock = async (prod: Product) => {
+    const prodDist = prod.custom_field_values?.location_distribution as Record<string, number> | undefined;
+    if (isProductGeneric(prod) && prodDist == null) {
+      const loc = (prod.custom_field_values?.location as string) || 'Almacén Central';
+      const master = products.find(p =>
+        p.serial_number === prod.serial_number && p.id !== prod.id &&
+        p.status === 'Disponible' && p.custom_field_values?.location_distribution != null);
+      if (master) {
+        const md = { ...((master.custom_field_values?.location_distribution as Record<string, number>) || {}) };
+        md[loc] = (md[loc] || 0) + 1;
+        await upsertProduct({ ...master, custom_field_values: { ...master.custom_field_values, location_distribution: md } });
+        await deleteProduct(prod.id);
+        return;
+      }
+      await upsertProduct({ ...prod, status: 'Disponible', sold_date: null, price_sold: null, custom_field_values: { ...prod.custom_field_values, location: loc, location_distribution: { [loc]: 1 } } });
+      return;
+    }
+    await upsertProduct({ ...prod, status: 'Disponible', sold_date: null, price_sold: null });
+  };
+
   const getDynamicEventStatus = useCallback((ev: CompanyEvent): 'Pendiente' | 'Realizado' => {
     if (ev.title.startsWith('[Service]')) {
       const serial = ev.title.replace('[Service]', '').trim();
@@ -2717,29 +2751,48 @@ USING (true);`;
       const firstProd = firstItem ? products.find(prod => prod.id === firstItem.product_id) : null;
 
       if (s.payment_type === 'contado') {
-        txs.push({
-          id: `sale-new-${s.id}`,
-          date: s.sale_date,
-          type: 'income',
-          amount: s.total_amount,
-          description: `Venta Contado${descDetails}${custName}`,
-          category: 'Venta',
-          created_at: s.created_at,
-          productCategoryId: firstProd?.category_id,
-          brand: firstProd?.brand || undefined,
-          model: firstProd?.model || undefined,
-          productName: firstProd?.name || undefined,
-          received_via: s.received_via || 'efectivo'
-        });
-      } else if (s.payment_type === 'financiado') {
-        if (s.down_payment > 0) {
+        if (s.received_via === 'mixto') {
+          const parsed = parseMixtoAmounts(s.notes, s.total_amount);
+          if (parsed.cash > 0) {
+            txs.push({
+              id: `sale-new-${s.id}-cash`,
+              date: s.sale_date,
+              type: 'income',
+              amount: parsed.cash,
+              description: `Venta Contado (Efectivo)${descDetails}${custName}`,
+              category: 'Venta',
+              created_at: s.created_at,
+              productCategoryId: firstProd?.category_id,
+              brand: firstProd?.brand || undefined,
+              model: firstProd?.model || undefined,
+              productName: firstProd?.name || undefined,
+              received_via: 'efectivo'
+            });
+          }
+          if (parsed.transfer > 0) {
+            txs.push({
+              id: `sale-new-${s.id}-transfer`,
+              date: s.sale_date,
+              type: 'income',
+              amount: parsed.transfer,
+              description: `Venta Contado (Transferencia)${descDetails}${custName}`,
+              category: 'Venta',
+              created_at: s.created_at,
+              productCategoryId: firstProd?.category_id,
+              brand: firstProd?.brand || undefined,
+              model: firstProd?.model || undefined,
+              productName: firstProd?.name || undefined,
+              received_via: 'transferencia'
+            });
+          }
+        } else {
           txs.push({
-            id: `sale-down-${s.id}`,
+            id: `sale-new-${s.id}`,
             date: s.sale_date,
             type: 'income',
-            amount: s.down_payment,
-            description: `Entrada Financiamiento${descDetails}${custName}`,
-            category: 'Financiamiento',
+            amount: s.total_amount,
+            description: `Venta Contado${descDetails}${custName}`,
+            category: 'Venta',
             created_at: s.created_at,
             productCategoryId: firstProd?.category_id,
             brand: firstProd?.brand || undefined,
@@ -2747,6 +2800,59 @@ USING (true);`;
             productName: firstProd?.name || undefined,
             received_via: s.received_via || 'efectivo'
           });
+        }
+      } else if (s.payment_type === 'financiado') {
+        if (s.down_payment > 0) {
+          if (s.received_via === 'mixto') {
+            const parsed = parseMixtoAmounts(s.notes, s.down_payment);
+            if (parsed.cash > 0) {
+              txs.push({
+                id: `sale-down-${s.id}-cash`,
+                date: s.sale_date,
+                type: 'income',
+                amount: parsed.cash,
+                description: `Entrada Financiamiento (Efectivo)${descDetails}${custName}`,
+                category: 'Financiamiento',
+                created_at: s.created_at,
+                productCategoryId: firstProd?.category_id,
+                brand: firstProd?.brand || undefined,
+                model: firstProd?.model || undefined,
+                productName: firstProd?.name || undefined,
+                received_via: 'efectivo'
+              });
+            }
+            if (parsed.transfer > 0) {
+              txs.push({
+                id: `sale-down-${s.id}-transfer`,
+                date: s.sale_date,
+                type: 'income',
+                amount: parsed.transfer,
+                description: `Entrada Financiamiento (Transferencia)${descDetails}${custName}`,
+                category: 'Financiamiento',
+                created_at: s.created_at,
+                productCategoryId: firstProd?.category_id,
+                brand: firstProd?.brand || undefined,
+                model: firstProd?.model || undefined,
+                productName: firstProd?.name || undefined,
+                received_via: 'transferencia'
+              });
+            }
+          } else {
+            txs.push({
+              id: `sale-down-${s.id}`,
+              date: s.sale_date,
+              type: 'income',
+              amount: s.down_payment,
+              description: `Entrada Financiamiento${descDetails}${custName}`,
+              category: 'Financiamiento',
+              created_at: s.created_at,
+              productCategoryId: firstProd?.category_id,
+              brand: firstProd?.brand || undefined,
+              model: firstProd?.model || undefined,
+              productName: firstProd?.name || undefined,
+              received_via: s.received_via || 'efectivo'
+            });
+          }
         }
       }
     });
@@ -3044,6 +3150,8 @@ USING (true);`;
     odometer:      false,
     modifications: false,
     roi:           false,
+    key_number:    false,
+    linked_status: false,
   });
 
   // Sold Tab filters & Column Visibility
@@ -3356,12 +3464,29 @@ USING (true);`;
   const [soldCustomerPhone, setSoldCustomerPhone] = useState('');
   const [soldCustomerSearch, setSoldCustomerSearch] = useState('');
   const [soldEmailLang, setSoldEmailLang] = useState<'es' | 'en' | 'pt'>('es');
-  const [soldProducts, setSoldProducts] = useState<Product[]>([]);
+  const [soldProducts, setSoldProducts] = useState<{ tempId: string; product: Product }[]>([]);
   const [soldProductPrices, setSoldProductPrices] = useState<Record<string, number>>({});
   const [soldProductLocations, setSoldProductLocations] = useState<Record<string, string>>({});
   const [soldProductSearch, setSoldProductSearch] = useState('');
   const [soldSubmitting, setSoldSubmitting] = useState(false);
-  const [soldReceivedVia, setSoldReceivedVia] = useState<'efectivo' | 'transferencia'>('efectivo');
+  const [soldReceivedVia, setSoldReceivedVia] = useState<'efectivo' | 'transferencia' | 'mixto'>('efectivo');
+  const [soldMixedCash, setSoldMixedCash] = useState(0);
+  const [soldMixedTransfer, setSoldMixedTransfer] = useState(0);
+
+  useEffect(() => {
+    const targetAmount = soldPaymentType === 'financiado' ? soldDownPayment : soldFormPrice;
+    if (soldReceivedVia === 'mixto') {
+      if (Math.abs((soldMixedCash + soldMixedTransfer) - targetAmount) > 0.01) {
+        if (soldMixedCash > targetAmount) {
+          setSoldMixedCash(targetAmount);
+          setSoldMixedTransfer(0);
+        } else {
+          setSoldMixedTransfer(Number((targetAmount - soldMixedCash).toFixed(2)));
+        }
+      }
+    }
+  }, [soldPaymentType, soldDownPayment, soldFormPrice, soldReceivedVia, soldMixedCash, soldMixedTransfer]);
+
   const [returnRentalId,     setReturnRentalId]     = useState<string | null>(null);
   const [returnFormOdo,      setReturnFormOdo]      = useState(0);
   const [returnFormDamage,   setReturnFormDamage]   = useState('');
@@ -3881,18 +4006,30 @@ USING (true);`;
     setSoldCustomerSearch('');
     setSoldEmailLang('es');
     const linkedLock = products.find(p => p.category_id === catLockId && p.custom_field_values?.associated_bike_id === prod.id);
-    if (linkedLock) {
-      const lockPrice = linkedLock.price_sold ?? (linkedLock.price_paid ? Math.round(linkedLock.price_paid * 1.5) : 50);
-      setSoldProducts([prod, linkedLock]);
-      setSoldProductPrices({ [prod.id]: suggestedPrice, [linkedLock.id]: lockPrice });
-      setSoldFormPrice(suggestedPrice + lockPrice);
-    } else {
-      setSoldProducts([prod]);
-      setSoldProductPrices({ [prod.id]: suggestedPrice });
-    }
+    const prodTempId = crypto.randomUUID();
+    const lockTempId = crypto.randomUUID();
     const dist = prod.custom_field_values?.location_distribution as Record<string, number> | undefined;
     const initialLoc = dist ? Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central' : (prod.custom_field_values?.location as string || 'Almacén Central');
-    setSoldProductLocations({ [prod.id]: initialLoc });
+
+    if (linkedLock) {
+      const lockPrice = linkedLock.price_sold ?? (linkedLock.price_paid ? Math.round(linkedLock.price_paid * 1.5) : 50);
+      const lockDist = linkedLock.custom_field_values?.location_distribution as Record<string, number> | undefined;
+      const lockLoc = lockDist ? Object.entries(lockDist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central' : (linkedLock.custom_field_values?.location as string || 'Almacén Central');
+
+      setSoldProducts([
+        { tempId: prodTempId, product: prod },
+        { tempId: lockTempId, product: linkedLock }
+      ]);
+      setSoldProductPrices({ [prodTempId]: suggestedPrice, [lockTempId]: lockPrice });
+      setSoldProductLocations({ [prodTempId]: initialLoc, [lockTempId]: lockLoc });
+      setSoldFormPrice(suggestedPrice + lockPrice);
+    } else {
+      setSoldProducts([
+        { tempId: prodTempId, product: prod }
+      ]);
+      setSoldProductPrices({ [prodTempId]: suggestedPrice });
+      setSoldProductLocations({ [prodTempId]: initialLoc });
+    }
     setSoldProductSearch('');
     setSoldSubmitting(false);
     setSoldReceivedVia('efectivo');
@@ -4105,6 +4242,8 @@ USING (true);`;
   const [wizHasKit,      setWizHasKit]      = useState(true);
   const [wizKitDetails,  setWizKitDetails]  = useState('Casco, Soporte móvil, Cargador rápido');
   const [wizKitProductIds, setWizKitProductIds] = useState<string[]>([]);
+  // Chosen stock location per kit product (for generic items with location_distribution)
+  const [wizKitLocations, setWizKitLocations] = useState<Record<string, string>>({});
   const [kitSearchModalOpen, setKitSearchModalOpen] = useState(false);
   const [kitSearchQuery, setKitSearchQuery] = useState('');
   // Generic Stock addition/removal states
@@ -4868,15 +5007,17 @@ USING (true);`;
         const totalQty = dist ? Object.values(dist).reduce((a, b) => a + b, 0) : 0;
         if (dist && totalQty > 1) {
           const splitId = crypto.randomUUID();
-          const mainLoc = Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central';
+          // Use the location chosen by the operator in Step 3; fall back to the one with most stock.
+          const autoLoc = Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central';
+          const chosenLoc = (wizKitLocations[kitId] && (dist[wizKitLocations[kitId]] || 0) > 0) ? wizKitLocations[kitId] : autoLoc;
           updates.push(upsertProduct({
             ...kitProduct,
             id: splitId,
             status: 'Rentada',
-            custom_field_values: { ...kitProduct.custom_field_values, location: mainLoc, location_distribution: undefined },
+            custom_field_values: { ...kitProduct.custom_field_values, location: chosenLoc, location_distribution: undefined },
           }));
           const updatedDist = { ...dist };
-          const locToDecrement = Object.keys(updatedDist).find(k => updatedDist[k] > 0) || mainLoc;
+          const locToDecrement = (updatedDist[chosenLoc] || 0) > 0 ? chosenLoc : (Object.keys(updatedDist).find(k => updatedDist[k] > 0) || chosenLoc);
           updatedDist[locToDecrement] = (updatedDist[locToDecrement] || 1) - 1;
           Object.keys(updatedDist).forEach(k => { if (updatedDist[k] <= 0) delete updatedDist[k]; });
           const newTotal = Object.values(updatedDist).reduce((a, b) => a + b, 0);
@@ -4983,7 +5124,7 @@ USING (true);`;
       setWizBikeId(''); setWizBatteryIds([]); setWizLockId(''); setWizGigAccountId(null);
       setWizFirstName(''); setWizLastName(''); setWizEmail('');
       setWizPhone(''); setWizRiderEmail(''); setSignatureData(null);
-      setWizKitProductIds([]); setWizHasKit(true); setWizKitDetails('');
+      setWizKitProductIds([]); setWizKitLocations({}); setWizHasKit(true); setWizKitDetails('');
       setWizCustomerCode(''); setWizStartDate(new Date().toISOString().split('T')[0]);
       // Reset Step 7 evidence states
       setWizConditionFiles([]); setWizConditionPreviews([]);
@@ -6516,7 +6657,7 @@ USING (true);`;
                                           const sItems = items.filter(si => si.sale_id === saleId);
                                           for (const si of sItems) {
                                             const prod = products.find(p => p.id === si.product_id);
-                                            if (prod) await upsertProduct({...prod, status: 'Disponible', sold_date: null, price_sold: null});
+                                            if (prod) await restoreSoldUnitToStock(prod);
                                           }
                                           // Delete financing plan, payments and linked calendar events
                                           const plan = financingPlans.find(fp => fp.sale_id === saleId);
@@ -6538,7 +6679,7 @@ USING (true);`;
                                           await deleteSale(saleId);
                                         } else if (rawId.startsWith('sale-')) {
                                           const prod = products.find(p => p.id === rawId.replace('sale-', ''));
-                                          if (prod) await upsertProduct({...prod, status: 'Disponible', sold_date: null, price_sold: null});
+                                          if (prod) await restoreSoldUnitToStock(prod);
                                         } else if (rawId.startsWith('buy-group-')) {
                                           if (tx.refIds && tx.refIds.length > 0) {
                                             for (const id of tx.refIds) {
@@ -7009,6 +7150,7 @@ USING (true);`;
                                 <th>{language === 'es' ? 'Código' : 'Code'}</th>
                                 <th>{language === 'es' ? 'Nombre' : 'Name'}</th>
                                 <th>{language === 'es' ? 'Categoría' : 'Category'}</th>
+                                <th>{language === 'es' ? 'Ubicación' : 'Location'}</th>
                                 <th style={{ width: '60px', textAlign: 'center' }}></th>
                               </tr>
                             </thead>
@@ -7017,11 +7159,30 @@ USING (true);`;
                                 const kitProd = products.find(p => p.id === pid);
                                 if (!kitProd) return null;
                                 const catName = categories.find(c => c.id === kitProd.category_id);
+                                const kitDist = kitProd.custom_field_values?.location_distribution as Record<string, number> | undefined;
+                                const kitLocs = kitDist ? Object.keys(kitDist).filter(k => (kitDist[k] || 0) > 0) : [];
+                                const selectedLoc = wizKitLocations[pid] || (kitLocs.length > 0 ? [...kitLocs].sort((a, b) => (kitDist![b] || 0) - (kitDist![a] || 0))[0] : '');
                                 return (
                                   <tr key={pid}>
                                     <td><strong>{kitProd.serial_number}</strong></td>
                                     <td>{kitProd.name}</td>
                                     <td>{language === 'es' ? catName?.name_es : catName?.name_en}</td>
+                                    <td>
+                                      {kitLocs.length > 0 ? (
+                                        <select
+                                          className="form-control"
+                                          style={{ height: '32px', fontSize: '12px', minWidth: '140px' }}
+                                          value={selectedLoc}
+                                          onChange={e => setWizKitLocations(prev => ({ ...prev, [pid]: e.target.value }))}
+                                        >
+                                          {kitLocs.map(loc => (
+                                            <option key={loc} value={loc}>📍 {loc} ({kitDist![loc]})</option>
+                                          ))}
+                                        </select>
+                                      ) : (
+                                        <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>—</span>
+                                      )}
+                                    </td>
                                     <td style={{ textAlign: 'center' }}>
                                       <button className="btn-danger btn-xs" style={{ padding: '4px 8px', fontSize: '12px' }}
                                         onClick={() => setWizKitProductIds(prev => prev.filter(x => x !== pid))}>
@@ -7847,6 +8008,8 @@ USING (true);`;
                               { key: 'assembly_date', label: language === 'es' ? '🔩 Fecha Armado'      : '🔩 Assembly Date' },
                               { key: 'modifications', label: language === 'es' ? '🛠️ Modificaciones'   : '🛠️ Modifications' },
                               { key: 'roi',           label: '📊 ROI' },
+                              { key: 'key_number',    label: language === 'es' ? '🔑 Número de Llave'   : '🔑 Key Number' },
+                              { key: 'linked_status', label: language === 'es' ? '🔗 Vinculado'         : '🔗 Linked' },
                             ].map(col => {
                               const isChecked = !!stockVisibleCols[col.key];
                               return (
@@ -7888,6 +8051,8 @@ USING (true);`;
                             {stockVisibleCols.assembly_date && <th>{language === 'es' ? 'Fecha Armado'    : 'Assembly Date'}</th>}
                             {stockVisibleCols.modifications && <th>{language === 'es' ? 'Modificaciones'  : 'Modifications'}</th>}
                             {stockVisibleCols.roi           && <th>ROI</th>}
+                             {stockVisibleCols.key_number    && <th>{language === 'es' ? 'Número Llave'   : 'Key Number'}</th>}
+                             {stockVisibleCols.linked_status && <th>{language === 'es' ? 'Vinculado'      : 'Linked'}</th>}
                             <th>{t.actions}</th>
                           </tr>
                         </thead>
@@ -8107,8 +8272,9 @@ USING (true);`;
                                         </span>
                                       );
                                     })() : (() => {
+                                      const groupIdSet = new Set(group.map(p => p.id));
                                       const displayRent = isConsolidated
-                                        ? (rentals || []).filter(r => group.some(p => p.id === r.bike_id) && r.status === 'Activo').length
+                                        ? (rentalItems || []).filter(ri => groupIdSet.has(ri.product_id) && (rentals || []).some(r => r.id === ri.rental_id && r.status === 'Activo')).length
                                         : countRent;
                                       const displayShop = isConsolidated ? countShop : countShop;
                                       const displayLost = isConsolidated ? countLost : countLost;
@@ -8168,6 +8334,42 @@ USING (true);`;
                                   {stockVisibleCols.roi && (
                                     <td>{renderROIBadge(prod.id)}</td>
                                   )}
+                                  {stockVisibleCols.key_number && (
+                                    <td>{prod.key_number || <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  )}
+                                  {stockVisibleCols.linked_status && (
+                                    <td>{(() => {
+                                      if (prod.category_id === catLockId) {
+                                        const bikeId = prod.custom_field_values?.associated_bike_id as string;
+                                        const associatedBike = bikeId ? products.find(p => p.id === bikeId) : null;
+                                        return associatedBike ? (
+                                          <span 
+                                            className="badge status-rented" 
+                                            style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                                            onClick={() => openProductModal(associatedBike)}
+                                          >
+                                            🔗 {language === 'es' ? 'Sí' : 'Yes'} ({associatedBike.serial_number})
+                                          </span>
+                                        ) : (
+                                          <span style={{ color: 'var(--text-muted)' }}>{language === 'es' ? 'No' : 'No'}</span>
+                                        );
+                                      } else if (prod.category_id === catBikeId) {
+                                        const associatedLock = products.find(p => p.category_id === catLockId && p.custom_field_values?.associated_bike_id === prod.id);
+                                        return associatedLock ? (
+                                          <span 
+                                            className="badge status-rented" 
+                                            style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                                            onClick={() => openProductModal(associatedLock)}
+                                          >
+                                            🔗 {language === 'es' ? 'Sí' : 'Yes'} ({associatedLock.serial_number})
+                                          </span>
+                                        ) : (
+                                          <span style={{ color: 'var(--text-muted)' }}>{language === 'es' ? 'No' : 'No'}</span>
+                                        );
+                                      }
+                                      return <span style={{ color: 'var(--text-muted)' }}>-</span>;
+                                    })()}</td>
+                                  )}
                                   <td>
                                     <div style={{ display: 'flex', gap: '6px', flexWrap: 'nowrap', alignItems: 'center' }}>
                                       {(isConsolidated ? totalCount : countDisp) > 0 ? (
@@ -8217,7 +8419,7 @@ USING (true);`;
                                           ➕ {language === 'es' ? 'Más' : 'More'}
                                         </button>
 
-                                        {activeStockMenuId === prod.id && (
+                                        {false && (
                                           <>
                                             <div
                                               style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 90, cursor: 'default' }}
@@ -8639,12 +8841,79 @@ USING (true);`;
                       <button className="btn-secondary" onClick={() => { setCatFormNameEs(''); setCatFormNameEn(''); setModalType('category'); }}>📁 {t.addCategory}</button>
                     </div>
                     <input className="form-control filter-input" placeholder={t.searchPlaceholder} value={searchStock} onChange={e => setSearchStock(e.target.value)} />
-                    <select className="form-control" style={{ width: 'auto' }} value={filterCategory} onChange={e => setFilterCategory(e.target.value)}>
-                      <option value="all">{language === 'es' ? 'Todas Categorías' : 'All Categories'}</option>
-                      {(categories || [])
-                        .filter(c => c && c.id)
-                        .map(c => <option key={c.id} value={c.id}>{language === 'es' ? (c.name_es || c.name_en || '') : (c.name_en || c.name_es || '')}</option>)}
-                    </select>
+                    <div className="filter-row-group" style={{ marginLeft: 'auto' }}>
+                      <select className="form-control" style={{ width: 'auto' }} value={filterCategory} onChange={e => setFilterCategory(e.target.value)}>
+                        <option value="all">{language === 'es' ? 'Todas Categorías' : 'All Categories'}</option>
+                        {(categories || [])
+                          .filter(c => c && c.id)
+                          .map(c => <option key={c.id} value={c.id}>{language === 'es' ? (c.name_es || c.name_en || '') : (c.name_en || c.name_es || '')}</option>)}
+                      </select>
+
+                      {/* Column Visibility Picker */}
+                      <div className="col-vis-wrapper">
+                        <button
+                          className={`col-vis-btn ${showColVisPicker ? 'active' : ''}`}
+                          onClick={() => setShowColVisPicker(v => !v)}
+                          title={language === 'es' ? 'Columnas visibles' : 'Visible columns'}
+                        >
+                          ⊞ {language === 'es' ? 'Columnas' : 'Columns'}
+                        </button>
+                        {showColVisPicker && (
+                          <>
+                            <div
+                              style={{ position: 'fixed', inset: 0, zIndex: 499 }}
+                              onClick={() => setShowColVisPicker(false)}
+                            />
+                            <div className="col-vis-dropdown">
+                              <div className="col-vis-dropdown-header">
+                                {language === 'es' ? 'Columnas visibles' : 'Visible columns'}
+                              </div>
+                              {/* Always-locked columns */}
+                              {[
+                                { key: '_code',  label: language === 'es' ? '🔒 Código' : '🔒 Code' },
+                                { key: '_brand', label: language === 'es' ? '🔒 Marca / Modelo' : '🔒 Brand / Model' },
+                                { key: '_actions', label: language === 'es' ? '🔒 Acciones' : '🔒 Actions' },
+                              ].map(col => (
+                                <div key={col.key} className="col-vis-item locked checked">
+                                  <div className="col-vis-check">✓</div>
+                                  <span>{col.label}</span>
+                                </div>
+                              ))}
+                              {/* Toggleable columns */}
+                              {[
+                                { key: 'location',      label: language === 'es' ? '📍 Ubicación'       : '📍 Location' },
+                                { key: 'price',         label: language === 'es' ? '💶 Precio Venta'      : '💶 Sale Price' },
+                                { key: 'cost',          label: language === 'es' ? '💰 Costo'             : '💰 Cost' },
+                                { key: 'condition',     label: language === 'es' ? '🔧 Condición'        : '🔧 Condition' },
+                                { key: 'status',        label: language === 'es' ? '📌 Estado'            : '📌 Status' },
+                                { key: 'frame_serial',  label: language === 'es' ? '🔢 Número de Cuadro' : '🔢 Frame Serial' },
+                                { key: 'motor',         label: language === 'es' ? '⚙️ Número de Motor'  : '⚙️ Motor Serial' },
+                                { key: 'odometer',      label: language === 'es' ? '📏 Kilometraje'       : '📏 Odometer' },
+                                { key: 'purchase_date', label: language === 'es' ? '🗓️ Fecha Compra'      : '🗓️ Purchase Date' },
+                                { key: 'arrival_date',  label: language === 'es' ? '🛬 Fecha Arribo'      : '🛬 Arrival Date' },
+                                { key: 'assembly_date', label: language === 'es' ? '🔩 Fecha Armado'      : '🔩 Assembly Date' },
+                                { key: 'modifications', label: language === 'es' ? '🛠️ Modificaciones'   : '🛠️ Modifications' },
+                                { key: 'roi',           label: '📊 ROI' },
+                                { key: 'key_number',    label: language === 'es' ? '🔑 Número de Llave'   : '🔑 Key Number' },
+                                { key: 'linked_status', label: language === 'es' ? '🔗 Vinculado'         : '🔗 Linked' },
+                              ].map(col => {
+                                const isChecked = !!stockVisibleCols[col.key];
+                                return (
+                                  <div
+                                    key={col.key}
+                                    className={`col-vis-item ${isChecked ? 'checked' : ''}`}
+                                    onClick={() => setStockVisibleCols(prev => ({ ...prev, [col.key]: !isChecked }))}
+                                  >
+                                    <div className="col-vis-check">{isChecked ? '✓' : ''}</div>
+                                    <span>{col.label}</span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    </div>
                   </div>
 
                   {/* Stock table */}
@@ -8668,6 +8937,8 @@ USING (true);`;
                             {stockVisibleCols.assembly_date && <th>{language === 'es' ? 'Fecha Armado'    : 'Assembly Date'}</th>}
                             {stockVisibleCols.modifications && <th>{language === 'es' ? 'Modificaciones'  : 'Modifications'}</th>}
                             {stockVisibleCols.roi           && <th>ROI</th>}
+                             {stockVisibleCols.key_number    && <th>{language === 'es' ? 'Número Llave'   : 'Key Number'}</th>}
+                             {stockVisibleCols.linked_status && <th>{language === 'es' ? 'Vinculado'      : 'Linked'}</th>}
                             <th>{t.actions}</th>
                           </tr>
                         </thead>
@@ -8877,8 +9148,9 @@ USING (true);`;
                                       );
                                     })() : (() => {
                                       // "Stock" here = active stock only (sold/lost/stolen are already excluded from this tab).
+                                      const groupIdSet = new Set(group.map(p => p.id));
                                       const displayRent = isConsolidated
-                                        ? (rentals || []).filter(r => group.some(p => p.id === r.bike_id) && r.status === 'Activo').length
+                                        ? (rentalItems || []).filter(ri => groupIdSet.has(ri.product_id) && (rentals || []).some(r => r.id === ri.rental_id && r.status === 'Activo')).length
                                         : countRent;
                                       const displayShop = isConsolidated ? group.filter(p => p.status === 'Mantenimiento').length : countShop;
                                       const displayDisp = isConsolidated
@@ -8931,6 +9203,42 @@ USING (true);`;
                                   {stockVisibleCols.roi && (
                                     <td>{renderROIBadge(prod.id)}</td>
                                   )}
+                                  {stockVisibleCols.key_number && (
+                                    <td>{prod.key_number || <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  )}
+                                  {stockVisibleCols.linked_status && (
+                                    <td>{(() => {
+                                      if (prod.category_id === catLockId) {
+                                        const bikeId = prod.custom_field_values?.associated_bike_id as string;
+                                        const associatedBike = bikeId ? products.find(p => p.id === bikeId) : null;
+                                        return associatedBike ? (
+                                          <span 
+                                            className="badge status-rented" 
+                                            style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                                            onClick={() => openProductModal(associatedBike)}
+                                          >
+                                            🔗 {language === 'es' ? 'Sí' : 'Yes'} ({associatedBike.serial_number})
+                                          </span>
+                                        ) : (
+                                          <span style={{ color: 'var(--text-muted)' }}>{language === 'es' ? 'No' : 'No'}</span>
+                                        );
+                                      } else if (prod.category_id === catBikeId) {
+                                        const associatedLock = products.find(p => p.category_id === catLockId && p.custom_field_values?.associated_bike_id === prod.id);
+                                        return associatedLock ? (
+                                          <span 
+                                            className="badge status-rented" 
+                                            style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                                            onClick={() => openProductModal(associatedLock)}
+                                          >
+                                            🔗 {language === 'es' ? 'Sí' : 'Yes'} ({associatedLock.serial_number})
+                                          </span>
+                                        ) : (
+                                          <span style={{ color: 'var(--text-muted)' }}>{language === 'es' ? 'No' : 'No'}</span>
+                                        );
+                                      }
+                                      return <span style={{ color: 'var(--text-muted)' }}>-</span>;
+                                    })()}</td>
+                                  )}
                                   <td>
                                     <div style={{ display: 'flex', gap: '6px', flexWrap: 'nowrap', alignItems: 'center' }}>
                                       {(isConsolidated ? totalCount : countDisp) > 0 ? (
@@ -8980,7 +9288,7 @@ USING (true);`;
                                           ➕ {language === 'es' ? 'Más' : 'More'}
                                         </button>
 
-                                        {activeStockMenuId === prod.id && (
+                                        {false && (
                                           <>
                                             {/* Click-away overlay */}
                                             <div 
@@ -9569,7 +9877,7 @@ USING (true);`;
                           </div>
                           <div className="glass-card stat-card" style={{ padding: '16px' }}>
                             <div className="stat-label">{language === 'es' ? 'Costo de Adquisición' : 'Acquisition Cost'}</div>
-                            <div className="stat-value" style={{ color: 'var(--text-muted)' }}>€{totalCost}</div>
+                            <div className="stat-value" style={{ color: 'var(--text-muted)' }}>€{totalCost % 1 !== 0 ? totalCost.toFixed(1) : totalCost}</div>
                           </div>
                           <div className="glass-card stat-card" style={{ padding: '16px' }}>
                             <div className="stat-label">{language === 'es' ? 'Ganancia Neta' : 'Net Profit'}</div>
@@ -9631,7 +9939,7 @@ USING (true);`;
                                         <td><span style={{ fontFamily: 'monospace', fontSize: '11px', background: 'rgba(255,255,255,0.06)', padding: '2px 6px', borderRadius: '4px', color: 'var(--text-bright)' }}>{serialDisplay}</span></td>
                                         <td>{s.name}</td>
                                         {soldVisibleCols.category     && <td style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{categoryName}</td>}
-                                        {soldVisibleCols.cost         && <td><strong>€{s.price_paid}</strong></td>}
+                                        {soldVisibleCols.cost         && <td><strong>€{(s.price_paid || 0) % 1 !== 0 ? (s.price_paid || 0).toFixed(1) : (s.price_paid || 0)}</strong></td>}
                                         {soldVisibleCols.price_sold   && <td><strong>€{s.price_sold || 0}</strong></td>}
                                         {soldVisibleCols.profit       && (
                                           <td>
@@ -15939,9 +16247,26 @@ USING (true);`;
         const prod = products.find(p => p.id === selectedProductId);
         if (!prod && soldProducts.length === 0) return null;
         
-        // Filter out products already added
-        const selectedIds = new Set(soldProducts.map(p => p.id));
-        const availableForSale = products.filter(p => p.status === 'Disponible' && !selectedIds.has(p.id));
+        // Count how many of each product ID is currently in the sold list
+        const soldProductCounts: Record<string, number> = {};
+        soldProducts.forEach(item => {
+          soldProductCounts[item.product.id] = (soldProductCounts[item.product.id] || 0) + 1;
+        });
+
+        const availableForSale = products.filter(p => {
+          if (p.status !== 'Disponible') return false;
+          const alreadyAdded = soldProductCounts[p.id] || 0;
+          if (alreadyAdded === 0) return true;
+          
+          // If it's a generic product, we check if there is still quantity available in its stock distribution
+          if (isProductGeneric(p)) {
+            const dist = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
+            const totalQty = dist ? Object.values(dist).reduce((a, b) => a + b, 0) : 1;
+            return alreadyAdded < totalQty;
+          }
+          
+          return false;
+        });
         
         // Filter available by search query
         const searchedAvailable = soldProductSearch.trim()
@@ -15990,116 +16315,120 @@ USING (true);`;
                   </h4>
                   
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '12px' }}>
-                    {soldProducts.map(p => (
-                      <div key={p.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(255, 255, 255, 0.05)', padding: '8px 12px', borderRadius: '8px' }}>
-                        <div>
-                          <strong style={{ color: 'var(--color-primary)' }}>{p.serial_number}</strong> - {p.name}
-                          <span style={{ marginLeft: '8px', color: 'var(--text-muted)', fontSize: '12px' }}>
-                            (Coste: €{p.price_paid})
-                          </span>
-                          {(() => {
-                            const isGeneric = isProductGeneric(p);
-                            if (!isGeneric) return null;
-                            const pGroup = products.filter(item => item.serial_number === p.serial_number && item.status === 'Disponible');
-                            const locsMap: Record<string, number> = {};
-                            pGroup.forEach(mp => {
-                              const dist = (mp.custom_field_values?.location_distribution as Record<string, number>) || {};
-                              Object.entries(dist).forEach(([loc, qty]) => {
-                                if (qty > 0) {
-                                  locsMap[loc] = (locsMap[loc] || 0) + qty;
+                    {soldProducts.map((item) => {
+                      const p = item.product;
+                      const tempId = item.tempId;
+                      return (
+                        <div key={tempId} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(255, 255, 255, 0.05)', padding: '8px 12px', borderRadius: '8px' }}>
+                          <div>
+                            <strong style={{ color: 'var(--color-primary)' }}>{p.serial_number}</strong> - {p.name}
+                            <span style={{ marginLeft: '8px', color: 'var(--text-muted)', fontSize: '12px' }}>
+                              (Coste: €{p.price_paid})
+                            </span>
+                            {(() => {
+                              const isGeneric = isProductGeneric(p);
+                              if (!isGeneric) return null;
+                              const pGroup = products.filter(g => g.serial_number === p.serial_number && g.status === 'Disponible');
+                              const locsMap: Record<string, number> = {};
+                              pGroup.forEach(mp => {
+                                const dist = (mp.custom_field_values?.location_distribution as Record<string, number>) || {};
+                                Object.entries(dist).forEach(([loc, qty]) => {
+                                  if (qty > 0) {
+                                    locsMap[loc] = (locsMap[loc] || 0) + qty;
+                                  }
+                                });
+                                const hasDistField = mp.custom_field_values?.location_distribution != null;
+                                if (!hasDistField && mp.custom_field_values?.location) {
+                                  const singleLoc = mp.custom_field_values.location as string;
+                                  locsMap[singleLoc] = (locsMap[singleLoc] || 0) + 1;
                                 }
                               });
-                              const hasDistField = mp.custom_field_values?.location_distribution != null;
-                              if (!hasDistField && mp.custom_field_values?.location) {
-                                const singleLoc = mp.custom_field_values.location as string;
-                                locsMap[singleLoc] = (locsMap[singleLoc] || 0) + 1;
-                              }
-                            });
-                            const availableLocations = Object.keys(locsMap);
-                            if (availableLocations.length === 0) return null;
-                            return (
-                              <div style={{ marginTop: '6px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-                                  📍 {language === 'es' ? 'Vender desde:' : 'Sell from:'}
-                                </span>
-                                <select
-                                  className="form-control"
-                                  style={{ width: '180px', padding: '2px 6px', height: '24px', fontSize: '12px', margin: 0, display: 'inline-block' }}
-                                  value={soldProductLocations[p.id] || ''}
-                                  onChange={e => {
-                                    const selectedLoc = e.target.value;
-                                    setSoldProductLocations(prev => ({ ...prev, [p.id]: selectedLoc }));
-                                  }}
-                                >
-                                  {availableLocations.map(loc => (
-                                    <option key={loc} value={loc}>
-                                      {loc} ({language === 'es' ? 'Disp:' : 'Avail:'} {locsMap[loc]})
-                                    </option>
-                                  ))}
-                                </select>
-                              </div>
-                            );
-                          })()}
-                        </div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                          <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
-                            {language === 'es' ? 'Precio:' : 'Price:'}
-                          </span>
-                          <input 
-                            type="number" 
-                            className="form-control" 
-                            style={{ width: '80px', padding: '2px 6px', height: '26px', fontSize: '13px', margin: 0 }}
-                            value={soldProductPrices[p.id] ?? ''} 
-                            onChange={e => {
-                              const val = Number(e.target.value);
-                              setSoldProductPrices(prev => {
-                                const next = { ...prev, [p.id]: val };
-                                const newSum = soldProducts.reduce((sum, item) => sum + (next[item.id] ?? 0), 0);
-                                setSoldFormPrice(newSum);
-                                return next;
-                              });
-                            }}
-                          />
-                          {soldProducts.length > 1 && (
-                            <button className="btn-xs btn-secondary" style={{ color: '#ef4444', padding: '2px 6px', height: '26px' }} onClick={async () => {
-                              if (p.category_id === catLockId) {
-                                const bikeId = p.custom_field_values?.associated_bike_id as string;
-                                if (bikeId && soldProducts.some(item => item.id === bikeId)) {
-                                  const msg = language === 'es'
-                                    ? '¿Deseas desvincular el candado de la bicicleta para vender la bicicleta sola?'
-                                    : 'Do you want to unlink the lock from the bike to sell the bike alone?';
-                                  if (!window.confirm(msg)) {
-                                    return;
-                                  }
-                                  try {
-                                    const updatedLock = {
-                                      ...p,
-                                      custom_field_values: {
-                                        ...p.custom_field_values,
-                                        associated_bike_id: undefined
-                                      }
-                                    };
-                                    await upsertProduct(updatedLock);
-                                    triggerReload();
-                                  } catch (err) {
-                                    console.error('Error unlinking lock from sold list:', err);
+                              const availableLocations = Object.keys(locsMap);
+                              if (availableLocations.length === 0) return null;
+                              return (
+                                <div style={{ marginTop: '6px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                  <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                                    📍 {language === 'es' ? 'Vender desde:' : 'Sell from:'}
+                                  </span>
+                                  <select
+                                    className="form-control"
+                                    style={{ width: '180px', padding: '2px 6px', height: '24px', fontSize: '12px', margin: 0, display: 'inline-block' }}
+                                    value={soldProductLocations[tempId] || ''}
+                                    onChange={e => {
+                                      const selectedLoc = e.target.value;
+                                      setSoldProductLocations(prev => ({ ...prev, [tempId]: selectedLoc }));
+                                    }}
+                                  >
+                                    {availableLocations.map(loc => (
+                                      <option key={loc} value={loc}>
+                                        {loc} ({language === 'es' ? 'Disp:' : 'Avail:'} {locsMap[loc]})
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+                              );
+                            })()}
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                              {language === 'es' ? 'Precio:' : 'Price:'}
+                            </span>
+                            <input 
+                              type="number" 
+                              className="form-control" 
+                              style={{ width: '80px', padding: '2px 6px', height: '26px', fontSize: '13px', margin: 0 }}
+                              value={soldProductPrices[tempId] ?? ''} 
+                              onChange={e => {
+                                const val = Number(e.target.value);
+                                setSoldProductPrices(prev => {
+                                  const next = { ...prev, [tempId]: val };
+                                  const newSum = soldProducts.reduce((sum, x) => sum + (next[x.tempId] ?? 0), 0);
+                                  setSoldFormPrice(newSum);
+                                  return next;
+                                });
+                              }}
+                            />
+                            {soldProducts.length > 1 && (
+                              <button className="btn-xs btn-secondary" style={{ color: '#ef4444', padding: '2px 6px', height: '26px' }} onClick={async () => {
+                                if (p.category_id === catLockId) {
+                                  const bikeId = p.custom_field_values?.associated_bike_id as string;
+                                  if (bikeId && soldProducts.some(x => x.product.id === bikeId)) {
+                                    const msg = language === 'es'
+                                      ? '¿Deseas desvincular el candado de la bicicleta para vender la bicicleta sola?'
+                                      : 'Do you want to unlink the lock from the bike to sell the bike alone?';
+                                    if (!window.confirm(msg)) {
+                                      return;
+                                    }
+                                    try {
+                                      const updatedLock = {
+                                        ...p,
+                                        custom_field_values: {
+                                          ...p.custom_field_values,
+                                          associated_bike_id: undefined
+                                        }
+                                      };
+                                      await upsertProduct(updatedLock);
+                                      triggerReload();
+                                    } catch (err) {
+                                      console.error('Error unlinking lock from sold list:', err);
+                                    }
                                   }
                                 }
-                              }
-                              const filtered = soldProducts.filter(item => item.id !== p.id);
-                              setSoldProducts(filtered);
-                              setSoldProductPrices(prev => {
-                                const next = { ...prev };
-                                delete next[p.id];
-                                const newSum = filtered.reduce((sum, item) => sum + (next[item.id] ?? 0), 0);
-                                setSoldFormPrice(newSum);
-                                return next;
-                              });
-                            }}>✕</button>
-                          )}
+                                const filtered = soldProducts.filter(x => x.tempId !== tempId);
+                                setSoldProducts(filtered);
+                                setSoldProductPrices(prev => {
+                                  const next = { ...prev };
+                                  delete next[tempId];
+                                  const newSum = filtered.reduce((sum, x) => sum + (next[x.tempId] ?? 0), 0);
+                                  setSoldFormPrice(newSum);
+                                  return next;
+                                });
+                              }}>✕</button>
+                            )}
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
 
                   {/* Agregar más productos */}
@@ -16119,19 +16448,20 @@ USING (true);`;
                             key={p.id} 
                             style={{ padding: '8px 12px', cursor: 'pointer', borderBottom: '1px solid rgba(255,255,255,0.05)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
                             onClick={() => {
-                              const newList = [...soldProducts, p];
+                              const newTempId = crypto.randomUUID();
+                              const newList = [...soldProducts, { tempId: newTempId, product: p }];
                               setSoldProducts(newList);
                               setSoldProductSearch('');
                               const suggested = p.price_sold ?? (p.price_paid ? Math.round(p.price_paid * 1.5) : 500);
                               setSoldProductPrices(prev => {
-                                const next = { ...prev, [p.id]: suggested };
-                                const newSum = newList.reduce((sum, item) => sum + (next[item.id] ?? 0), 0);
+                                const next = { ...prev, [newTempId]: suggested };
+                                const newSum = newList.reduce((sum, x) => sum + (next[x.tempId] ?? 0), 0);
                                 setSoldFormPrice(newSum);
                                 return next;
                               });
                               const pDist = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
                               const pLoc = pDist ? Object.entries(pDist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central' : (p.custom_field_values?.location as string || 'Almacén Central');
-                              setSoldProductLocations(prev => ({ ...prev, [p.id]: pLoc }));
+                              setSoldProductLocations(prev => ({ ...prev, [newTempId]: pLoc }));
                             }}
                           >
                             <span><strong>{p.serial_number}</strong> - {p.name}</span>
@@ -16210,7 +16540,7 @@ USING (true);`;
 
                   <div className="form-group" style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
                     <label className="form-label" style={{ fontWeight: 600, marginBottom: '8px' }}>💵 {language === 'es' ? 'Recibido Vía' : 'Received Via'}</label>
-                    <div style={{ display: 'flex', gap: '24px' }}>
+                    <div style={{ display: 'flex', gap: '24px', flexWrap: 'wrap' }}>
                       <label style={{ fontSize: '15px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px' }}>
                         <input 
                           type="radio" 
@@ -16231,8 +16561,79 @@ USING (true);`;
                         />
                         🏦 {language === 'es' ? 'Transferencia' : 'Transfer'}
                       </label>
+                      <label style={{ fontSize: '15px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <input 
+                          type="radio" 
+                          name="soldReceivedVia"
+                          checked={soldReceivedVia === 'mixto'} 
+                          onChange={() => {
+                            setSoldReceivedVia('mixto');
+                            const targetAmount = soldPaymentType === 'financiado' ? soldDownPayment : soldFormPrice;
+                            setSoldMixedCash(targetAmount);
+                            setSoldMixedTransfer(0);
+                          }}
+                          style={{ scale: '1.2' }} 
+                        />
+                        🔀 {language === 'es' ? 'Mixto' : 'Mixed'}
+                      </label>
                     </div>
                   </div>
+
+                  {soldReceivedVia === 'mixto' && (
+                    <div style={{
+                      gridColumn: 'span 2',
+                      display: 'grid',
+                      gridTemplateColumns: '1fr 1fr',
+                      gap: '12px',
+                      background: 'rgba(255, 255, 255, 0.03)',
+                      padding: '12px',
+                      borderRadius: '8px',
+                      border: '1px solid rgba(255, 255, 255, 0.08)',
+                      marginTop: '4px',
+                      marginBottom: '12px'
+                    }}>
+                      <div className="form-group" style={{ margin: 0 }}>
+                        <label className="form-label" style={{ fontSize: '13px', color: 'rgba(255,255,255,0.7)', fontWeight: 500 }}>
+                          💶 {language === 'es' ? 'Monto en Efectivo' : 'Cash Amount'}
+                        </label>
+                        <input
+                          type="number"
+                          className="form-control"
+                          step="0.01"
+                          min="0"
+                          max={soldPaymentType === 'financiado' ? soldDownPayment : soldFormPrice}
+                          value={soldMixedCash}
+                          onChange={e => {
+                            const val = parseFloat(e.target.value) || 0;
+                            const targetAmount = soldPaymentType === 'financiado' ? soldDownPayment : soldFormPrice;
+                            const cash = Math.max(0, Math.min(targetAmount, val));
+                            setSoldMixedCash(cash);
+                            setSoldMixedTransfer(Number((targetAmount - cash).toFixed(2)));
+                          }}
+                        />
+                      </div>
+                      <div className="form-group" style={{ margin: 0 }}>
+                        <label className="form-label" style={{ fontSize: '13px', color: 'rgba(255,255,255,0.7)', fontWeight: 500 }}>
+                          🏦 {language === 'es' ? 'Monto por Transferencia' : 'Transfer Amount'}
+                        </label>
+                        <input
+                          type="number"
+                          className="form-control"
+                          step="0.01"
+                          min="0"
+                          max={soldPaymentType === 'financiado' ? soldDownPayment : soldFormPrice}
+                          value={soldMixedTransfer}
+                          onChange={e => {
+                            const val = parseFloat(e.target.value) || 0;
+                            const targetAmount = soldPaymentType === 'financiado' ? soldDownPayment : soldFormPrice;
+                            const transfer = Math.max(0, Math.min(targetAmount, val));
+                            setSoldMixedTransfer(transfer);
+                            setSoldMixedCash(Number((targetAmount - transfer).toFixed(2)));
+                          }}
+                        />
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {/* 5. SECCION DATOS DEL CLIENTE (SIEMPRE VISIBLE) */}
@@ -16415,9 +16816,9 @@ USING (true);`;
                         total_amount: soldFormPrice,
                         down_payment: soldPaymentType === 'financiado' ? soldDownPayment : soldFormPrice,
                         email_language: soldEmailLang,
-                        notes: soldPaymentType === 'financiado' 
+                        notes: (soldPaymentType === 'financiado' 
                           ? `Venta financiada en ${soldInstallments} cuotas ${soldFrequency}.` 
-                          : 'Venta de contado.',
+                          : 'Venta de contado.') + (soldReceivedVia === 'mixto' ? ` [Pago Mixto] Efectivo: €${soldMixedCash} | Transferencia: €${soldMixedTransfer}` : ''),
                         status: soldPaymentType === 'financiado' ? 'Financiada' : 'Completada',
                         created_at: new Date().toISOString(),
                         received_via: soldReceivedVia,
@@ -16440,11 +16841,13 @@ USING (true);`;
                         await deleteProduct(id);
                         currentProducts = currentProducts.filter(cp => cp.id !== id);
                       };
-                      for (const p of soldProducts) {
-                        const actualUnitPrice = soldProductPrices[p.id] ?? p.price_sold ?? (p.price_paid ? Math.round(p.price_paid * 1.5) : 500);
+                      for (const item of soldProducts) {
+                        const p = item.product;
+                        const tempId = item.tempId;
+                        const actualUnitPrice = soldProductPrices[tempId] ?? p.price_sold ?? (p.price_paid ? Math.round(p.price_paid * 1.5) : 500);
                         const statusToSet = soldPaymentType === 'financiado' ? 'Financiada' : 'Vendida';
                         const isGeneric = isProductGeneric(p);
-                        const selectedLoc = soldProductLocations[p.id] || 'Almacén Central';
+                        const selectedLoc = soldProductLocations[tempId] || 'Almacén Central';
                         const dist = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
                         const totalQty = dist ? Object.values(dist).reduce((a, b) => a + b, 0) : 0;
 
@@ -16667,7 +17070,7 @@ USING (true);`;
 
                         // 5. Create calendar event for next upcoming payment
                         if (paymentsList.length > 0) {
-                          const bikeSerials = soldProducts.map(p => p.serial_number).join(', ');
+                          const bikeSerials = soldProducts.map(item => item.product.serial_number).join(', ');
                           const reminderEvent = {
                             id: crypto.randomUUID(),
                             title: `💳 Cuota 1/${soldInstallments}: ${soldCustomerFirstName} ${soldCustomerLastName}`,
@@ -16682,12 +17085,12 @@ USING (true);`;
 
                         // 6. Trigger Financing email structure
                         if (customerObj) {
-                          sendFinancingPlanEmail(saleObj, { ...financingPlanObj, created_at: new Date().toISOString() }, paymentsList, soldProducts, customerObj, soldEmailLang, emailTemplates);
+                          sendFinancingPlanEmail(saleObj, { ...financingPlanObj, created_at: new Date().toISOString() }, paymentsList, soldProducts.map(item => item.product), customerObj, soldEmailLang, emailTemplates);
                         }
                       } else {
                         // Send cash sale confirmation email
                         if (customerObj) {
-                          sendSaleConfirmationEmail(saleObj, soldProducts, customerObj, soldEmailLang, emailTemplates);
+                          sendSaleConfirmationEmail(saleObj, soldProducts.map(item => item.product), customerObj, soldEmailLang, emailTemplates);
                         } else {
                           // No customer registered, just print details
                           console.log("[EMAIL MOCK] Venta de contado realizada, sin cliente registrado.", saleObj);
@@ -17088,27 +17491,65 @@ USING (true);`;
                       }
                       
                       const rItems = rentalItems.filter(item => item.rental_id === rental.id);
-                      const itemUpdates = rItems.map(item => {
+                      const itemUpdates: Promise<unknown>[] = [];
+                      const itemDeletes: string[] = [];
+                      // Accumulate distribution increments per master record so several
+                      // returned units of the same generic item merge correctly in one pass.
+                      const masterMerges: Record<string, { product: Product; dist: Record<string, number> }> = {};
+                      for (const item of rItems) {
                         const prod = products.find(p => p.id === item.product_id);
-                        if (prod && prod.status === 'Rentada') {
-                          if (prod.category_id === catLockId) {
-                            const keep = prod.custom_field_values?.keep_associated;
-                            const updatedLock = {
-                              ...prod,
-                              status: 'Disponible' as const,
-                              custom_field_values: {
-                                ...prod.custom_field_values,
-                                associated_bike_id: keep ? prod.custom_field_values?.associated_bike_id : undefined,
-                                keep_associated: keep ? true : undefined
-                              }
-                            };
-                            return upsertProduct(updatedLock);
-                          }
-                          return upsertProduct({ ...prod, status: 'Disponible' });
+                        if (!prod || prod.status !== 'Rentada') continue;
+                        if (prod.category_id === catLockId) {
+                          const keep = prod.custom_field_values?.keep_associated;
+                          itemUpdates.push(upsertProduct({
+                            ...prod,
+                            status: 'Disponible',
+                            custom_field_values: {
+                              ...prod.custom_field_values,
+                              associated_bike_id: keep ? prod.custom_field_values?.associated_bike_id : undefined,
+                              keep_associated: keep ? true : undefined
+                            }
+                          }));
+                          continue;
                         }
-                        return Promise.resolve();
+                        const prodDist = prod.custom_field_values?.location_distribution as Record<string, number> | undefined;
+                        const isGenericSplit = isProductGeneric(prod) && prodDist == null;
+                        if (isGenericSplit) {
+                          // Merge the returned unit back into the group's master distribution
+                          // (avoids leaving an orphan single-unit row that can't be managed later).
+                          const loc = (prod.custom_field_values?.location as string) || 'Almacén Central';
+                          const master = products.find(p =>
+                            p.serial_number === prod.serial_number && p.id !== prod.id &&
+                            p.status === 'Disponible' && p.custom_field_values?.location_distribution != null);
+                          if (master) {
+                            if (!masterMerges[master.id]) {
+                              masterMerges[master.id] = {
+                                product: master,
+                                dist: { ...((master.custom_field_values?.location_distribution as Record<string, number>) || {}) }
+                              };
+                            }
+                            masterMerges[master.id].dist[loc] = (masterMerges[master.id].dist[loc] || 0) + 1;
+                            itemDeletes.push(prod.id);
+                          } else {
+                            // No master carries a distribution: normalise this unit into one.
+                            itemUpdates.push(upsertProduct({
+                              ...prod,
+                              status: 'Disponible',
+                              custom_field_values: { ...prod.custom_field_values, location: loc, location_distribution: { [loc]: 1 } }
+                            }));
+                          }
+                        } else {
+                          itemUpdates.push(upsertProduct({ ...prod, status: 'Disponible' }));
+                        }
+                      }
+                      Object.values(masterMerges).forEach(({ product, dist }) => {
+                        itemUpdates.push(upsertProduct({
+                          ...product,
+                          custom_field_values: { ...product.custom_field_values, location_distribution: dist }
+                        }));
                       });
                       await Promise.all(itemUpdates);
+                      for (const delId of itemDeletes) await deleteProduct(delId);
                       
                       // Clean object URLs
                       returnPhotoPreviews.forEach(url => URL.revokeObjectURL(url));
@@ -23135,8 +23576,21 @@ USING (true);`;
 
                         const dist = { ...((mp.custom_field_values?.location_distribution as Record<string, number>) || {}) };
                         const locQty = dist[genStockLocation] || 0;
+                        const isOrphanUnit = Object.keys(dist).length === 0 && mp.custom_field_values?.location === genStockLocation;
 
-                        if (locQty > 0) {
+                        if (isOrphanUnit) {
+                          // Legacy single-unit row with no distribution (from older returns/sales) — counts as 1 unit.
+                          qtyToRemove -= 1;
+                          const totalRowsInGroup = products.filter(p => p.serial_number === prod.serial_number).length;
+                          if (totalRowsInGroup <= 1) {
+                            updates.push(upsertProduct({
+                              ...mp,
+                              custom_field_values: { ...mp.custom_field_values, location: null, location_distribution: {} }
+                            }));
+                          } else {
+                            deletes.push(deleteProduct(mp.id));
+                          }
+                        } else if (locQty > 0) {
                           const deduct = Math.min(qtyToRemove, locQty);
                           dist[genStockLocation] = locQty - deduct;
                           qtyToRemove -= deduct;
@@ -23285,6 +23739,50 @@ USING (true);`;
               >
                 ✏️ {t.edit}
               </button>
+
+              {/* Lock Association Option */}
+              {prod.category_id === catLockId && (
+                <button
+                  className="dropdown-item"
+                  style={{ 
+                    width: '100%', 
+                    textAlign: 'left', 
+                    background: 'transparent', 
+                    border: 'none', 
+                    borderRadius: '6px', 
+                    padding: '8px 12px', 
+                    fontSize: '12px', 
+                    color: 'var(--text-muted)', 
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    transition: 'all 0.2s ease'
+                  }}
+                  onClick={() => {
+                    setActiveStockMenuId(null);
+                    setSelectedProductId(prod.id);
+                    if (prod.custom_field_values?.associated_bike_id) {
+                      setModalType('confirmUnlinkLock');
+                    } else {
+                      setModalType('linkLockToBike');
+                    }
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
+                    e.currentTarget.style.color = 'var(--text-bright)';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = 'transparent';
+                    e.currentTarget.style.color = 'var(--text-muted)';
+                  }}
+                >
+                  {prod.custom_field_values?.associated_bike_id 
+                    ? (language === 'es' ? '🔗 Desvincular de Bike' : '🔗 Unlink from Bike')
+                    : (language === 'es' ? '🔗 Vincular a Bike' : '🔗 Link to Bike')
+                  }
+                </button>
+              )}
               
               {isGeneric && (
                 <>
