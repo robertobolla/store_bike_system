@@ -1,0 +1,608 @@
+﻿diff --git a/src/App.tsx b/src/App.tsx
+index 94b0db5..800f521 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -2121,7 +2121,10 @@ USING (true);`;
+             category_id: p.category_id
+           };
+         }
+-        purchaseGroups[groupKey].quantity += 1;
++        const dist = (p.custom_field_values?.location_distribution as Record<string, number>) || {};
++        const isCons = !!p.custom_field_values?.location_distribution;
++        const rowQty = isCons ? Object.values(dist).reduce((a, b) => a + b, 0) : 1;
++        purchaseGroups[groupKey].quantity += rowQty;
+         purchaseGroups[groupKey].ids.push(p.id);
+         
+         const groupCreatedAt = purchaseGroups[groupKey].created_at;
+@@ -2429,6 +2432,20 @@ USING (true);`;
+   const [selectedProductId, setSelectedProductId] = useState<string | null>(null);
+   const [selectedCondition, setSelectedCondition] = useState<'nuevo' | 'bueno' | 'regular' | 'para venta'>('bueno');
+   const [activeStockMenuId, setActiveStockMenuId] = useState<string | null>(null);
++
++  useEffect(() => {
++    const handleScroll = () => {
++      setActiveStockMenuId(null);
++      setMenuCoords(null);
++    };
++    if (activeStockMenuId) {
++      window.addEventListener('scroll', handleScroll, { capture: true, passive: true });
++    }
++    return () => {
++      window.removeEventListener('scroll', handleScroll, { capture: true });
++    };
++  }, [activeStockMenuId]);
++
+   const [activeLeadMenuId, setActiveLeadMenuId] = useState<string | null>(null);
+   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
+   const [selectedEventId,   setSelectedEventId]   = useState<string | null>(null);
+@@ -3398,6 +3415,13 @@ USING (true);`;
+   const [wizKitProductIds, setWizKitProductIds] = useState<string[]>([]);
+   const [kitSearchModalOpen, setKitSearchModalOpen] = useState(false);
+   const [kitSearchQuery, setKitSearchQuery] = useState('');
++  // Generic Stock addition/removal states
++  const [addGenStockModalOpen, setAddGenStockModalOpen] = useState(false);
++  const [removeGenStockModalOpen, setRemoveGenStockModalOpen] = useState(false);
++  const [genStockQty, setGenStockQty] = useState(1);
++  const [genStockLocation, setGenStockLocation] = useState('Almac├®n Central');
++  const [genStockCost, setGenStockCost] = useState(0);
++  const [menuCoords, setMenuCoords] = useState<{ top: number; left: number; width: number; height: number } | null>(null);
+ 
+   // Conditional Referral UI States (Wizard)
+   const [wizRefType, setWizRefType] = useState('Instagram');
+@@ -6463,7 +6487,6 @@ USING (true);`;
+                               const totalCount = isConsolidated
+                                 ? Object.values(prod.custom_field_values.location_distribution as Record<string, number>).reduce((a, b) => a + b, 0)
+                                 : group.length;
+-                              const isLastFew = index > 0 && index >= groupedList.length - 2;
+                               const serialDisplay = (prod.serial_number || '').replace(/^([A-Za-z]+)(\d+)$/, '$1-$2');
+                               const catMatch = (categories || []).find(c => c && c.id === prod.category_id);
+                               const categoryName = catMatch ? (language === 'es' ? catMatch.name_es : catMatch.name_en) : '';
+@@ -6700,27 +6723,44 @@ USING (true);`;
+                                           style={{ display: 'flex', alignItems: 'center', gap: '4px' }}
+                                           onClick={(e) => {
+                                             e.stopPropagation();
+-                                            setActiveStockMenuId(activeStockMenuId === prod.id ? null : prod.id);
++                                            const rect = e.currentTarget.getBoundingClientRect();
++                                            if (activeStockMenuId === prod.id) {
++                                              setActiveStockMenuId(null);
++                                              setMenuCoords(null);
++                                            } else {
++                                              setActiveStockMenuId(prod.id);
++                                              setMenuCoords({
++                                                top: rect.top,
++                                                left: rect.left,
++                                                width: rect.width,
++                                                height: rect.height
++                                              });
++                                            }
+                                           }}
+                                         >
+                                           Ô×ò {language === 'es' ? 'M├ís' : 'More'}
+                                         </button>
+                                         
+-                                        {activeStockMenuId === prod.id && (
++                                        {activeStockMenuId === prod.id && menuCoords && (
+                                           <>
+                                             <div 
+-                                              style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 90, cursor: 'default' }}
++                                              style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 1190, cursor: 'default' }}
+                                               onClick={(e) => {
+                                                 e.stopPropagation();
+                                                 setActiveStockMenuId(null);
++                                                setMenuCoords(null);
+                                               }}
+                                             />
+                                             
+                                             <div 
+                                               style={{ 
+-                                                position: 'absolute', 
+-                                                ...(isLastFew ? { bottom: 'calc(100% + 4px)' } : { top: 'calc(100% + 4px)' }),
+-                                                right: 0, 
++                                                position: 'fixed', 
++                                                top: (menuCoords.top + 220 > window.innerHeight)
++                                                  ? `${menuCoords.top - 4}px` 
++                                                  : `${menuCoords.top + menuCoords.height + 4}px`,
++                                                left: `${Math.max(8, menuCoords.left + menuCoords.width - 150)}px`,
++                                                transform: (menuCoords.top + 220 > window.innerHeight) ? 'translateY(-100%)' : 'none',
++                                                right: 'auto', 
+                                                 background: 'rgba(23, 23, 37, 0.98)', 
+                                                 backdropFilter: 'blur(12px)',
+                                                 WebkitBackdropFilter: 'blur(12px)',
+@@ -6767,6 +6807,84 @@ USING (true);`;
+                                               >
+                                                 Ô£Å´©Å {t.edit}
+                                               </button>
++                                              {isConsolidated && (
++                                                <>
++                                                  <button
++                                                    className="dropdown-item"
++                                                    style={{ 
++                                                      width: '100%', 
++                                                      textAlign: 'left', 
++                                                      background: 'transparent', 
++                                                      border: 'none', 
++                                                      borderRadius: '6px', 
++                                                      padding: '8px 12px', 
++                                                      fontSize: '12px', 
++                                                      color: 'var(--text-muted)', 
++                                                      cursor: 'pointer',
++                                                      display: 'flex',
++                                                      alignItems: 'center',
++                                                      gap: '8px',
++                                                      transition: 'all 0.2s ease'
++                                                    }}
++                                                    onClick={() => {
++                                                      setActiveStockMenuId(null);
++                                                      setSelectedProductId(prod.id);
++                                                      setGenStockQty(1);
++                                                      setGenStockLocation('Almac├®n Central');
++                                                      setGenStockCost(prod.price_paid || 0);
++                                                      setAddGenStockModalOpen(true);
++                                                    }}
++                                                    onMouseEnter={(e) => {
++                                                      e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
++                                                      e.currentTarget.style.color = 'var(--text-bright)';
++                                                    }}
++                                                    onMouseLeave={(e) => {
++                                                      e.currentTarget.style.background = 'transparent';
++                                                      e.currentTarget.style.color = 'var(--text-muted)';
++                                                    }}
++                                                  >
++                                                    Ô×ò ${language === 'es' ? 'Agregar existencias' : 'Add Stock'}
++                                                  </button>
++                                                  <button
++                                                    className="dropdown-item"
++                                                    style={{ 
++                                                      width: '100%', 
++                                                      textAlign: 'left', 
++                                                      background: 'transparent', 
++                                                      border: 'none', 
++                                                      borderRadius: '6px', 
++                                                      padding: '8px 12px', 
++                                                      fontSize: '12px', 
++                                                      color: 'var(--text-muted)', 
++                                                      cursor: 'pointer',
++                                                      display: 'flex',
++                                                      alignItems: 'center',
++                                                      gap: '8px',
++                                                      transition: 'all 0.2s ease'
++                                                    }}
++                                                    onClick={() => {
++                                                      setActiveStockMenuId(null);
++                                                      setSelectedProductId(prod.id);
++                                                      setGenStockQty(1);
++                                                      const distObj = (prod.custom_field_values?.location_distribution as Record<string, number>) || {};
++                                                      const locs = Object.keys(distObj).filter(k => distObj[k] > 0);
++                                                      setGenStockLocation(locs[0] || 'Almac├®n Central');
++                                                      setRemoveGenStockModalOpen(true);
++                                                    }}
++                                                    onMouseEnter={(e) => {
++                                                      e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
++                                                      e.currentTarget.style.color = 'var(--text-bright)';
++                                                    }}
++                                                    onMouseLeave={(e) => {
++                                                      e.currentTarget.style.background = 'transparent';
++                                                      e.currentTarget.style.color = 'var(--text-muted)';
++                                                    }}
++                                                  >
++                                                    Ô×û ${language === 'es' ? 'Quitar existencias' : 'Remove Stock'}
++                                                  </button>
++                                                </>
++                                              )}
++
+ 
+                                               {prod.status !== 'Vendida' && prod.status !== 'Financiada' && (
+                                                 <>
+@@ -7119,7 +7237,6 @@ USING (true);`;
+                             return groupedList.map((group, index) => {
+                               const prod = group[0];
+                               const isConsolidated = !!prod.custom_field_values?.location_distribution;
+-                              const isLastFew = index > 0 && index >= groupedList.length - 2;
+                               const totalCount = isConsolidated
+                                 ? Object.values(prod.custom_field_values.location_distribution as Record<string, number>).reduce((a, b) => a + b, 0)
+                                 : group.length;
+@@ -7344,29 +7461,46 @@ USING (true);`;
+                                           style={{ display: 'flex', alignItems: 'center', gap: '4px' }}
+                                           onClick={(e) => {
+                                             e.stopPropagation();
+-                                            setActiveStockMenuId(activeStockMenuId === prod.id ? null : prod.id);
++                                            const rect = e.currentTarget.getBoundingClientRect();
++                                            if (activeStockMenuId === prod.id) {
++                                              setActiveStockMenuId(null);
++                                              setMenuCoords(null);
++                                            } else {
++                                              setActiveStockMenuId(prod.id);
++                                              setMenuCoords({
++                                                top: rect.top,
++                                                left: rect.left,
++                                                width: rect.width,
++                                                height: rect.height
++                                              });
++                                            }
+                                           }}
+                                         >
+                                           Ô×ò {language === 'es' ? 'M├ís' : 'More'}
+                                         </button>
+                                         
+-                                        {activeStockMenuId === prod.id && (
++                                        {activeStockMenuId === prod.id && menuCoords && (
+                                           <>
+                                             {/* Click-away overlay */}
+                                             <div 
+-                                              style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 90, cursor: 'default' }}
++                                              style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 1190, cursor: 'default' }}
+                                               onClick={(e) => {
+                                                 e.stopPropagation();
+                                                 setActiveStockMenuId(null);
++                                                setMenuCoords(null);
+                                               }}
+                                             />
+                                             
+                                             {/* Dropdown Menu */}
+                                             <div 
+                                               style={{ 
+-                                                position: 'absolute', 
+-                                                ...(isLastFew ? { bottom: 'calc(100% + 4px)' } : { top: 'calc(100% + 4px)' }),
+-                                                right: 0, 
++                                                position: 'fixed', 
++                                                top: (menuCoords.top + 220 > window.innerHeight)
++                                                  ? `${menuCoords.top - 4}px` 
++                                                  : `${menuCoords.top + menuCoords.height + 4}px`,
++                                                left: `${Math.max(8, menuCoords.left + menuCoords.width - 150)}px`,
++                                                transform: (menuCoords.top + 220 > window.innerHeight) ? 'translateY(-100%)' : 'none',
++                                                right: 'auto', 
+                                                 background: 'rgba(23, 23, 37, 0.98)', 
+                                                 backdropFilter: 'blur(12px)',
+                                                 WebkitBackdropFilter: 'blur(12px)',
+@@ -7413,6 +7547,84 @@ USING (true);`;
+                                               >
+                                                 Ô£Å´©Å {t.edit}
+                                               </button>
++                                              {isConsolidated && (
++                                                <>
++                                                  <button
++                                                    className="dropdown-item"
++                                                    style={{ 
++                                                      width: '100%', 
++                                                      textAlign: 'left', 
++                                                      background: 'transparent', 
++                                                      border: 'none', 
++                                                      borderRadius: '6px', 
++                                                      padding: '8px 12px', 
++                                                      fontSize: '12px', 
++                                                      color: 'var(--text-muted)', 
++                                                      cursor: 'pointer',
++                                                      display: 'flex',
++                                                      alignItems: 'center',
++                                                      gap: '8px',
++                                                      transition: 'all 0.2s ease'
++                                                    }}
++                                                    onClick={() => {
++                                                      setActiveStockMenuId(null);
++                                                      setSelectedProductId(prod.id);
++                                                      setGenStockQty(1);
++                                                      setGenStockLocation('Almac├®n Central');
++                                                      setGenStockCost(prod.price_paid || 0);
++                                                      setAddGenStockModalOpen(true);
++                                                    }}
++                                                    onMouseEnter={(e) => {
++                                                      e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
++                                                      e.currentTarget.style.color = 'var(--text-bright)';
++                                                    }}
++                                                    onMouseLeave={(e) => {
++                                                      e.currentTarget.style.background = 'transparent';
++                                                      e.currentTarget.style.color = 'var(--text-muted)';
++                                                    }}
++                                                  >
++                                                    Ô×ò ${language === 'es' ? 'Agregar existencias' : 'Add Stock'}
++                                                  </button>
++                                                  <button
++                                                    className="dropdown-item"
++                                                    style={{ 
++                                                      width: '100%', 
++                                                      textAlign: 'left', 
++                                                      background: 'transparent', 
++                                                      border: 'none', 
++                                                      borderRadius: '6px', 
++                                                      padding: '8px 12px', 
++                                                      fontSize: '12px', 
++                                                      color: 'var(--text-muted)', 
++                                                      cursor: 'pointer',
++                                                      display: 'flex',
++                                                      alignItems: 'center',
++                                                      gap: '8px',
++                                                      transition: 'all 0.2s ease'
++                                                    }}
++                                                    onClick={() => {
++                                                      setActiveStockMenuId(null);
++                                                      setSelectedProductId(prod.id);
++                                                      setGenStockQty(1);
++                                                      const distObj = (prod.custom_field_values?.location_distribution as Record<string, number>) || {};
++                                                      const locs = Object.keys(distObj).filter(k => distObj[k] > 0);
++                                                      setGenStockLocation(locs[0] || 'Almac├®n Central');
++                                                      setRemoveGenStockModalOpen(true);
++                                                    }}
++                                                    onMouseEnter={(e) => {
++                                                      e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
++                                                      e.currentTarget.style.color = 'var(--text-bright)';
++                                                    }}
++                                                    onMouseLeave={(e) => {
++                                                      e.currentTarget.style.background = 'transparent';
++                                                      e.currentTarget.style.color = 'var(--text-muted)';
++                                                    }}
++                                                  >
++                                                    Ô×û ${language === 'es' ? 'Quitar existencias' : 'Remove Stock'}
++                                                  </button>
++                                                </>
++                                              )}
++
+ 
+                                               {prod.status !== 'Vendida' && prod.status !== 'Financiada' && (
+                                                 <>
+@@ -19368,6 +19580,266 @@ USING (true);`;
+         </div>
+       )}
+ 
++      
++      {/* ===== ADD GENERIC STOCK MODAL ===== */}
++      {addGenStockModalOpen && (() => {
++        const prod = products.find(p => p.id === selectedProductId);
++        if (!prod) return null;
++        
++        return (
++          <div className="modal-overlay" style={{ zIndex: 1300 }} onClick={() => setAddGenStockModalOpen(false)}>
++            <div className="modal-content" style={{ maxWidth: '450px', width: '100%', padding: '24px' }} onClick={e => e.stopPropagation()}>
++              <div className="modal-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
++                <h3>Ô×ò {language === 'es' ? 'Agregar Existencias' : 'Add Stock'} ({prod.serial_number})</h3>
++                <button className="btn-secondary btn-xs" onClick={() => setAddGenStockModalOpen(false)}>Ô£ò</button>
++              </div>
++              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
++                <div className="form-group">
++                  <label className="form-label">{language === 'es' ? 'Cantidad a agregar' : 'Quantity to add'}</label>
++                  <input 
++                    type="number" 
++                    className="form-control" 
++                    min={1} 
++                    value={genStockQty} 
++                    onChange={e => setGenStockQty(Math.max(1, Number(e.target.value)))} 
++                  />
++                </div>
++                <div className="form-group">
++                  <label className="form-label">{language === 'es' ? 'Ubicaci├│n' : 'Location'}</label>
++                  <input 
++                    type="text" 
++                    className="form-control" 
++                    placeholder="Ej: Oficina, Almac├®n Central..."
++                    value={genStockLocation} 
++                    onChange={e => setGenStockLocation(e.target.value)} 
++                  />
++                </div>
++                <div className="form-group">
++                  <label className="form-label">{language === 'es' ? 'Costo unitario (Ôé¼)' : 'Unit Cost (Ôé¼)'}</label>
++                  <input 
++                    type="number" 
++                    className="form-control" 
++                    min={0} 
++                    value={genStockCost} 
++                    onChange={e => setGenStockCost(Math.max(0, Number(e.target.value)))} 
++                  />
++                </div>
++              </div>
++              <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
++                <button className="btn-secondary" onClick={() => setAddGenStockModalOpen(false)}>
++                  {language === 'es' ? 'Cancelar' : 'Cancel'}
++                </button>
++                <button 
++                  className="btn-primary" 
++                  onClick={async () => {
++                    const cleanLocation = genStockLocation.trim() || 'Almac├®n Central';
++                    try {
++                      // Insert new product row representing these new generic units
++                      const newId = crypto.randomUUID();
++                      await upsertProduct({
++                        ...prod,
++                        id: newId,
++                        status: 'Disponible',
++                        price_paid: genStockCost,
++                        price_sold: null,
++                        sold_date: null,
++                        purchase_date: new Date().toISOString().split('T')[0],
++                        date_added: new Date().toISOString(),
++                        custom_field_values: {
++                          ...prod.custom_field_values,
++                          location: cleanLocation,
++                          location_distribution: {
++                            [cleanLocation]: genStockQty
++                          }
++                        }
++                      });
++                      showToast(language === 'es' ? 'Existencias a├▒adidas correctamente.' : 'Stock added successfully.', 'success');
++                      setAddGenStockModalOpen(false);
++                      triggerReload();
++                    } catch (err) {
++                      console.error('Error adding generic stock:', err);
++                      showToast(language === 'es' ? 'Error al agregar existencias.' : 'Error adding stock.', 'error');
++                    }
++                  }}
++                >
++                  ­ƒÆ¥ {language === 'es' ? 'Guardar' : 'Save'}
++                </button>
++              </div>
++            </div>
++          </div>
++        );
++      })()}
++
++      {/* ===== REMOVE GENERIC STOCK MODAL ===== */}
++      {removeGenStockModalOpen && (() => {
++        const prod = products.find(p => p.id === selectedProductId);
++        if (!prod) return null;
++
++        // Find all rows with the same serial number
++        const matchingProducts = products.filter(p => p.serial_number === prod.serial_number && p.status === 'Disponible');
++
++        // Compile location distribution across all matching available products
++        const locStockMap: Record<string, number> = {};
++        matchingProducts.forEach(mp => {
++          const dist = (mp.custom_field_values?.location_distribution as Record<string, number>) || {};
++          Object.entries(dist).forEach(([loc, qty]) => {
++            if (qty > 0) {
++              locStockMap[loc] = (locStockMap[loc] || 0) + qty;
++            }
++          });
++          // Also fallback to single location if no distribution
++          if (Object.keys(dist).length === 0 && mp.custom_field_values?.location) {
++            const singleLoc = mp.custom_field_values.location as string;
++            locStockMap[singleLoc] = (locStockMap[singleLoc] || 0) + 1;
++          }
++        });
++
++        const availableLocations = Object.keys(locStockMap);
++        const maxQty = locStockMap[genStockLocation] || 0;
++
++        return (
++          <div className="modal-overlay" style={{ zIndex: 1300 }} onClick={() => setRemoveGenStockModalOpen(false)}>
++            <div className="modal-content" style={{ maxWidth: '450px', width: '100%', padding: '24px' }} onClick={e => e.stopPropagation()}>
++              <div className="modal-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
++                <h3>Ô×û {language === 'es' ? 'Quitar Existencias' : 'Remove Stock'} ({prod.serial_number})</h3>
++                <button className="btn-secondary btn-xs" onClick={() => setRemoveGenStockModalOpen(false)}>Ô£ò</button>
++              </div>
++              
++              {availableLocations.length === 0 ? (
++                <div className="modal-body" style={{ padding: '16px 0', textAlign: 'center', color: 'var(--text-muted)' }}>
++                  {language === 'es' ? 'No hay existencias disponibles para retirar.' : 'No available stock to remove.'}
++                </div>
++              ) : (
++                <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
++                  <div className="form-group">
++                    <label className="form-label">{language === 'es' ? 'Ubicaci├│n' : 'Location'}</label>
++                    <select 
++                      className="form-control" 
++                      value={genStockLocation} 
++                      onChange={e => {
++                        setGenStockLocation(e.target.value);
++                        setGenStockQty(1);
++                      }}
++                    >
++                      {availableLocations.map(loc => (
++                        <option key={loc} value={loc}>
++                          {loc} ({language === 'es' ? 'Disp:' : 'Avail:'} {locStockMap[loc]})
++                        </option>
++                      ))}
++                    </select>
++                  </div>
++                  <div className="form-group">
++                    <label className="form-label">
++                      {language === 'es' ? 'Cantidad a retirar' : 'Quantity to remove'}
++                    </label>
++                    <input 
++                      type="number" 
++                      className="form-control" 
++                      min={1} 
++                      max={maxQty}
++                      value={genStockQty} 
++                      onChange={e => setGenStockQty(Math.min(maxQty, Math.max(1, Number(e.target.value))))} 
++                    />
++                  </div>
++                </div>
++              )}
++              
++              <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
++                <button className="btn-secondary" onClick={() => setRemoveGenStockModalOpen(false)}>
++                  {language === 'es' ? 'Cancelar' : 'Cancel'}
++                </button>
++                <button 
++                  className="btn-primary" 
++                  disabled={availableLocations.length === 0}
++                  onClick={async () => {
++                    try {
++                      let qtyToRemove = genStockQty;
++                      const updates = [];
++                      const deletes = [];
++
++                      // Iterate through matching products to deduct quantity
++                      for (const mp of matchingProducts) {
++                        if (qtyToRemove <= 0) break;
++
++                        const dist = { ...((mp.custom_field_values?.location_distribution as Record<string, number>) || {}) };
++                        const locQty = dist[genStockLocation] || 0;
++
++                        if (locQty > 0) {
++                          const deduct = Math.min(qtyToRemove, locQty);
++                          dist[genStockLocation] = locQty - deduct;
++                          qtyToRemove -= deduct;
++
++                          // Clean up 0 quantities
++                          if (dist[genStockLocation] <= 0) {
++                            delete dist[genStockLocation];
++                          }
++
++                          const newTotal = Object.values(dist).reduce((a, b) => a + b, 0);
++
++                          if (newTotal <= 0) {
++                            // If it's the very last remaining row in the entire serial number group, 
++                            // keep it but with empty distribution and status set to 'Disponible' (0 stock),
++                            // to avoid deleting the product definition completely.
++                            const totalRowsInGroup = products.filter(p => p.serial_number === prod.serial_number).length;
++                            if (totalRowsInGroup <= 1) {
++                              updates.push(upsertProduct({
++                                ...mp,
++                                custom_field_values: {
++                                  ...mp.custom_field_values,
++                                  location_distribution: {}
++                                }
++                              }));
++                            } else {
++                              deletes.push(deleteProduct(mp.id));
++                            }
++                          } else {
++                            // Find new main location
++                            let mainLocation = '';
++                            let maxQ = -1;
++                            Object.entries(dist).forEach(([l, v]) => {
++                              if (v > maxQ) {
++                                maxQ = v;
++                                mainLocation = l;
++                              }
++                            });
++
++                            updates.push(upsertProduct({
++                              ...mp,
++                              custom_field_values: {
++                                ...mp.custom_field_values,
++                                location: mainLocation,
++                                location_distribution: dist
++                              }
++                            }));
++                          }
++                        }
++                      }
++
++                      // Run db calls
++                      if (updates.length > 0) {
++                        await Promise.all(updates.map(up => up));
++                      }
++                      if (deletes.length > 0) {
++                        await Promise.all(deletes.map(del => del));
++                      }
++
++                      showToast(language === 'es' ? 'Existencias retiradas correctamente.' : 'Stock removed successfully.', 'success');
++                      setRemoveGenStockModalOpen(false);
++                      triggerReload();
++                    } catch (err) {
++                      console.error('Error removing generic stock:', err);
++                      showToast(language === 'es' ? 'Error al retirar existencias.' : 'Error removing stock.', 'error');
++                    }
++                  }}
++                >
++                  {language === 'es' ? 'Confirmar' : 'Confirm'}
++                </button>
++              </div>
++            </div>
++          </div>
++        );
++      })()}
++
+       {/* ===== GOOGLE AUTH ACCESS CONTROL WHITELIST MODAL ===== */}
+       {whitelistModalOpen && (
+         <div

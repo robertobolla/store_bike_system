@@ -12,6 +12,7 @@ export interface SerialPrefix {
   id: string;
   prefix: string;
   description: string;
+  category_id?: string | null;
 }
 
 export interface Category {
@@ -482,7 +483,7 @@ async function findOrCreateProductModel(p: Product): Promise<string | null> {
 
   const brand = p.brand || (p.name ? p.name.split(' ')[0] : 'Unknown');
   const modelName =
-    p.model || (p.name ? p.name.split(' ').slice(1).join(' ') || p.name : 'Model');
+    p.model !== undefined && p.model !== null ? p.model : (p.name ? p.name.split(' ').slice(1).join(' ') || p.name : 'Model');
 
   // Search both with and without color suffix
   const { data: existing, error: fetchErr } = await supabase
@@ -550,10 +551,30 @@ export async function getPrefixes(): Promise<SerialPrefix[]> {
 }
 
 export async function upsertPrefix(p: SerialPrefix): Promise<void> {
-  const { error } = await supabase
-    .from('serial_prefixes')
-    .upsert({ id: p.id, prefix: p.prefix, description: p.description });
-  if (error) throw error;
+  try {
+    const { error } = await supabase
+      .from('serial_prefixes')
+      .upsert({ 
+        id: p.id, 
+        prefix: p.prefix, 
+        description: p.description, 
+        category_id: p.category_id || null 
+      });
+    if (error) throw error;
+  } catch (err: any) {
+    if (err.message && err.message.includes('category_id')) {
+      const { error } = await supabase
+        .from('serial_prefixes')
+        .upsert({ 
+          id: p.id, 
+          prefix: p.prefix, 
+          description: p.description 
+        });
+      if (error) throw error;
+    } else {
+      throw err;
+    }
+  }
 }
 
 export async function deletePrefix(id: string): Promise<void> {
@@ -811,6 +832,161 @@ export async function uploadSignatureImage(rentalId: string, dataUrl: string): P
     .getPublicUrl(filePath);
 
   return data.publicUrl;
+}
+
+// Upload a delivery-checklist signature image (from canvas toDataURL)
+export async function uploadChecklistSignature(checklistId: string, dataUrl: string): Promise<string> {
+  const response = await fetch(dataUrl);
+  const blob = await response.blob();
+  const filePath = `checklists/${checklistId}/signature_${Date.now()}.png`;
+
+  const { error: uploadErr } = await supabase.storage
+    .from('rental-photos')
+    .upload(filePath, blob, { upsert: true, contentType: 'image/png' });
+  if (uploadErr) throw uploadErr;
+
+  const { data } = supabase.storage
+    .from('rental-photos')
+    .getPublicUrl(filePath);
+
+  return data.publicUrl;
+}
+
+// ================================================================
+// DELIVERY CHECKLISTS (customer-facing e-bike delivery acknowledgement)
+// ================================================================
+
+export interface DeliveryChecklist {
+  id: string;
+  rental_id: string | null;
+  audience: 'customer' | 'internal';
+  customer_name: string;
+  customer_email: string;
+  email_lang: 'es' | 'en' | 'pt';
+  bike_model: string;
+  bike_serial: string;
+  delivery_date: string;
+  battery_level: string;
+  items: Record<string, boolean>;
+  notes: Record<string, string>;
+  signature_url: string | null;
+  status: 'pending' | 'completed';
+  completed_at: string | null;
+  created_at: string;
+}
+
+export async function createDeliveryChecklist(
+  data: Pick<DeliveryChecklist, 'rental_id' | 'customer_name' | 'customer_email' | 'email_lang' | 'bike_model' | 'bike_serial' | 'delivery_date'> &
+    Partial<Pick<DeliveryChecklist, 'audience'>>
+): Promise<DeliveryChecklist> {
+  const { data: row, error } = await supabase
+    .from('delivery_checklists')
+    .insert({
+      rental_id: data.rental_id,
+      audience: data.audience ?? 'customer',
+      customer_name: data.customer_name,
+      customer_email: data.customer_email,
+      email_lang: data.email_lang,
+      bike_model: data.bike_model,
+      bike_serial: data.bike_serial,
+      delivery_date: data.delivery_date,
+    })
+    .select('*')
+    .single();
+  if (error) throw error;
+  return row as DeliveryChecklist;
+}
+
+// Create an internal (operator-filled) technical inspection checklist.
+export async function createInternalChecklist(
+  data: Pick<DeliveryChecklist, 'rental_id' | 'customer_name' | 'bike_model' | 'bike_serial' | 'delivery_date'> & {
+    battery_level?: string;
+    items?: Record<string, boolean>;
+    notes?: Record<string, string>;
+    status?: 'pending' | 'completed';
+  }
+): Promise<DeliveryChecklist> {
+  const { data: row, error } = await supabase
+    .from('delivery_checklists')
+    .insert({
+      rental_id: data.rental_id,
+      audience: 'internal',
+      customer_name: data.customer_name,
+      customer_email: '',
+      email_lang: 'en',
+      bike_model: data.bike_model,
+      bike_serial: data.bike_serial,
+      delivery_date: data.delivery_date,
+      battery_level: data.battery_level ?? '',
+      items: data.items ?? {},
+      notes: data.notes ?? {},
+      status: data.status ?? 'pending',
+      completed_at: data.status === 'completed' ? new Date().toISOString() : null,
+    })
+    .select('*')
+    .single();
+  if (error) throw error;
+  return row as DeliveryChecklist;
+}
+
+// Update an existing checklist row (used to edit the internal checklist).
+export async function updateDeliveryChecklist(
+  id: string,
+  payload: { items?: Record<string, boolean>; notes?: Record<string, string>; battery_level?: string; signature_url?: string; status?: 'pending' | 'completed' }
+): Promise<void> {
+  const update: Record<string, unknown> = {};
+  if (payload.items !== undefined) update.items = payload.items;
+  if (payload.notes !== undefined) update.notes = payload.notes;
+  if (payload.battery_level !== undefined) update.battery_level = payload.battery_level;
+  if (payload.signature_url !== undefined) update.signature_url = payload.signature_url;
+  if (payload.status !== undefined) {
+    update.status = payload.status;
+    update.completed_at = payload.status === 'completed' ? new Date().toISOString() : null;
+  }
+  const { error } = await supabase.from('delivery_checklists').update(update).eq('id', id);
+  if (error) throw error;
+}
+
+export async function getDeliveryChecklists(): Promise<DeliveryChecklist[]> {
+  const { data, error } = await supabase
+    .from('delivery_checklists')
+    .select('*')
+    .order('created_at', { ascending: false });
+  if (error) throw error;
+  return (data ?? []) as DeliveryChecklist[];
+}
+
+export async function getDeliveryChecklist(id: string): Promise<DeliveryChecklist | null> {
+  const { data, error } = await supabase
+    .from('delivery_checklists')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle();
+  if (error) throw error;
+  return (data as DeliveryChecklist) ?? null;
+}
+
+// Submit the checklist. Guarded: only flips a row that is still 'pending',
+// so a re-submission via the same link cannot overwrite an accepted record.
+// Returns true if this call completed the checklist.
+export async function submitDeliveryChecklist(
+  id: string,
+  payload: { items: Record<string, boolean>; battery_level: string; signature_url: string }
+): Promise<boolean> {
+  const { data, error } = await supabase
+    .from('delivery_checklists')
+    .update({
+      items: payload.items,
+      battery_level: payload.battery_level,
+      signature_url: payload.signature_url,
+      status: 'completed',
+      completed_at: new Date().toISOString(),
+    })
+    .eq('id', id)
+    .eq('status', 'pending')
+    .select('id');
+  if (error) throw error;
+  return (data?.length ?? 0) > 0;
 }
 
 // ================================================================
@@ -1471,6 +1647,16 @@ export async function deleteSaleItems(saleId: string): Promise<void> {
   if (error) throw error;
 }
 
+export async function deleteSaleItem(id: string): Promise<void> {
+  const { error } = await supabase.from('sale_items').delete().eq('id', id);
+  if (error) throw error;
+}
+
+export async function updateSaleTotal(id: string, total_amount: number): Promise<void> {
+  const { error } = await supabase.from('sales').update({ total_amount }).eq('id', id);
+  if (error) throw error;
+}
+
 // ================================================================
 // FINANCING PLANS
 // ================================================================
@@ -2100,6 +2286,16 @@ export async function getBikeModifications(bikeId: string): Promise<BikeModifica
   return (data ?? []) as BikeModification[];
 }
 
+// All bike modifications (used for the full data backup).
+export async function getAllBikeModifications(): Promise<BikeModification[]> {
+  const { data, error } = await supabase
+    .from('bike_modifications')
+    .select('*')
+    .order('modification_date', { ascending: false });
+  if (error) throw error;
+  return (data ?? []) as BikeModification[];
+}
+
 export async function addBikeModification(bikeId: string, description: string, date: string): Promise<void> {
   const { error } = await supabase
     .from('bike_modifications')
@@ -2118,5 +2314,102 @@ export async function deleteBikeModification(id: string): Promise<void> {
     .eq('id', id);
   if (error) throw error;
 }
+
+// ================================================================
+// TASK BOARD (To-Do Lists)
+// ================================================================
+
+export interface TaskCard {
+  id: string;
+  title: string;
+  created_at: string;
+}
+
+export interface TaskItem {
+  id: string;
+  card_id: string;
+  text: string;
+  completed: boolean;
+  color: string;
+  position: number;
+  created_at?: string;
+}
+
+export interface TaskColorTag {
+  color: string;
+  label: string;
+}
+
+export async function getTaskCards(): Promise<TaskCard[]> {
+  const { data, error } = await supabase
+    .from('task_cards')
+    .select('*')
+    .order('created_at', { ascending: true });
+  if (error) throw error;
+  return (data ?? []) as TaskCard[];
+}
+
+export async function upsertTaskCard(card: Partial<TaskCard>): Promise<void> {
+  const { error } = await supabase
+    .from('task_cards')
+    .upsert(card);
+  if (error) throw error;
+}
+
+export async function deleteTaskCard(id: string): Promise<void> {
+  const { error } = await supabase
+    .from('task_cards')
+    .delete()
+    .eq('id', id);
+  if (error) throw error;
+}
+
+export async function getTaskItems(): Promise<TaskItem[]> {
+  const { data, error } = await supabase
+    .from('task_items')
+    .select('*')
+    .order('position', { ascending: true });
+  if (error) throw error;
+  return (data ?? []) as TaskItem[];
+}
+
+export async function upsertTaskItem(item: Partial<TaskItem>): Promise<void> {
+  const { error } = await supabase
+    .from('task_items')
+    .upsert(item);
+  if (error) throw error;
+}
+
+export async function deleteTaskItem(id: string): Promise<void> {
+  const { error } = await supabase
+    .from('task_items')
+    .delete()
+    .eq('id', id);
+  if (error) throw error;
+}
+
+export async function getColorTags(): Promise<TaskColorTag[]> {
+  const { data, error } = await supabase
+    .from('task_color_tags')
+    .select('*');
+  if (error) throw error;
+  return (data ?? []) as TaskColorTag[];
+}
+
+export async function upsertColorTag(tag: TaskColorTag): Promise<void> {
+  const { error } = await supabase
+    .from('task_color_tags')
+    .upsert(tag);
+  if (error) throw error;
+}
+
+export async function deleteColorTag(color: string): Promise<void> {
+  const { error } = await supabase
+    .from('task_color_tags')
+    .delete()
+    .eq('color', color);
+  if (error) throw error;
+}
+
 
 

@@ -1314,6 +1314,8 @@ select optgroup option {
    ============================================================ */
 .sign-page {
   min-height: 100vh;
+  width: 100%;
+  flex: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1323,7 +1325,7 @@ select optgroup option {
 }
 .sign-page-card {
   width: 100%;
-  max-width: 520px;
+  max-width: 860px;
   background: rgba(30, 41, 59, 0.85);
   backdrop-filter: blur(20px);
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -1414,6 +1416,91 @@ select optgroup option {
 .sign-page-card .sign-success p {
   color: var(--text-muted);
   font-size: 14px;
+}
+
+/* Checklist field/group/item styles, shared by the public page (.sign-page-card),
+   the wizard step and the internal-checklist editor (.checklist-scope). */
+.checklist-scope .checklist-field { margin: 16px 0; }
+.checklist-scope .checklist-field label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.checklist-scope .checklist-field input {
+  width: 100%; padding: 10px 12px; border: 1px solid var(--border-color);
+  border-radius: 8px; background: rgba(0, 0, 0, 0.2); color: inherit; font-size: 14px;
+}
+.checklist-scope .checklist-group { margin-bottom: 16px; }
+.checklist-scope .checklist-group-title { font-size: 13px; font-weight: 700; margin: 0 0 8px; color: var(--color-primary); }
+.checklist-scope .checklist-item {
+  display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; margin-bottom: 8px;
+  border: 1px solid var(--border-color); border-radius: 10px; font-size: 13px; line-height: 1.45;
+  cursor: pointer; transition: background 0.15s, border-color 0.15s;
+}
+.checklist-scope .checklist-item.checked { background: rgba(16, 185, 129, 0.08); border-color: rgba(16, 185, 129, 0.4); }
+.checklist-scope .checklist-item input { margin-top: 2px; width: 18px; height: 18px; flex-shrink: 0; accent-color: var(--color-primary); }
+
+/* Delivery checklist (public page) */
+.sign-page-card .checklist-field {
+  margin: 16px 0;
+}
+.sign-page-card .checklist-field label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.sign-page-card .checklist-field input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.2);
+  color: inherit;
+  font-size: 14px;
+}
+.sign-page-card .checklist-group {
+  margin-bottom: 16px;
+}
+.sign-page-card .checklist-group-title {
+  font-size: 13px;
+  font-weight: 700;
+  margin: 0 0 8px;
+  color: var(--color-primary);
+}
+.sign-page-card .checklist-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.45;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.sign-page-card .checklist-item.checked {
+  background: rgba(16, 185, 129, 0.08);
+  border-color: rgba(16, 185, 129, 0.4);
+}
+.sign-page-card .checklist-item input {
+  margin-top: 2px;
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  accent-color: var(--color-primary);
+}
+.sign-page-card .checklist-declaration {
+  margin: 0 0 8px;
+  padding: 0 4px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+.sign-page-card .checklist-signing-note {
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 12px 0;
+  font-style: italic;
+  color: var(--text-muted);
 }
 
 @media (max-width: 520px) {

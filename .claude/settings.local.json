@@ -1,7 +1,26 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "Bash(awk -F: '$1>=13880 && $1<=14040')",
+      "Bash(npx tsc *)",
+      "Bash(node scratch/migrate-is-generic.mjs --apply)",
+      "Bash(node scratch/audit-stock.mjs)",
+      "Bash(git stash *)",
+      "Bash(pip install *)",
+      "Bash(python -c ' *)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(grep -iE \"^xlsx$|exceljs|sheetjs\")",
+      "Bash(npm install *)",
+      "Bash(node -e \"console.log\\(require\\('xlsx/package.json'\\).version\\)\")",
+      "Bash(grep -noE \"useState[^;]{0,40}\" src/App.tsx)",
+      "Read(//tmp/**)",
+      "Bash(cd \"C:\\\\roberto\\\\webs\\\\the_fast_sheep\" && echo \"=== Funciones/handlers de stock agregados en el stash ===\" && grep -nE \"^\\\\+\" /tmp/stash_diff.txt | grep -iE \"const \\(handle|add|remove|merge|split|consolidat|adjust|move|transfer\\)[A-Za-z]*Stock|const handle[A-Za-z]*\\(Sold|Lost|Inventory|GenStock\\)|function [a-zA-Z]*[Ss]tock\" | sed 's/^[0-9]*:+//' | head -40)",
+      "Bash(cd \"C:\\\\roberto\\\\webs\\\\the_fast_sheep\" && echo \"=== Todas las const/función agregadas \\(lineas +\\) con 'stock','gen','consolid','sold','qty' ===\" && grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -iE \"const [a-zA-Z]+ =|=>\" | grep -iE \"stock|gen[A-Z]|consolid|sold|qty|quantity|location|almac\" | sed 's/^+//' | sed 's/^[[:space:]]*//' | sort -u | head -50)",
+      "Bash(cd \"C:\\\\roberto\\\\webs\\\\the_fast_sheep\" && echo \"=== Titulos/labels de las features de stock del stash ===\" && grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -oE \"\\(es' \\\\?|=== 'es' \\\\?|language === 'es' \\\\?\\) '[^']+' : '[^']+'\" | sed \"s/.*? '/ES: /; s/' : '/  | EN: /; s/'$//\" | grep -iE \"stock|ubicaci|locat|almac|generic|generic|consolid|distribu|mover|trasla|cantidad|merg\" | sort -u | head -30; echo \"\"; echo \"=== Strings 'Almacén' y modales gen-stock ===\"; grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -oiE \"\\(Agregar Stock|Quitar Stock|Add Stock|Remove Stock|Mover Stock|Stock Gen[^<']*|Distribución[^<']*|por Ubicación[^<']*\\)\" | sort -u | head)",
+      "Bash(cd \"C:\\\\roberto\\\\webs\\\\the_fast_sheep\" && echo \"=== Nuevos useState \\(features nuevas\\) en el stash ===\" && grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -oE \"const \\\\[[a-zA-Z]+, set[A-Za-z]+\\\\]\" | sed 's/const \\\\[//; s/, set.*//' | sort -u | head -80)",
+      "Bash(cd \"C:\\\\roberto\\\\webs\\\\the_fast_sheep\" && echo \"=== Claves de traduccion nuevas en el stash ===\" && grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -oE \"[a-zA-Z_]+: \\\\\"[^\\\\\"]+\\\\\"\" | grep -vE \"className|style|type|id:|key:|width|color|padding|margin|display|flex|font|background|border\" | sed 's/:.*//' | sort -u | head -60; echo \"\"; echo \"=== Feature 'prefix' \\(que es?\\) ===\"; grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -iE \"prefix|prefijo\" | grep -oiE \"\\(es' \\\\? '[^']+' : '[^']+'|Prefijo[^<']*|Prefix[^<']*\\)\" | sort -u | head)",
+      "Bash(cd \"C:\\\\roberto\\\\webs\\\\the_fast_sheep\" && echo \"=== TODOS los textos bilingues nuevos del stash \\(para inventario\\) ===\" && grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -oE \"=== 'es'|language === 'es' \\\\? '[^']+' : '[^']+'\" 2>/dev/null; grep -E \"^\\\\+\" /tmp/stash_diff.txt | grep -oE \"'es' \\\\? '[^']+' : '[^']+'\" | sed \"s/'es' ? '//; s/' : '/  |  /; s/'$//\" | sort -u | head -90)"
     ]
   }
 }
