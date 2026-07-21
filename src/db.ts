@@ -78,12 +78,32 @@ export interface Customer {
   first_name: string;
   last_name: string;
   email: string;
+  // Opcional: las filas anteriores a la migracion no traen direccion.
+  address?: string;
   phone: string;
   id_document_url: string;
   referral_source: string;
   nationality: string;
   notes: string;
   created_at: string;
+}
+
+// Frozen copy of the "RENTAL DETAILS" block of the contract, taken when the
+// signing link is generated. Mirrors page 1 of the signed PDF agreement.
+export interface RentalContractSnapshot {
+  lessee_name: string;
+  lessee_address: string;
+  lessee_phone: string;
+  lessee_email: string;
+  email_lang: 'es' | 'en' | 'pt';
+  bike_brand_model: string;
+  bike_serial: string;
+  start_date: string;
+  payment_due_weekday: string;
+  rate_amount: number;
+  rate_type: 'diario' | 'semanal' | 'mensual';
+  deposit_amount: number;
+  battery_count: number;
 }
 
 export interface Rental {
@@ -103,6 +123,11 @@ export interface Rental {
   status: 'Activo' | 'Devolución en Proceso' | 'Inactivo';
   contract_type: 'photo' | 'digital';
   contract_url: string | null;
+  // Digital rental contract (?firmar= page). The snapshot freezes the rental
+  // details shown at signing time so later rate changes never alter what was signed.
+  contract_snapshot?: RentalContractSnapshot | null;
+  contract_signed_at?: string | null;
+  contract_image_consent?: boolean | null;
   condition_photos: string[];
   return_photos?: string[];
   instagram_photos?: string[];
@@ -1148,6 +1173,7 @@ export async function upsertCustomer(c: Customer): Promise<void> {
     first_name: c.first_name,
     last_name: c.last_name,
     email: c.email,
+    address: c.address ?? '',
     phone: c.phone,
     id_document_url: c.id_document_url,
     referral_source: c.referral_source,

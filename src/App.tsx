@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import type { InputHTMLAttributes } from 'react';
 import type { Session, User } from '@supabase/supabase-js';
 import { supabase } from './supabaseClient';
 import type {
@@ -43,12 +44,93 @@ import {
   uploadChecklistSignature, createDeliveryChecklist, getDeliveryChecklist, getDeliveryChecklists, submitDeliveryChecklist,
   createInternalChecklist, updateDeliveryChecklist,
 } from './db';
-import type { AllowedEmail, BikeModification, DeliveryChecklist } from './db';
+import type { AllowedEmail, BikeModification, DeliveryChecklist, RentalContractSnapshot } from './db';
 import { downloadBackupXlsx } from './backup';
 
 
 
 import heic2any from 'heic2any';
+
+// Formatea cualquier importe para mostrarlo con un solo decimal como maximo
+// (los enteros se muestran sin decimales).
+const fmt1 = (value: number | string | null | undefined): string => {
+  const num = typeof value === 'number' ? value : parseFloat(String(value ?? ''));
+  if (!Number.isFinite(num)) return String(value ?? '');
+  const rounded = Math.round(num * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+};
+
+// Redondea un importe a un decimal para guardarlo en base de datos.
+const round1 = (value: number): number => Math.round((Number(value) || 0) * 10) / 10;
+
+// Lee el valor de un <input type="number"> sin romper lo que el usuario esta escribiendo.
+// Mientras el texto es intermedio ("1500." o "1500,") el navegador devuelve '' en
+// e.target.value, asi que hacer Number(e.target.value) ahi mismo ponia 0 (o vaciaba el
+// campo) y borraba lo tecleado. En ese caso devolvemos undefined para ignorar el evento
+// y dejar que el usuario termine de escribir el decimal.
+// Solo sirve para campos enteros (cantidades, cuotas, kilometraje); para importes con
+// decimales hay que usar <NumberField>, ver el comentario de abajo.
+//   number -> valor valido | null -> campo vacio | undefined -> ignorar
+const readNumberInput = (e: { target: HTMLInputElement }): number | null | undefined => {
+  if (e.target.validity.badInput) return undefined;
+  if (e.target.value === '') return null;
+  const num = Number(e.target.value);
+  return Number.isFinite(num) ? num : undefined;
+};
+
+const toNumberOrNull = (value: number | string | null | undefined): number | null => {
+  if (value === null || value === undefined || value === '') return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+};
+
+// Campo para importes. Guarda el TEXTO que el usuario escribe, no el numero.
+//
+// Con <input type="number"> no alcanza con ignorar el evento intermedio: React restaura
+// el valor del DOM a partir del estado cuando el onChange no lo cambia, asi que el punto
+// recien tecleado desaparecia igual. Aca el input es de texto y su contenido es el estado
+// local, de modo que "1250." se queda en pantalla; hacia afuera solo emitimos el numero
+// cuando el texto es interpretable. inputMode="decimal" mantiene el teclado numerico en movil.
+type NumberFieldProps = Omit<InputHTMLAttributes<HTMLInputElement>, 'value' | 'onChange' | 'type'> & {
+  value: number | string | null | undefined;
+  onValueChange: (value: number | null) => void;
+};
+
+const NumberField = ({ value, onValueChange, ...rest }: NumberFieldProps) => {
+  const [text, setText] = useState(() => {
+    const num = toNumberOrNull(value);
+    return num === null ? '' : String(num);
+  });
+  // Ultimo valor emitido hacia el padre: distingue un cambio propio (no hay que tocar el
+  // texto que se esta escribiendo) de uno que llega de afuera (hay que reflejarlo).
+  const emitted = useRef<number | null>(toNumberOrNull(value));
+
+  useEffect(() => {
+    const incoming = toNumberOrNull(value);
+    if (incoming !== emitted.current) {
+      emitted.current = incoming;
+      setText(incoming === null ? '' : String(incoming));
+    }
+  }, [value]);
+
+  return (
+    <input
+      {...rest}
+      type="text"
+      inputMode="decimal"
+      value={text}
+      onChange={e => {
+        const raw = e.target.value.replace(',', '.');
+        if (raw !== '' && !/^-?\d*\.?\d*$/.test(raw)) return; // descarta letras y simbolos
+        setText(raw);
+        const parsed = raw === '' ? null : Number(raw);
+        if (parsed !== null && !Number.isFinite(parsed)) return; // "-" o "." sueltos: sigue escribiendo
+        emitted.current = parsed;
+        onValueChange(parsed);
+      }}
+    />
+  );
+};
 
 const parseMixtoAmounts = (notes: string | null | undefined, totalAmount: number): { cash: number; transfer: number } => {
   if (!notes) return { cash: totalAmount, transfer: 0 };
@@ -59,6 +141,71 @@ const parseMixtoAmounts = (notes: string | null | undefined, totalAmount: number
     return { cash, transfer };
   }
   return { cash: totalAmount, transfer: 0 };
+};
+
+const getNextCustomerCode = (customers: Customer[]): string => {
+  let maxNum = 1000;
+  customers.forEach(c => {
+    if (c.customer_code) {
+      const match = c.customer_code.match(/\d+/);
+      if (match) {
+        const num = parseInt(match[0], 10);
+        if (num > maxNum) {
+          maxNum = num;
+        }
+      }
+    }
+  });
+  return `US-${maxNum + 1}`;
+};
+
+const deduplicateCustomerCodes = async (existingCusts: Customer[], setCustomersState: (c: Customer[]) => void) => {
+  const seenCodes = new Set<string>();
+  const duplicates: Customer[] = [];
+  
+  existingCusts.forEach(c => {
+    if (c.customer_code) {
+      const code = c.customer_code.trim();
+      if (seenCodes.has(code)) {
+        duplicates.push(c);
+      } else {
+        seenCodes.add(code);
+      }
+    } else {
+      duplicates.push(c);
+    }
+  });
+
+  if (duplicates.length === 0) return;
+
+  console.log(`[FastSheep] Found ${duplicates.length} customers with duplicate or missing codes. Automatically resolving...`);
+
+  let maxNum = 1000;
+  existingCusts.forEach(c => {
+    if (c.customer_code) {
+      const match = c.customer_code.match(/\d+/);
+      if (match) {
+        const num = parseInt(match[0], 10);
+        if (num > maxNum) maxNum = num;
+      }
+    }
+  });
+
+  const updatedCusts = [...existingCusts];
+  for (const c of duplicates) {
+    maxNum++;
+    const newCode = `US-${maxNum}`;
+    const idx = updatedCusts.findIndex(x => x.id === c.id);
+    if (idx !== -1) {
+      updatedCusts[idx] = { ...updatedCusts[idx], customer_code: newCode };
+      try {
+        await upsertCustomer(updatedCusts[idx]);
+      } catch (err) {
+        console.error(`Error updating customer ${c.id} code:`, err);
+      }
+    }
+  }
+  setCustomersState(updatedCusts);
 };
 
 const convertHeicToJpgIfNeeded = async (file: File): Promise<File> => {
@@ -681,6 +828,358 @@ function sendDeliveryChecklistCopyEmail(
   executeEmailSend(checklist.customer_email, subject, html);
 }
 
+// ====================================================
+// DIGITAL RENTAL CONTRACT
+// Mirrors "THE FAST SHEEP LIMITED - ELECTRIC BICYCLE RENTAL AGREEMENT".
+// The legal text is an English document, so its clauses are never translated;
+// only the surrounding email copy follows the rider's language.
+// ====================================================
+type ContractClause = { title: string; paragraphs?: string[]; bullets?: string[]; closing?: string[] };
+
+const RENTAL_CONTRACT_INTRO =
+  'This Electric Bicycle Rental Agreement ("Agreement") is entered into between The Fast Sheep Limited, ' +
+  'Unit 3D North Point House, New Mallow Road, Cork, Ireland (the "LESSOR"), and the individual whose ' +
+  'details appear in the Rental Details section of this Agreement (the "LESSEE"). The LESSEE confirms ' +
+  'that they are at least eighteen (18) years of age and legally capable of entering into this Agreement.';
+
+const RENTAL_CONTRACT_CLAUSES: ContractClause[] = [
+  {
+    title: '1. SUBJECT OF THE AGREEMENT',
+    paragraphs: [
+      'The LESSOR rents to the LESSEE the electric bicycle described in the Electric Bicycle Details section of this Agreement (the "Bicycle").',
+      'The rental also includes the accessories and equipment listed in the E-Bike Delivery Checklist, which forms part of this Agreement.',
+      'The LESSEE confirms that the bicycle, battery(ies) and accessories have been inspected and received in good working condition.',
+      'The LESSEE confirms that they have inspected and test-ridden the bicycle before accepting delivery and are satisfied that it is safe and suitable for its intended use.',
+    ],
+  },
+  {
+    title: '2. RENTAL PERIOD',
+    paragraphs: [
+      'The initial rental period is two (2) weeks, after which the Agreement automatically continues on a weekly basis unless terminated by either party.',
+      'Weekly rental payments shall be due on the day specified in the Rental Information section of this Agreement.',
+      "If the LESSEE wishes to terminate the rental, at least one (1) week's written notice must be given.",
+    ],
+  },
+  {
+    title: '3. SECURITY DEPOSIT AND RENTAL FEES',
+    paragraphs: [
+      'The LESSEE agrees to pay the Security Deposit and Weekly Rental Fee specified in the Rental Information section of this Agreement.',
+      'The Security Deposit is refundable upon termination of the rental, following inspection of the Bicycle and all supplied equipment, provided they are returned in satisfactory condition, allowing for reasonable wear and tear, and all outstanding amounts have been paid.',
+      'The LESSOR may deduct from the Security Deposit any overdue rental fees, late payment charges, repair costs, replacement costs for lost or damaged equipment, or any other amounts payable by the LESSEE under this Agreement.',
+      'Where the Security Deposit is insufficient to cover the amounts due, the LESSEE shall remain liable for the outstanding balance.',
+    ],
+  },
+  {
+    title: '4. RESPONSIBILITIES OF THE LESSEE',
+    paragraphs: [
+      'The LESSEE assumes full responsibility for the bicycle, battery(ies), charger, keys and all supplied accessories from the moment possession is transferred until they have been returned to and accepted by the LESSOR.',
+      'The LESSEE agrees to:',
+    ],
+    bullets: [
+      'take all reasonable precautions to prevent theft or damage;',
+      'comply with all Irish traffic laws and regulations;',
+      'ride at safe speeds appropriate to road and weather conditions;',
+      'use the bicycle only for its intended purpose;',
+      'wear appropriate safety equipment, including a helmet whenever possible. The LESSOR strongly recommends wearing a helmet at all times;',
+      'keep the bicycle securely locked whenever unattended.',
+    ],
+    closing: [
+      "The bicycle may only be used by the LESSEE and may not be lent, sub-rented, transferred or otherwise used by any third party without the LESSOR's written permission.",
+      'All supplied accessories form part of the rental and remain the property of the LESSOR.',
+      'The LESSEE shall not take the bicycle outside the Republic of Ireland without the prior written consent of the LESSOR.',
+    ],
+  },
+  {
+    title: '5. PROHIBITED USE',
+    paragraphs: ['The LESSEE shall not:'],
+    bullets: [
+      'modify, tamper with, or permit any third party to repair the bicycle without the prior written consent of the LESSOR;',
+      'manipulate the motor, controller, battery(ies), software or electrical system;',
+      'use the bicycle for racing, competitions or stunt riding;',
+      'perform jumps or intentionally ride on terrain likely to damage the bicycle;',
+      "transport loads exceeding the manufacturer's limits;",
+      'use the bicycle for commercial purposes unless authorized by the LESSOR;',
+      'operate the bicycle while under the influence of alcohol or drugs;',
+      'intentionally misuse or abuse the bicycle.',
+    ],
+  },
+  {
+    title: '6. BATTERY CARE',
+    paragraphs: ['The LESSEE agrees that:'],
+    bullets: [
+      'batteries shall only be charged using the original charger supplied by the LESSOR;',
+      'batteries shall be stored and charged in a cool, dry and well-ventilated place;',
+      'batteries shall be kept away from excessive heat, direct sunlight, fire and moisture;',
+      'the LESSEE shall never leave the battery(ies) charging unattended overnight or in unsafe conditions;',
+      'batteries shall never be opened, modified or repaired by the LESSEE;',
+      'if a battery suffers any fall, impact, collision, overheating, water damage or any abnormal behaviour, the LESSEE must immediately notify the LESSOR for inspection and possible replacement;',
+      'all batteries must be returned fully charged, in the same condition as delivered (except normal wear);',
+      'the LESSEE shall immediately stop using the bicycle if it is no longer safe to ride and shall notify the LESSOR immediately.',
+    ],
+    closing: [
+      'The LESSEE shall avoid repeatedly allowing the battery(ies) to become fully discharged. Damage caused by improper charging or battery(ies) misuse may result in additional charges.',
+    ],
+  },
+  {
+    title: '7. MAINTENANCE AND BREAKDOWNS',
+    paragraphs: [
+      'The LESSEE shall not carry out repairs or maintenance without prior authorization.',
+      'Any malfunction, warning light, unusual noise or damage must be reported immediately.',
+      'The bicycle must not continue to be used if it is unsafe or could suffer further damage.',
+      'Failure to report damage may result in additional liability.',
+    ],
+  },
+  {
+    title: '8. DAMAGE, LOSS, THEFT AND TOTAL LOSS',
+    paragraphs: [
+      'The LESSEE is fully responsible for accidental damage, vandalism, theft, attempted theft, fire, flooding, negligence, misuse, confiscation or impoundment by An Garda Síochána or any public authority, abandonment or total loss.',
+      'Any accident, collision or fall must be reported immediately, even where no visible damage is present.',
+      'In the event of theft, the LESSEE must immediately notify the LESSOR or any authorised representative of The Fast Sheep Limited, as well as An Garda Síochána, and provide the LESSOR with the Garda incident/report number within twenty-four (24) hours.',
+      'Rental charges shall continue to accrue until the bicycle has been recovered by the LESSOR or the current retail replacement value has been paid in full.',
+      'If the bicycle is declared beyond economical repair or cannot be recovered for any reason, the LESSEE agrees to pay the full current retail replacement value of the bicycle and all supplied accessories.',
+      'Any damaged or missing accessories (including charger, lock, lights, phone holder, helmet or batteries) shall be charged to the LESSEE.',
+      'Lost keys or replacement locks shall be charged to the LESSEE at the applicable replacement cost.',
+      'The LESSEE is responsible for all parking fines, traffic offences, penalties, toll charges or any other charges incurred during the rental period.',
+      "The LESSEE acknowledges that the bicycle may be fitted with a GPS tracking device for security, theft prevention and recovery purposes. GPS data shall only be processed for security, theft prevention, recovery of the bicycle and protection of the LESSOR's property, in accordance with applicable data protection legislation.",
+    ],
+  },
+  {
+    title: '9. LIABILITY',
+    paragraphs: [
+      'The LESSEE acknowledges that riding an electric bicycle involves inherent risks.',
+      "Nothing in this Agreement shall exclude or limit the LESSOR's liability where such liability cannot legally be excluded under Irish law, including liability for death or personal injury caused by the LESSOR's negligence.",
+      'The LESSOR confirms that the bicycle has been inspected and is provided in good working order at the commencement of the rental period.',
+      'The LESSEE accepts full responsibility for all consequences arising from the use of the bicycle during the rental period.',
+    ],
+  },
+  {
+    title: '10. RETURN OF THE BICYCLE',
+    paragraphs: [
+      "Rental fees are non-refundable once the bicycle has been collected, except where otherwise required by law or at the LESSOR's sole discretion.",
+      'The security deposit shall be refunded following inspection, provided the bicycle, batteries, charger and all supplied equipment are returned in satisfactory condition and all outstanding rental fees or other charges have been paid.',
+      'The LESSOR reserves the right to carry out a more detailed inspection after cleaning or dismantling components where reasonably necessary. Hidden or internal damage identified during such inspection may result in additional charges.',
+    ],
+  },
+  {
+    title: '11. TERMINATION',
+    paragraphs: [
+      "The LESSEE may terminate this Agreement by giving at least one (1) week's written notice.",
+      'Failure to provide the required notice may result in outstanding rental charges being deducted from the security deposit.',
+      'The LESSOR may terminate this Agreement immediately by written notice or by any other reasonable means of communication if:',
+    ],
+    bullets: [
+      'rental payments are overdue;',
+      'the bicycle is being misused;',
+      'the bicycle has been taken outside the Republic of Ireland without prior written permission;',
+      'the LESSOR reasonably believes that the bicycle is at risk of theft, damage, loss or unlawful use;',
+      'the LESSEE breaches any provision of this Agreement.',
+    ],
+    closing: [
+      'Failure to make any rental payment when due shall constitute a material breach of this Agreement.',
+      'Upon termination of this Agreement, or where rental payments are overdue, the LESSOR may recover possession of the bicycle without further notice, where permitted by law.',
+    ],
+  },
+  {
+    title: '12. PRIVACY',
+    paragraphs: [
+      "The LESSEE's personal information shall be used solely for the administration of this rental agreement and in accordance with applicable Irish data protection legislation, including the General Data Protection Regulation (GDPR).",
+      "Where fitted, GPS tracking data shall only be processed for security, theft prevention, recovery of the bicycle and protection of the LESSOR's property, in accordance with applicable data protection legislation.",
+    ],
+  },
+  {
+    title: '13. USE OF IMAGE',
+    paragraphs: [
+      'The LESSEE may voluntarily authorize the LESSOR to use photographs and/or videos in which the LESSEE appears for promotional purposes, including social media, advertising and marketing.',
+      'The LESSEE may withdraw this consent at any time by notifying the LESSOR in writing.',
+      'Refusing or withdrawing consent shall not affect the rental agreement or any services provided by the LESSOR.',
+    ],
+  },
+  {
+    title: '14. INSPECTION',
+    paragraphs: [
+      'The LESSOR reserves the right to inspect the bicycle at any reasonable time during the rental period upon giving reasonable prior notice to the LESSEE.',
+      'The LESSOR may take photographs or videos of the bicycle and supplied equipment before delivery, during the rental period where reasonably necessary, and upon return for the purpose of recording their condition.',
+    ],
+  },
+  {
+    title: '15. GOVERNING LAW',
+    paragraphs: [
+      'This Agreement shall be governed by the laws of Ireland.',
+      'Any dispute arising under this Agreement shall be subject to the exclusive jurisdiction of the Irish Courts.',
+    ],
+  },
+  {
+    title: '16. ENTIRE AGREEMENT',
+    paragraphs: [
+      'This Agreement, together with the E-Bike Delivery Checklist, constitutes the entire agreement between the parties and supersedes all previous oral or written discussions, negotiations, representations or agreements relating to the rental of the bicycle. No amendment or variation of this Agreement shall be valid unless made in writing and signed or otherwise electronically agreed by both parties.',
+    ],
+  },
+];
+
+const CONTRACT_SIGNATURE_ACKNOWLEDGEMENTS = [
+  'they have read and understood this Agreement;',
+  'they accept all of its terms and conditions;',
+  'they received the bicycle and equipment in good condition;',
+  'they accept full responsibility during the rental period.',
+];
+
+const CONTRACT_IMAGE_CONSENT_TEXT =
+  'By ticking this box, the LESSEE authorizes the LESSOR to use photographs and/or videos in which the ' +
+  'LESSEE appears for promotional purposes, including social media, advertising and marketing.';
+
+const WEEKDAY_NAMES_EN = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+// "Weekly Payment Due Every: ____" is derived from the weekday the rental starts on.
+const contractPaymentWeekday = (startDate: string): string => {
+  const d = new Date(`${startDate}T00:00:00`);
+  return Number.isNaN(d.getTime()) ? '—' : WEEKDAY_NAMES_EN[d.getDay()];
+};
+
+const contractRatePeriodLabel = (rateType: 'diario' | 'semanal' | 'mensual'): string =>
+  rateType === 'diario' ? 'Daily Rental Fee' : rateType === 'mensual' ? 'Monthly Rental Fee' : 'Weekly Rental Fee';
+
+// Rows of the "RENTAL DETAILS" block, pre-filled from the wizard data.
+const contractDetailRows = (s: RentalContractSnapshot): [string, string][] => [
+  ['Name', s.lessee_name || '—'],
+  ['Address', s.lessee_address || '—'],
+  ['Telephone', s.lessee_phone || '—'],
+  ['Email', s.lessee_email || '—'],
+  ['Brand and Model', s.bike_brand_model || '—'],
+  ['Serial Number', s.bike_serial || '—'],
+  ['Rental Start Date', s.start_date || '—'],
+  ['Weekly Payment Due Every', s.payment_due_weekday || '—'],
+  [contractRatePeriodLabel(s.rate_type), `€${fmt1(s.rate_amount)}`],
+  ['Security Deposit', `€${fmt1(s.deposit_amount)}`],
+  ['Number of Batteries Supplied', String(s.battery_count)],
+  // Kept visible and blank: filled in by hand only when an extra battery is charged.
+  ['Additional Battery (if applicable)', '€ ______ / week'],
+];
+
+const CONTRACT_EMAIL_T = {
+  es: {
+    inviteSubject: 'Contrato de alquiler de tu e-bike - The Fast Sheep',
+    greeting: (n: string) => `Hola ${n},`,
+    intro: (m: string, s: string) =>
+      `Ya casi está. Para completar el alquiler de tu e-bike <strong>${m}</strong> (${s}), revisá y firmá el contrato desde este enlace.`,
+    button: 'Leer y firmar el contrato',
+    fallback: 'Si el botón no funciona, copiá y pegá este enlace en tu navegador:',
+    note: 'El contrato está redactado en inglés, tal como el documento original de The Fast Sheep Limited.',
+    copySubject: 'Copia de tu contrato de alquiler firmado - The Fast Sheep',
+    copyIntro: (n: string) => `Hola ${n}, a continuación encontrarás una copia del contrato de alquiler que firmaste.`,
+  },
+  en: {
+    inviteSubject: 'Your e-bike rental agreement - The Fast Sheep',
+    greeting: (n: string) => `Hi ${n},`,
+    intro: (m: string, s: string) =>
+      `Almost there. To complete the rental of your e-bike <strong>${m}</strong> (${s}), please review and sign the agreement using the link below.`,
+    button: 'Read &amp; sign the agreement',
+    fallback: 'If the button does not work, copy and paste this link into your browser:',
+    note: '',
+    copySubject: 'Copy of your signed rental agreement - The Fast Sheep',
+    copyIntro: (n: string) => `Hi ${n}, below is a copy of the rental agreement you signed.`,
+  },
+  pt: {
+    inviteSubject: 'Contrato de aluguer da tua e-bike - The Fast Sheep',
+    greeting: (n: string) => `Olá ${n},`,
+    intro: (m: string, s: string) =>
+      `Falta pouco. Para concluir o aluguer da tua e-bike <strong>${m}</strong> (${s}), revê e assina o contrato através deste link.`,
+    button: 'Ler e assinar o contrato',
+    fallback: 'Se o botão não funcionar, copia e cola este link no teu navegador:',
+    note: 'O contrato está redigido em inglês, tal como o documento original da The Fast Sheep Limited.',
+    copySubject: 'Cópia do teu contrato de aluguer assinado - The Fast Sheep',
+    copyIntro: (n: string) => `Olá ${n}, em baixo encontras uma cópia do contrato de aluguer que assinaste.`,
+  },
+} as const;
+
+const CONTRACT_EMAIL_FOOTER =
+  '<hr style="border:none; border-top:1px solid #e5e7eb; margin: 20px 0;">' +
+  '<p style="font-size: 11px; color:#9ca3af; text-align:center;">THE FAST SHEEP LIMITED — 802654<br>' +
+  'Unit 3D North Point House, New Mallow Road, Cork, Ireland<br>www.thefastsheep.com · +353 83 042 9732</p>';
+
+// Email 1: invitation with the link to the public signing page.
+function sendRentalContractInviteEmail(
+  snapshot: RentalContractSnapshot,
+  url: string,
+  lang: 'es' | 'en' | 'pt'
+) {
+  const t = CONTRACT_EMAIL_T[lang] ?? CONTRACT_EMAIL_T.en;
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 560px; margin: 0 auto; color: #1f2937;">
+      <div style="text-align:center; padding: 16px 0;">
+        <div style="font-size: 28px;">🐏</div>
+        <h2 style="margin: 4px 0;">The Fast Sheep</h2>
+        <p style="margin:0; font-size: 13px; color:#6b7280;">Electric Bicycle Rental Agreement</p>
+      </div>
+      <p>${t.greeting(snapshot.lessee_name)}</p>
+      <p>${t.intro(snapshot.bike_brand_model, snapshot.bike_serial)}</p>
+      <div style="text-align:center; margin: 28px 0;">
+        <a href="${url}" style="background:#10b981; color:#fff; text-decoration:none; padding: 14px 28px; border-radius: 10px; font-weight: 600; display:inline-block;">
+          ${t.button}
+        </a>
+      </div>
+      ${t.note ? `<p style="font-size: 12px; color:#6b7280;">${t.note}</p>` : ''}
+      <p style="font-size: 12px; color:#6b7280;">${t.fallback}<br>
+        <a href="${url}" style="color:#10b981;">${url}</a></p>
+      ${CONTRACT_EMAIL_FOOTER}
+    </div>`;
+  executeEmailSend(snapshot.lessee_email, t.inviteSubject, html);
+}
+
+// Email 2: signed copy for the rider's records. The reproduced agreement stays
+// in English; only the cover note follows the configured language.
+function sendRentalContractCopyEmail(
+  snapshot: RentalContractSnapshot,
+  payload: { signature_url: string; signed_at: string; image_consent: boolean },
+  lang: 'es' | 'en' | 'pt'
+) {
+  const t = CONTRACT_EMAIL_T[lang] ?? CONTRACT_EMAIL_T.en;
+
+  const detailsHtml = contractDetailRows(snapshot).map(([label, value]) => `
+    <tr>
+      <td style="padding:4px 0; color:#6b7280; font-size:12px;">${label}</td>
+      <td style="padding:4px 0; text-align:right; font-weight:600; font-size:12px;">${value}</td>
+    </tr>`).join('');
+
+  const clausesHtml = RENTAL_CONTRACT_CLAUSES.map(c => `
+    <h3 style="font-size:13px; margin: 16px 0 6px;">${c.title}</h3>
+    ${(c.paragraphs ?? []).map(p => `<p style="margin:4px 0; font-size:12px; line-height:1.5;">${p}</p>`).join('')}
+    ${(c.bullets ?? []).length ? `<ul style="margin:4px 0 4px 18px; padding:0;">${(c.bullets ?? []).map(b => `<li style="font-size:12px; line-height:1.5;">${b}</li>`).join('')}</ul>` : ''}
+    ${(c.closing ?? []).map(p => `<p style="margin:4px 0; font-size:12px; line-height:1.5;">${p}</p>`).join('')}
+  `).join('');
+
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto; color: #1f2937;">
+      <div style="text-align:center; padding: 16px 0;">
+        <div style="font-size: 28px;">🐏</div>
+        <h2 style="margin: 4px 0;">THE FAST SHEEP LIMITED</h2>
+        <p style="margin:0; font-size: 13px; color:#6b7280;">Electric Bicycle Rental Agreement</p>
+      </div>
+      <p style="font-size: 13px;">${t.copyIntro(snapshot.lessee_name)}</p>
+
+      <h3 style="font-size:14px; margin: 18px 0 6px;">RENTAL DETAILS</h3>
+      <table style="width:100%; border-collapse:collapse;">${detailsHtml}</table>
+
+      <p style="margin:16px 0 0; font-size:12px; line-height:1.5;">${RENTAL_CONTRACT_INTRO}</p>
+      ${clausesHtml}
+
+      <h3 style="font-size:14px; margin: 18px 0 6px;">SIGNATURES</h3>
+      <p style="margin:4px 0; font-size:12px;">By signing, the LESSEE confirms that:</p>
+      <ul style="margin:4px 0 4px 18px; padding:0;">
+        ${CONTRACT_SIGNATURE_ACKNOWLEDGEMENTS.map(a => `<li style="font-size:12px; line-height:1.5;">${a}</li>`).join('')}
+      </ul>
+      <p style="margin:8px 0; font-size:12px;">
+        <strong>${payload.image_consent ? '☑' : '☐'}</strong> ${CONTRACT_IMAGE_CONSENT_TEXT}
+      </p>
+      <div style="margin-top:12px;">
+        <img src="${payload.signature_url}" alt="signature" style="max-width: 320px; border:1px solid #e5e7eb; border-radius: 8px; background:#fff;" />
+      </div>
+      <p style="font-size: 12px; color:#6b7280; margin-top: 8px;">Signed by ${snapshot.lessee_name} — ${payload.signed_at}</p>
+      ${CONTRACT_EMAIL_FOOTER}
+    </div>`;
+  executeEmailSend(snapshot.lessee_email, t.copySubject, html);
+}
+
+
 
 // ----------------------------------------------------
 // EMAIL TEMPLATES & MOCK DELIVERY SYSTEM (Resend ready)
@@ -694,7 +1193,7 @@ function sendSaleConfirmationEmail(sale: any, items: any[], customer: any, lang:
   if (customTemplate) {
     let body = customTemplate.body_text;
     body = body.replace(/\{\{CLIENT_NAME\}\}/g, `${customer.first_name} ${customer.last_name}`.trim());
-    body = body.replace(/\{\{TOTAL_SALE\}\}/g, `€${sale.total_amount}`);
+    body = body.replace(/\{\{TOTAL_SALE\}\}/g, `€${fmt1(sale.total_amount)}`);
     
     const prodListHtml = `
       <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
@@ -705,7 +1204,7 @@ function sendSaleConfirmationEmail(sale: any, items: any[], customer: any, lang:
         ${items.map(item => `
           <tr>
             <td style="padding: 8px 0; font-size: 12px; color: #e2e8f0;">${item.name} (${item.serial_number})</td>
-            <td style="padding: 8px 0; text-align: right; font-size: 12px; color: #e2e8f0; font-weight: bold;">€${item.price_sold || item.price_paid}</td>
+            <td style="padding: 8px 0; text-align: right; font-size: 12px; color: #e2e8f0; font-weight: bold;">€${fmt1(item.price_sold || item.price_paid)}</td>
           </tr>
         `).join('')}
       </table>
@@ -762,10 +1261,10 @@ function sendSaleConfirmationEmail(sale: any, items: any[], customer: any, lang:
         <p>${t.thankYou}</p>
         <hr />
         <ul>
-          ${items.map(item => `<li><strong>${item.serial_number}</strong> - ${item.name}: €${item.price_sold || item.price_paid}</li>`).join('')}
+          ${items.map(item => `<li><strong>${item.serial_number}</strong> - ${item.name}: €${fmt1(item.price_sold || item.price_paid)}</li>`).join('')}
         </ul>
         <p><strong>${t.date}:</strong> ${sale.sale_date}</p>
-        <p><strong>${t.total}:</strong> €${sale.total_amount}</p>
+        <p><strong>${t.total}:</strong> €${fmt1(sale.total_amount)}</p>
         <hr />
         <p style="font-size: 12px; color: #777;">${t.footer}</p>
       </div>
@@ -785,11 +1284,11 @@ function sendFinancingPlanEmail(sale: any, plan: any, payments: any[], items: an
   if (customTemplate) {
     let body = customTemplate.body_text;
     body = body.replace(/\{\{CLIENT_NAME\}\}/g, `${customer.first_name} ${customer.last_name}`.trim());
-    body = body.replace(/\{\{TOTAL_SALE\}\}/g, `€${sale.total_amount}`);
-    body = body.replace(/\{\{DOWN_PAYMENT\}\}/g, `€${sale.down_payment}`);
-    body = body.replace(/\{\{FINANCED_AMOUNT\}\}/g, `€${plan.total_financed}`);
+    body = body.replace(/\{\{TOTAL_SALE\}\}/g, `€${fmt1(sale.total_amount)}`);
+    body = body.replace(/\{\{DOWN_PAYMENT\}\}/g, `€${fmt1(sale.down_payment)}`);
+    body = body.replace(/\{\{FINANCED_AMOUNT\}\}/g, `€${fmt1(plan.total_financed)}`);
     body = body.replace(/\{\{INSTALLMENTS_COUNT\}\}/g, `${plan.num_installments}`);
-    body = body.replace(/\{\{INSTALLMENT_AMOUNT\}\}/g, `€${plan.installment_amount}`);
+    body = body.replace(/\{\{INSTALLMENT_AMOUNT\}\}/g, `€${fmt1(plan.installment_amount)}`);
     body = body.replace(/\{\{PAYMENT_FREQUENCY\}\}/g, plan.payment_frequency === 'semanal' ? (lang === 'es' ? 'semanal' : lang === 'en' ? 'weekly' : 'semanal') : (lang === 'es' ? 'mensual' : lang === 'en' ? 'monthly' : 'mensal'));
     body = body.replace(/\{\{FIRST_DUE_DATE\}\}/g, plan.start_date ? plan.start_date.split('-').reverse().join('/') : '—');
     html = body;
@@ -866,10 +1365,10 @@ function sendFinancingPlanEmail(sale: any, plan: any, payments: any[], items: an
         <ul>
           ${items.map(item => `<li><strong>${item.serial_number}</strong> - ${item.name}</li>`).join('')}
         </ul>
-        <p><strong>${t.totalSale}:</strong> €${sale.total_amount}</p>
-        <p><strong>${t.downPayment}:</strong> €${sale.down_payment}</p>
-        <p><strong>${t.totalFinanced}:</strong> €${plan.total_financed}</p>
-        <p><strong>${t.installments}:</strong> ${plan.num_installments} x €${plan.installment_amount} (${plan.payment_frequency === 'semanal' ? 'Semanal' : 'Mensual'})</p>
+        <p><strong>${t.totalSale}:</strong> €${fmt1(sale.total_amount)}</p>
+        <p><strong>${t.downPayment}:</strong> €${fmt1(sale.down_payment)}</p>
+        <p><strong>${t.totalFinanced}:</strong> €${fmt1(plan.total_financed)}</p>
+        <p><strong>${t.installments}:</strong> ${plan.num_installments} x €${fmt1(plan.installment_amount)} (${plan.payment_frequency === 'semanal' ? 'Semanal' : 'Mensual'})</p>
         
         <h3>${t.paymentSchedule}:</h3>
         <table border="1" cellpadding="8" style="border-collapse: collapse; width: 100%;">
@@ -886,7 +1385,7 @@ function sendFinancingPlanEmail(sale: any, plan: any, payments: any[], items: an
               <tr>
                 <td>${p.installment_number}</td>
                 <td>${p.due_date}</td>
-                <td>€${p.amount}</td>
+                <td>€${fmt1(p.amount)}</td>
                 <td>${p.status}</td>
               </tr>
             `).join('')}
@@ -925,7 +1424,7 @@ function sendRentalConfirmationEmail(rental: any, vehicle: any, customer: any, l
       body = body.replace(/Alquiler Mensual:/gi, lang === 'es' ? 'Alquiler Semanal:' : lang === 'en' ? 'Weekly Rent:' : 'Aluguer Semanal:');
       body = body.replace(/Monthly Rent:/gi, 'Weekly Rent:');
       body = body.replace(/Aluguer Mensal:/gi, 'Aluguer Semanal:');
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${rental.rental_rate || Math.round(rental.monthly_rate / 4)}`);
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt1(rental.rental_rate || Math.round(rental.monthly_rate / 4))}`);
       
       body = body.replace(/mensualidades/gi, lang === 'es' ? 'cuotas semanales' : lang === 'en' ? 'weekly payments' : 'prestações semanais');
       body = body.replace(/cobrarán el mismo día de cada mes/gi, lang === 'es' ? 'cobrarán cada semana' : lang === 'en' ? 'charged every week' : 'cobrarão a cada semana');
@@ -933,15 +1432,15 @@ function sendRentalConfirmationEmail(rental: any, vehicle: any, customer: any, l
       body = body.replace(/Alquiler Mensual:/gi, lang === 'es' ? 'Alquiler Diario:' : lang === 'en' ? 'Daily Rent:' : 'Aluguer Diário:');
       body = body.replace(/Monthly Rent:/gi, 'Daily Rent:');
       body = body.replace(/Aluguer Mensal:/gi, 'Aluguer Diário:');
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${rental.rental_rate}`);
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt1(rental.rental_rate)}`);
       
       body = body.replace(/mensualidades/gi, lang === 'es' ? 'cuotas diarias' : lang === 'en' ? 'daily payments' : 'prestações diárias');
       body = body.replace(/cobrarán el mismo día de cada mes/gi, lang === 'es' ? 'cobrarán cada día' : lang === 'en' ? 'charged every day' : 'cobrarão a cada dia');
     } else {
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${rental.monthly_rate}`);
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt1(rental.monthly_rate)}`);
     }
     
-    body = body.replace(/\{\{DEPOSIT_AMOUNT\}\}/g, `€${rental.deposit_amount || 0}`);
+    body = body.replace(/\{\{DEPOSIT_AMOUNT\}\}/g, `€${fmt1(rental.deposit_amount || 0)}`);
     html = body;
   } else {
     const rateType = rental.rate_type || 'mensual';
@@ -1010,8 +1509,8 @@ function sendRentalConfirmationEmail(rental: any, vehicle: any, customer: any, l
         <ul>
           <li><strong>${t.vehicle}:</strong> ${vehicleStr}</li>
           <li><strong>${t.startDate}:</strong> ${rental.start_date}</li>
-          <li><strong>${t.monthlyRate}:</strong> €${rateVal}</li>
-          <li><strong>${t.deposit}:</strong> €${rental.deposit_amount || 0}</li>
+          <li><strong>${t.monthlyRate}:</strong> €${fmt1(rateVal)}</li>
+          <li><strong>${t.deposit}:</strong> €${fmt1(rental.deposit_amount || 0)}</li>
         </ul>
         <hr />
         <p style="font-size: 12px; color: #777;">${t.footer}</p>
@@ -1045,7 +1544,7 @@ function sendRentalReminderEmail(rental: any, vehicle: any, customer: any, dueDa
       body = body.replace(/Monto de Mensualidad:/gi, lang === 'es' ? 'Monto Semanal:' : lang === 'en' ? 'Weekly Rate:' : 'Valor Semanal:');
       body = body.replace(/Monthly Rate:/gi, 'Weekly Rate:');
       body = body.replace(/Mensalidade de Aluguer:/gi, 'Aluguer Semanal:');
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${rental.rental_rate || Math.round(rental.monthly_rate / 4)}`);
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt1(rental.rental_rate || Math.round(rental.monthly_rate / 4))}`);
       
       body = body.replace(/mensualidad/gi, lang === 'es' ? 'cuota semanal' : lang === 'en' ? 'weekly rate' : 'mensualidade');
       body = body.replace(/cobro mensual/gi, lang === 'es' ? 'cobro semanal' : lang === 'en' ? 'weekly payment' : 'cobro semanal');
@@ -1053,12 +1552,12 @@ function sendRentalReminderEmail(rental: any, vehicle: any, customer: any, dueDa
       body = body.replace(/Monto de Mensualidad:/gi, lang === 'es' ? 'Monto Diario:' : lang === 'en' ? 'Daily Rate:' : 'Valor Diário:');
       body = body.replace(/Monthly Rate:/gi, 'Daily Rate:');
       body = body.replace(/Mensalidade de Aluguer:/gi, 'Aluguer Diário:');
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${rental.rental_rate}`);
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt1(rental.rental_rate)}`);
       
       body = body.replace(/mensualidad/gi, lang === 'es' ? 'cuota diaria' : lang === 'en' ? 'daily rate' : 'mensualidade');
       body = body.replace(/cobro mensual/gi, lang === 'es' ? 'cobro diario' : lang === 'en' ? 'daily payment' : 'cobro diário');
     } else {
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${rental.monthly_rate}`);
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt1(rental.monthly_rate)}`);
     }
     
     body = body.replace(/\{\{DUE_DATE\}\}/g, dueDate.split('-').reverse().join('/'));
@@ -1125,7 +1624,7 @@ function sendRentalReminderEmail(rental: any, vehicle: any, customer: any, dueDa
         <hr />
         <ul>
           <li><strong>${t.vehicle}:</strong> ${vehicleStr}</li>
-          <li><strong>${t.amount}:</strong> €${rateVal}</li>
+          <li><strong>${t.amount}:</strong> €${fmt1(rateVal)}</li>
           <li><strong>${t.dueDate}:</strong> ${dueDate}</li>
         </ul>
         <hr />
@@ -1147,7 +1646,7 @@ function sendRentalPaymentReceivedEmail(customer: any, amount: number, date: str
   if (customTemplate) {
     let body = customTemplate.body_text;
     body = body.replace(/\{\{CLIENT_NAME\}\}/g, `${customer.first_name} ${customer.last_name}`.trim());
-    body = body.replace(/\{\{PAYMENT_AMOUNT\}\}/g, `€${amount}`);
+    body = body.replace(/\{\{PAYMENT_AMOUNT\}\}/g, `€${fmt1(amount)}`);
     body = body.replace(/\{\{PAYMENT_DATE\}\}/g, date.split('-').reverse().join('/'));
     body = body.replace(/\{\{PAYMENT_METHOD\}\}/g, method);
     html = body;
@@ -1159,7 +1658,7 @@ function sendRentalPaymentReceivedEmail(customer: any, amount: number, date: str
         <p>Te confirmamos que hemos recibido tu pago correctamente:</p>
         <hr />
         <ul>
-          <li><strong>Monto:</strong> €${amount}</li>
+          <li><strong>Monto:</strong> €${fmt1(amount)}</li>
           <li><strong>Fecha:</strong> ${date}</li>
           <li><strong>Detalle:</strong> ${method}</li>
         </ul>
@@ -1223,7 +1722,7 @@ function sendRentalReturnedEmail(rental: any, vehicle: any, customer: any, lang:
     body = body.replace(/\{\{CLIENT_NAME\}\}/g, `${customer.first_name} ${customer.last_name}`.trim());
     body = body.replace(/\{\{VEHICLE_NAME\}\}/g, vehicleStr);
     body = body.replace(/\{\{ODOMETER_END\}\}/g, String(rental.odometer_end || 0));
-    body = body.replace(/\{\{DEPOSIT_REFUNDED\}\}/g, rental.deposit_refunded !== null ? `€${rental.deposit_refunded}` : '—');
+    body = body.replace(/\{\{DEPOSIT_REFUNDED\}\}/g, rental.deposit_refunded !== null ? `€${fmt1(rental.deposit_refunded)}` : '—');
     body = body.replace(/\{\{DAMAGE_REPORT\}\}/g, rental.damage_report || 'Sin Daños / Correcto');
     html = body;
   } else {
@@ -1236,7 +1735,7 @@ function sendRentalReturnedEmail(rental: any, vehicle: any, customer: any, lang:
         <ul>
           <li><strong>E-Bike:</strong> ${vehicleStr}</li>
           <li><strong>KM Final:</strong> ${rental.odometer_end || 0}</li>
-          <li><strong>Depósito Devuelto:</strong> ${rental.deposit_refunded !== null ? `€${rental.deposit_refunded}` : '—'}</li>
+          <li><strong>Depósito Devuelto:</strong> ${rental.deposit_refunded !== null ? `€${fmt1(rental.deposit_refunded)}` : '—'}</li>
           <li><strong>Reporte Daños:</strong> ${rental.damage_report || 'Sin Daños / Correcto'}</li>
         </ul>
         <hr />
@@ -1549,7 +2048,7 @@ const translations = {
     odometer: "Kilometraje (KM)", lastService: "Último Service", serviceLocation: "Lugar del Service",
     nextService: "Próximo Service", serviceAlert: "Alerta de Taller", performedBy: "Mecánico",
     serviceDescription: "Detalle de Trabajo", serviceCost: "Costo de Reparación",
-    addServiceRecord: "Registrar Entrada a Taller", cheapest: "El Más Barato", fastest: "El Más Rápido",
+    addServiceRecord: "Programar Entrada a Taller", cheapest: "El Más Barato", fastest: "El Más Rápido",
     suppliersComparison: "Comparador de Compra de Flota",
     cancelReturnNotice: "Cancelar Aviso", returnBike: "Registrar Devolución", odometerEnd: "Kilometraje Final (KM)", logPayment: "Registrar Pago",
     damageReport: "Reporte de Daños", depositRefunded: "Depósito Devuelto (€)",
@@ -1600,7 +2099,7 @@ const translations = {
     odometer: "Odometer (KM)", lastService: "Last Service", serviceLocation: "Service Location",
     nextService: "Next Service", serviceAlert: "Garage Alert", performedBy: "Mechanic",
     serviceDescription: "Job Details", serviceCost: "Repair Cost",
-    addServiceRecord: "Register Workshop Service", cheapest: "Cheapest", fastest: "Fastest",
+    addServiceRecord: "Schedule Workshop Entry", cheapest: "Cheapest", fastest: "Fastest",
     suppliersComparison: "Fleet Purchase Matcher",
     returnBike: "Register Return", odometerEnd: "Final Odometer (KM)", logPayment: "Log Payment",
     damageReport: "Damage Report", depositRefunded: "Deposit Refunded (€)",
@@ -1655,6 +2154,20 @@ export default function App() {
       setAuthLoading(false);
     });
     return () => subscription.unsubscribe();
+  }, []);
+
+  // Evita que la rueda del raton cambie el valor de un <input type="number"> enfocado:
+  // al hacer scroll dentro de un modal el importe se modificaba solo. Quitamos el foco
+  // para que la pagina siga desplazandose sin tocar el numero.
+  useEffect(() => {
+    const handleWheel = (e: WheelEvent) => {
+      const el = document.activeElement;
+      if (el instanceof HTMLInputElement && el.type === 'number' && el.contains(e.target as Node)) {
+        el.blur();
+      }
+    };
+    document.addEventListener('wheel', handleWheel, { passive: true });
+    return () => document.removeEventListener('wheel', handleWheel);
   }, []);
 
   // Parse auth error in URL hash if any
@@ -2083,6 +2596,9 @@ USING (true);`;
       setEvents(evs); setRecords(recs); setProductModels(pms); setQuickReplies(qrs);
       setSales(sls); setSaleItems(sis); setFinancingPlans(fps); setFinancingPaymentsData(fpays);
       setEmailTemplates(emts);
+
+      // Automatically detect and fix duplicate customer codes
+      deduplicateCustomerCodes(custs, setCustomers);
 
       // Delivery checklists (separate fetch so a missing table doesn't block the app)
       try {
@@ -3481,7 +3997,7 @@ USING (true);`;
           setSoldMixedCash(targetAmount);
           setSoldMixedTransfer(0);
         } else {
-          setSoldMixedTransfer(Number((targetAmount - soldMixedCash).toFixed(2)));
+          setSoldMixedTransfer(round1(targetAmount - soldMixedCash));
         }
       }
     }
@@ -3714,9 +4230,26 @@ USING (true);`;
       });
     }
 
-    // Current Lock Association
+    // Lock link / unlink history (recorded on link/unlink with the real date)
+    const lockEvents = Array.isArray(bike.custom_field_values?.lock_events)
+      ? (bike.custom_field_values.lock_events as Array<{ type: string; lock_serial?: string; lock_name?: string; date: string }>)
+      : [];
+    lockEvents.forEach((ev, i) => {
+      const label = ev.lock_name ? `${ev.lock_serial || ''} (${ev.lock_name})` : (ev.lock_serial || '');
+      extraEvents.push({
+        id: `lockev-${bike.id}-${i}`,
+        date: ev.date,
+        type: 'lock_link' as const,
+        description: ev.type === 'link'
+          ? (language === 'es' ? `🔗 Candado Vinculado — ${label}` : `🔗 Lock Linked — ${label}`)
+          : (language === 'es' ? `🔓 Candado Desvinculado — ${label}` : `🔓 Lock Unlinked — ${label}`),
+        cost: undefined
+      });
+    });
+
+    // Current Lock Association (fallback for bikes with no recorded history)
     const currentLock = products.find(p => p.category_id === catLockId && p.custom_field_values?.associated_bike_id === bike.id);
-    if (currentLock) {
+    if (currentLock && lockEvents.length === 0) {
       extraEvents.push({
         id: `lock-${currentLock.id}`,
         date: new Date().toISOString().split('T')[0],
@@ -3835,6 +4368,7 @@ USING (true);`;
     setProdFormPricePaid(vatApplied ? ((prod?.custom_field_values?.cost_base as number) ?? prod?.price_paid ?? 1000) : (prod?.price_paid ?? 1000));
     setProdFormPriceSold(prod?.price_sold ?? null);
     setProdFormWeeklyRate(prod?.suggested_weekly_rate ?? 50); setProdFormDeposit(prod?.suggested_deposit ?? 150);
+    setProdFormColor(prod?.color ?? '');
     setProdFormNotes(prod?.notes ?? ''); setProdFormFrame(prod?.frame_serial ?? '');
     setProdFormOdo(prod?.odometer ?? 0); setProdFormMotor(prod?.motor_brand ?? '');
     setProdFormBrand(prod?.brand ?? ''); setProdFormModel(prod?.model ?? '');
@@ -3976,7 +4510,7 @@ USING (true);`;
       setServFormLoc('Dublin Central Garage'); 
       setServFormBy('Mechanic Sean');
       setServFormDesc('Complete mechanical review & chain lube.'); 
-      setServFormCost(45);
+      setServFormCost(0);
       setServFormRemindWeek(false); 
       setServFormRemindDay(false);
       setServFormRemindCustom(false); 
@@ -3985,13 +4519,45 @@ USING (true);`;
     setModalType('service');
   }, [products, records, events]);
 
+  // Put a vehicle directly into the workshop (status Mantenimiento) without scheduling a service.
+  const enterWorkshopDirect = async (bike: Product) => {
+    if (bike.status === 'Rentada') {
+      showToast(language === 'es' ? 'No es posible ingresar al taller un vehículo mientras esté rentado.' : 'Cannot put a vehicle in the workshop while it is rented.', 'error');
+      return;
+    }
+    try {
+      const todayStr = new Date().toISOString().split('T')[0];
+      const record = records.find(r => r.bike_id === bike.id && r.service_date === bike.next_service_date);
+      if (record) {
+        await upsertRecord({ ...record, service_date: todayStr });
+        const existingEv = events.find(ev => ev.description.includes(`Service ID: ${record.id}`) && !ev.description.includes('Recordatorio personalizado'));
+        if (existingEv) await upsertEvent({ ...existingEv, event_date: todayStr, status: 'Realizado' });
+      } else {
+        await upsertRecord({
+          id: crypto.randomUUID(),
+          bike_id: bike.id,
+          service_date: todayStr,
+          location: 'Dublin Central Garage',
+          description: language === 'es' ? 'Ingreso directo a taller / Revisión general' : 'Direct check-in to workshop / General review',
+          cost: 0,
+          performed_by: 'Mechanic Sean'
+        });
+      }
+      await upsertProduct({ ...bike, maintenance_status: 'En Taller', status: 'Mantenimiento', last_service_date: todayStr, next_service_date: null });
+      triggerReload();
+      showToast(language === 'es' ? `${bike.serial_number} ingresada al taller.` : `${bike.serial_number} entered workshop.`, 'success');
+    } catch {
+      showToast('Error.', 'error');
+    }
+  };
+
   const openSoldModal = useCallback((prod: Product) => {
     if (prod.category_id === catLockId && prod.custom_field_values?.associated_bike_id) {
       alert(language === 'es' ? 'Desvincule primero antes de vender' : 'Please unlink before selling');
       return;
     }
 
-    const suggestedPrice = prod.price_sold ?? (prod.price_paid ? Math.round(prod.price_paid * 1.5) : 500);
+    const suggestedPrice = prod.price_sold ?? 0;
     setSoldFormPrice(suggestedPrice);
     setSoldFormDate(new Date().toISOString().split('T')[0]);
     setSoldPaymentType('contado');
@@ -4012,7 +4578,7 @@ USING (true);`;
     const initialLoc = dist ? Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central' : (prod.custom_field_values?.location as string || 'Almacén Central');
 
     if (linkedLock) {
-      const lockPrice = linkedLock.price_sold ?? (linkedLock.price_paid ? Math.round(linkedLock.price_paid * 1.5) : 50);
+      const lockPrice = linkedLock.price_sold ?? 0;
       const lockDist = linkedLock.custom_field_values?.location_distribution as Record<string, number> | undefined;
       const lockLoc = lockDist ? Object.entries(lockDist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central' : (linkedLock.custom_field_values?.location as string || 'Almacén Central');
 
@@ -4128,7 +4694,7 @@ USING (true);`;
           const reminderEvent = {
             id: crypto.randomUUID(),
             title: `💳 Cuota ${nextNext.installment_number}/${plan.num_installments}: ${custName}`,
-            description: `Vencimiento de la cuota ${nextNext.installment_number} del financiamiento por la compra de: ${bikeSerials}. Monto: €${nextNext.amount}.`,
+            description: `Vencimiento de la cuota ${nextNext.installment_number} del financiamiento por la compra de: ${bikeSerials}. Monto: €${fmt1(nextNext.amount)}.`,
             event_date: nextNext.due_date,
             remind_one_week: true,
             remind_one_day: true,
@@ -4228,6 +4794,7 @@ USING (true);`;
   const [editReferral, setEditReferral] = useState('');
   const [wizEmail,       setWizEmail]       = useState('');
   const [wizPhone,       setWizPhone]       = useState('');
+  const [wizAddress,     setWizAddress]     = useState('');
   const [wizNationality, setWizNationality] = useState('Brasil');
   const [wizEmailLang,   setWizEmailLang]   = useState<'es' | 'en' | 'pt'>(language === 'es' ? 'es' : 'en');
   const [wizReferral,    setWizReferral]    = useState('Instagram');
@@ -4250,6 +4817,9 @@ USING (true);`;
   const [addGenStockModalOpen, setAddGenStockModalOpen] = useState(false);
   const [removeGenStockModalOpen, setRemoveGenStockModalOpen] = useState(false);
   const [genStockQty, setGenStockQty] = useState(1);
+  const [workshopPickerSearch, setWorkshopPickerSearch] = useState('');
+  const [finishServiceBikeId, setFinishServiceBikeId] = useState<string | null>(null);
+  const [finishServiceCost, setFinishServiceCost] = useState(0);
   const [genStockLocation, setGenStockLocation] = useState('Almacén Central');
   const [genStockCost, setGenStockCost] = useState(0);
   const [menuCoords, setMenuCoords] = useState<{ top: number; left: number; width: number; height: number } | null>(null);
@@ -4535,7 +5105,7 @@ USING (true);`;
     }
     try {
       const newId = crypto.randomUUID();
-      const finalCode = 'US-' + (1001 + customers.length);
+      const finalCode = getNextCustomerCode(customers);
       const newRider: Customer = {
         id: newId,
         customer_code: finalCode,
@@ -4864,17 +5434,23 @@ USING (true);`;
       let rider = customers.find(c => c.email.toLowerCase() === wizEmail.toLowerCase());
       const customerId = rider?.id ?? crypto.randomUUID();
       if (!rider) {
-        let suffix = wizCustomerCode.trim().replace(/^US-?/i, '');
-        if (!suffix) {
-          suffix = `${1001 + customers.length}`;
+        let finalCode = '';
+        const suffix = wizCustomerCode.trim().replace(/^US-?/i, '');
+        if (suffix) {
+          finalCode = 'US-' + suffix;
+        } else {
+          finalCode = getNextCustomerCode(customers);
         }
-        const finalCode = 'US-' + suffix;
         rider = {
           id: customerId, customer_code: finalCode,
           first_name: wizFirstName, last_name: wizLastName, email: wizEmail,
-          phone: wizPhone, id_document_url: '',
+          phone: wizPhone, address: wizAddress, id_document_url: '',
           referral_source: wizReferral, nationality: wizNationality, notes: '', created_at: new Date().toISOString(),
         };
+        await upsertCustomer(rider);
+      } else if (wizAddress.trim() && wizAddress.trim() !== (rider.address ?? '').trim()) {
+        // Existing rider: keep the address up to date, it is printed on the contract.
+        rider = { ...rider, address: wizAddress.trim() };
         await upsertCustomer(rider);
       }
 
@@ -4970,7 +5546,7 @@ USING (true);`;
         const rentalReminderEvent = {
           id: crypto.randomUUID(),
           title: `🚲 Pago Alquiler: ${rider.first_name} ${rider.last_name}`,
-          description: `Mensualidad del alquiler de la bicicleta: ${bikeProduct?.name || 'E-Bike'} (${bikeProduct?.serial_number || 'S/N'}). Monto: €${wizRateType === 'mensual' ? wizRate : Math.round(wizRate * 4)}.`,
+          description: `Mensualidad del alquiler de la bicicleta: ${bikeProduct?.name || 'E-Bike'} (${bikeProduct?.serial_number || 'S/N'}). Monto: €${fmt1(wizRateType === 'mensual' ? wizRate : Math.round(wizRate * 4))}.`,
           event_date: formattedFirstInstallmentDate,
           remind_one_week: true,
           remind_one_day: true,
@@ -5072,11 +5648,34 @@ USING (true);`;
         }
       }
 
-      // Show signing link if digital contract
+      // Digital contract: freeze the rental details, then email the signing link.
+      // The snapshot is what the rider reads and signs, so later rate changes
+      // never alter the agreement that was accepted.
       if (wizContractMode === 'digital' && wizEmail) {
         const signUrl = `${window.location.origin}${window.location.pathname}?firmar=${newRentId}`;
-        showToast(`📋 Enlace de firma: ${signUrl}`, 'success');
-        // Copy to clipboard
+        const snapshot: RentalContractSnapshot = {
+          lessee_name: `${rider.first_name} ${rider.last_name}`.trim(),
+          lessee_address: wizAddress.trim() || rider.address || '',
+          lessee_phone: wizPhone || rider.phone || '',
+          lessee_email: wizEmail,
+          email_lang: wizEmailLang,
+          bike_brand_model: bikeProduct?.name ?? '',
+          bike_serial: bikeProduct?.serial_number ?? '',
+          start_date: wizStartDate,
+          payment_due_weekday: contractPaymentWeekday(wizStartDate),
+          rate_amount: wizRate,
+          rate_type: wizRateType,
+          deposit_amount: wizDeposit,
+          battery_count: wizBatteryIds.length,
+        };
+        try {
+          await supabase.from('rentals').update({ contract_snapshot: snapshot }).eq('id', newRentId);
+          sendRentalContractInviteEmail(snapshot, signUrl, wizEmailLang);
+          showToast(`📄 ${language === 'es' ? 'Contrato enviado' : 'Contract sent'}: ${signUrl}`, 'success');
+        } catch (err) {
+          console.error('Failed to send rental contract:', err);
+          showToast(language === 'es' ? 'No se pudo enviar el contrato.' : 'Could not send the contract.', 'error');
+        }
         try { await navigator.clipboard.writeText(signUrl); } catch { /* ignore */ }
       }
 
@@ -5123,7 +5722,7 @@ USING (true);`;
       // Reset wizard
       setWizBikeId(''); setWizBatteryIds([]); setWizLockId(''); setWizGigAccountId(null);
       setWizFirstName(''); setWizLastName(''); setWizEmail('');
-      setWizPhone(''); setWizRiderEmail(''); setSignatureData(null);
+      setWizPhone(''); setWizAddress(''); setWizRiderEmail(''); setSignatureData(null);
       setWizKitProductIds([]); setWizKitLocations({}); setWizHasKit(true); setWizKitDetails('');
       setWizCustomerCode(''); setWizStartDate(new Date().toISOString().split('T')[0]);
       // Reset Step 7 evidence states
@@ -5231,9 +5830,13 @@ USING (true);`;
   const signCanvasRef = useRef<HTMLCanvasElement>(null);
   const [signIsDrawing, setSignIsDrawing] = useState(false);
   const [signRentalData, setSignRentalData] = useState<{rental: Rental; customer: Customer; bike: Product} | null>(null);
+  const [signBatteryCount, setSignBatteryCount] = useState(0);
   const [signLoading, setSignLoading] = useState(true);
   const [signSuccess, setSignSuccess] = useState(false);
   const [signSubmitting, setSignSubmitting] = useState(false);
+  const [signHasSignature, setSignHasSignature] = useState(false);
+  const [signImageConsent, setSignImageConsent] = useState(false);
+  const [signAccepted, setSignAccepted] = useState(false);
 
   // Load rental data for signing page
   useEffect(() => {
@@ -5245,9 +5848,16 @@ USING (true);`;
         const rental = rentalRow as Rental;
         const { data: customerRow } = await supabase.from('customers').select('*').eq('id', rental.customer_id).single();
         const { data: bikeRow } = await supabase.from('products').select('*, product_models(*)').eq('id', rental.bike_id).single();
+        // Batteries handed over with this rental, for the contract details block.
+        const { data: itemRows } = await supabase
+          .from('rental_items').select('item_type').eq('rental_id', signRentalId);
+        setSignBatteryCount((itemRows ?? []).filter(i => i.item_type === 'battery').length);
         if (customerRow && bikeRow) {
-          const bikeName = (bikeRow as Record<string, unknown>).product_models
-            ? `${((bikeRow as Record<string, unknown>).product_models as Record<string, unknown>)?.brand ?? ''} ${((bikeRow as Record<string, unknown>).product_models as Record<string, unknown>)?.model_name ?? ''}`.trim()
+          const pm = (bikeRow as Record<string, unknown>).product_models as Record<string, unknown> | null;
+          // `brand` may carry the identification colour appended as "Brand#rrggbb".
+          const brand = ((pm?.brand as string) ?? '').split('#')[0].trim();
+          const bikeName = pm
+            ? `${brand} ${(pm?.model_name as string) ?? ''}`.trim()
             : (bikeRow as Record<string, unknown>).serial_number as string;
           setSignRentalData({
             rental,
@@ -5294,6 +5904,7 @@ USING (true);`;
     ctx.strokeStyle = '#10b981';
     ctx.lineTo(x, y);
     ctx.stroke();
+    setSignHasSignature(true);
   };
 
   const stopSign = () => setSignIsDrawing(false);
@@ -5304,16 +5915,56 @@ USING (true);`;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
+    setSignHasSignature(false);
   };
+
+  // Details the rider is signing: the frozen snapshot when one exists, otherwise
+  // rebuilt from live data so links created before this feature still work.
+  const signContractSnapshot = useMemo<RentalContractSnapshot | null>(() => {
+    if (!signRentalData) return null;
+    const stored = signRentalData.rental.contract_snapshot;
+    if (stored) return stored;
+    const { rental, customer, bike } = signRentalData;
+    return {
+      lessee_name: `${customer.first_name} ${customer.last_name}`.trim(),
+      lessee_address: customer.address ?? '',
+      lessee_phone: customer.phone ?? '',
+      lessee_email: customer.email ?? '',
+      email_lang: 'en',
+      bike_brand_model: bike.name ?? '',
+      bike_serial: bike.serial_number ?? '',
+      start_date: rental.start_date,
+      payment_due_weekday: contractPaymentWeekday(rental.start_date),
+      rate_amount: rental.rental_rate,
+      rate_type: rental.rate_type,
+      deposit_amount: rental.deposit_amount,
+      battery_count: signBatteryCount,
+    };
+  }, [signRentalData, signBatteryCount]);
 
   const submitSignature = async () => {
     const canvas = signCanvasRef.current;
-    if (!canvas || !signRentalData) return;
+    if (!canvas || !signRentalData || !signContractSnapshot) return;
+    if (!signHasSignature) {
+      alert(language === 'es' ? 'Por favor firmá dentro del recuadro antes de continuar.' : 'Please sign inside the box before continuing.');
+      return;
+    }
     setSignSubmitting(true);
     try {
       const dataUrl = canvas.toDataURL('image/png');
       const signatureUrl = await uploadSignatureImage(signRentalData.rental.id, dataUrl);
-      await supabase.from('rentals').update({ contract_url: signatureUrl }).eq('id', signRentalData.rental.id);
+      const signedAt = new Date().toISOString();
+      await supabase.from('rentals').update({
+        contract_url: signatureUrl,
+        contract_signed_at: signedAt,
+        contract_image_consent: signImageConsent,
+        contract_snapshot: signContractSnapshot,
+      }).eq('id', signRentalData.rental.id);
+      sendRentalContractCopyEmail(
+        signContractSnapshot,
+        { signature_url: signatureUrl, signed_at: new Date(signedAt).toLocaleString('en-IE'), image_consent: signImageConsent },
+        signContractSnapshot.email_lang,
+      );
       setSignSuccess(true);
     } catch (err) {
       console.error('Signature upload failed:', err);
@@ -5574,30 +6225,66 @@ USING (true);`;
             </div>
           ) : (
             <>
+              {/* RENTAL DETAILS — pre-filled from the wizard */}
+              <h3 style={{ fontSize: '14px', margin: '0 0 8px', letterSpacing: '0.04em' }}>RENTAL DETAILS</h3>
               <div className="contract-details">
-                {[
-                  [language === 'es' ? 'Rider' : 'Rider', `${signRentalData.customer.first_name} ${signRentalData.customer.last_name}`],
-                  [language === 'es' ? 'E-Bike' : 'E-Bike', `${signRentalData.bike.name} (${signRentalData.bike.serial_number ?? ''})`],
-                  [language === 'es' ? 'Tarifa' : 'Rate', `€${signRentalData.rental.rental_rate}/${signRentalData.rental.rate_type === 'diario' ? (language === 'es' ? 'diario' : 'daily') : signRentalData.rental.rate_type === 'semanal' ? (language === 'es' ? 'semanal' : 'weekly') : (language === 'es' ? 'mensual' : 'monthly')}`],
-                  [language === 'es' ? 'Depósito' : 'Deposit', `€${signRentalData.rental.deposit_amount}`],
-                  [language === 'es' ? 'Seguro' : 'Insurance', signRentalData.rental.has_insurance ? (language === 'es' ? 'Sí' : 'Yes') : (language === 'es' ? 'No' : 'No')],
-                  [language === 'es' ? 'Fecha de inicio' : 'Start Date', signRentalData.rental.start_date],
-                ].map(([label, val]) => (
+                {contractDetailRows(signContractSnapshot!).map(([label, val]) => (
                   <div key={label} className="detail-row">
                     <span className="detail-label">{label}</span>
                     <span className="detail-value">{val}</span>
                   </div>
                 ))}
               </div>
-              <div className="terms-box">
-                <p><strong>{language === 'es' ? 'Términos y Condiciones del Alquiler:' : 'Rental Terms & Conditions:'}</strong></p>
-                <p>{language === 'es' ? '1. El rider se compromete a devolver la bicicleta en las mismas condiciones en que fue entregada, salvo desgaste normal por uso.' : '1. The rider agrees to return the bicycle in the same condition as delivered, except for normal wear and tear.'}</p>
-                <p>{language === 'es' ? `2. El depósito de seguridad (€${signRentalData.rental.deposit_amount}) será reembolsado al momento de la devolución, una vez verificado el estado de la bicicleta.` : `2. The security deposit (€${signRentalData.rental.deposit_amount}) will be refunded upon return, once the condition of the bicycle is verified.`}</p>
-                <p>{language === 'es' ? '3. El rider es responsable por cualquier daño, pérdida o robo de la bicicleta y accesorios durante el período de alquiler.' : '3. The rider is responsible for any damage, loss, or theft of the bicycle and accessories during the rental period.'}</p>
-                <p>{language === 'es' ? '4. El rider debe respetar todas las leyes de tránsito vigentes y utilizar la bicicleta de manera responsable.' : '4. The rider must respect all traffic laws in force and use the bicycle in a responsible manner.'}</p>
-                <p>{language === 'es' ? '5. The Fast Sheep se reserva el derecho de retener parte o la totalidad del depósito en caso de daños comprobados.' : '5. The Fast Sheep reserves the right to retain part or all of the deposit in case of proven damage.'}</p>
-                <p>{language === 'es' ? '6. Al firmar este contrato, el rider acepta todos los términos y condiciones aquí descritos.' : '6. By signing this contract, the rider accepts all terms and conditions described herein.'}</p>
+
+              {/* Full agreement. English only: it reproduces the signed PDF. */}
+              <div className="terms-box" style={{ maxHeight: '380px', overflowY: 'auto' }}>
+                <p style={{ fontWeight: 700, marginTop: 0 }}>ELECTRIC BICYCLE RENTAL AGREEMENT</p>
+                <p>{RENTAL_CONTRACT_INTRO}</p>
+                {RENTAL_CONTRACT_CLAUSES.map(clause => (
+                  <div key={clause.title}>
+                    <p style={{ fontWeight: 700, marginBottom: '2px' }}>{clause.title}</p>
+                    {(clause.paragraphs ?? []).map((p, i) => <p key={`p${i}`}>{p}</p>)}
+                    {(clause.bullets ?? []).length > 0 && (
+                      <ul style={{ margin: '4px 0 4px 18px', padding: 0 }}>
+                        {(clause.bullets ?? []).map((b, i) => <li key={`b${i}`} style={{ marginBottom: '3px' }}>{b}</li>)}
+                      </ul>
+                    )}
+                    {(clause.closing ?? []).map((p, i) => <p key={`c${i}`}>{p}</p>)}
+                  </div>
+                ))}
               </div>
+
+              {/* SIGNATURES */}
+              <div className="terms-box">
+                <p style={{ fontWeight: 700, marginTop: 0 }}>SIGNATURES</p>
+                <p>By signing below, the LESSEE confirms that:</p>
+                <ul style={{ margin: '4px 0 4px 18px', padding: 0 }}>
+                  {CONTRACT_SIGNATURE_ACKNOWLEDGEMENTS.map(a => <li key={a} style={{ marginBottom: '3px' }}>{a}</li>)}
+                </ul>
+              </div>
+
+              {/* Clause 13 consent — optional and independent from accepting the agreement */}
+              <label style={{ display: 'flex', gap: '10px', alignItems: 'flex-start', margin: '12px 0', cursor: 'pointer', fontSize: '12px', lineHeight: 1.5 }}>
+                <input
+                  type="checkbox"
+                  checked={signImageConsent}
+                  onChange={e => setSignImageConsent(e.target.checked)}
+                  style={{ width: '18px', height: '18px', marginTop: '1px', flexShrink: 0, cursor: 'pointer' }}
+                />
+                <span>{CONTRACT_IMAGE_CONSENT_TEXT}</span>
+              </label>
+
+              {/* Required acceptance */}
+              <label style={{ display: 'flex', gap: '10px', alignItems: 'flex-start', margin: '12px 0', cursor: 'pointer', fontSize: '12px', lineHeight: 1.5 }}>
+                <input
+                  type="checkbox"
+                  checked={signAccepted}
+                  onChange={e => setSignAccepted(e.target.checked)}
+                  style={{ width: '18px', height: '18px', marginTop: '1px', flexShrink: 0, cursor: 'pointer' }}
+                />
+                <span><strong>I have read and accept the terms and conditions of this Agreement.</strong></span>
+              </label>
+
               <div className="sign-canvas-container">
                 <label>{language === 'es' ? '✍️ Firma aquí (use su dedo o ratón):' : '✍️ Sign here (use your finger or mouse):'}</label>
                 <canvas
@@ -5615,10 +6302,22 @@ USING (true);`;
               </div>
               <div className="sign-actions">
                 <button className="btn-secondary" style={{ flex: 1 }} onClick={clearSign}>🗑️ {language === 'es' ? 'Limpiar' : 'Clear'}</button>
-                <button className="btn-primary" style={{ flex: 2 }} disabled={signSubmitting} onClick={submitSignature}>
+                <button
+                  className="btn-primary"
+                  style={{ flex: 2 }}
+                  disabled={signSubmitting || !signAccepted || !signHasSignature}
+                  onClick={submitSignature}
+                >
                   {signSubmitting ? (language === 'es' ? '⏳ Guardando...' : '⏳ Saving...') : (language === 'es' ? '✅ Firmar y Aceptar' : '✅ Sign & Accept')}
                 </button>
               </div>
+              {(!signAccepted || !signHasSignature) && (
+                <p style={{ fontSize: '11px', color: 'var(--text-muted)', textAlign: 'center', marginTop: '8px' }}>
+                  {language === 'es'
+                    ? 'Marcá la aceptación y firmá en el recuadro para continuar.'
+                    : 'Tick the acceptance box and sign in the box to continue.'}
+                </p>
+              )}
             </>
           )}
         </div>
@@ -6474,7 +7173,7 @@ USING (true);`;
                 {balanceTxFilter !== 'maintenance_only' && (
                   <div className="glass-card kpi-card">
                     <div className="kpi-header"><span className="kpi-title">{t.income}</span><span className="kpi-icon">📈</span></div>
-                    <div className="kpi-value" style={{ color: '#10b981' }}>€{Math.round(balanceData.totalIncome * 10) / 10}</div>
+                    <div className="kpi-value" style={{ color: '#10b981' }}>€{fmt1(balanceData.totalIncome)}</div>
                     <div className="kpi-trend trend-up">
                       {balanceTxFilter === 'purchase_sale' 
                         ? (language === 'es' ? 'Ventas' : 'Sales') 
@@ -6484,8 +7183,8 @@ USING (true);`;
                     </div>
                     {/* Payment method breakdown */}
                     <div style={{ fontSize: '11.5px', color: 'var(--text-muted)', marginTop: '6px', display: 'flex', gap: '12px', borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '6px' }}>
-                      <span>💵 {language === 'es' ? 'Efectivo:' : 'Cash:'} €{Math.round(balanceData.totalIncomeCash * 10) / 10}</span>
-                      <span>🏦 {language === 'es' ? 'Transf.:' : 'Transfer:'} €{Math.round(balanceData.totalIncomeTransfer * 10) / 10}</span>
+                      <span>💵 {language === 'es' ? 'Efectivo:' : 'Cash:'} €{fmt1(balanceData.totalIncomeCash)}</span>
+                      <span>🏦 {language === 'es' ? 'Transf.:' : 'Transfer:'} €{fmt1(balanceData.totalIncomeTransfer)}</span>
                     </div>
                   </div>
                 )}
@@ -6493,17 +7192,17 @@ USING (true);`;
                   <>
                     <div className="glass-card kpi-card">
                        <div className="kpi-header"><span className="kpi-title">{language === 'es' ? 'Depósitos' : 'Deposits'}</span><span className="kpi-icon">🔒</span></div>
-                       <div className="kpi-value" style={{ color: '#f59e0b' }}>€{Math.round(balanceData.activeDeposits * 10) / 10}</div>
+                       <div className="kpi-value" style={{ color: '#f59e0b' }}>€{fmt1(balanceData.activeDeposits)}</div>
                        <div className="kpi-trend trend-neutral">{language === 'es' ? 'Garantía Retenida' : 'Held Guarantee'}</div>
                        {/* Deposit method breakdown */}
                        <div style={{ fontSize: '11.5px', color: 'var(--text-muted)', marginTop: '6px', display: 'flex', gap: '12px', borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '6px' }}>
-                         <span>💵 {language === 'es' ? 'Efectivo:' : 'Cash:'} €{Math.round(balanceData.activeDepositsCash * 10) / 10}</span>
-                         <span>🏦 {language === 'es' ? 'Transf.:' : 'Transfer:'} €{Math.round(balanceData.activeDepositsTransfer * 10) / 10}</span>
+                         <span>💵 {language === 'es' ? 'Efectivo:' : 'Cash:'} €{fmt1(balanceData.activeDepositsCash)}</span>
+                         <span>🏦 {language === 'es' ? 'Transf.:' : 'Transfer:'} €{fmt1(balanceData.activeDepositsTransfer)}</span>
                        </div>
                     </div>
                     <div className="glass-card kpi-card">
                        <div className="kpi-header"><span className="kpi-title">{language === 'es' ? 'Total Alquiler' : 'Total Rental'}</span><span className="kpi-icon">💶</span></div>
-                       <div className="kpi-value" style={{ color: '#10b981' }}>€{Math.round((balanceData.totalIncome + balanceData.activeDeposits) * 10) / 10}</div>
+                       <div className="kpi-value" style={{ color: '#10b981' }}>€{fmt1((balanceData.totalIncome + balanceData.activeDeposits))}</div>
                        <div className="kpi-trend trend-up">{language === 'es' ? 'Ingresos + Depósitos' : 'Income + Deposits'}</div>
                     </div>
                   </>
@@ -6511,7 +7210,7 @@ USING (true);`;
                 {balanceTxFilter !== 'rental_only' && (
                   <div className="glass-card kpi-card">
                     <div className="kpi-header"><span className="kpi-title">{t.expenses}</span><span className="kpi-icon">📉</span></div>
-                    <div className="kpi-value" style={{ color: '#ef4444' }}>€{Math.round(balanceData.totalExpense * 10) / 10}</div>
+                    <div className="kpi-value" style={{ color: '#ef4444' }}>€{fmt1(balanceData.totalExpense)}</div>
                     <div className="kpi-trend trend-down">
                       {balanceTxFilter === 'purchase_sale' 
                         ? (language === 'es' ? 'Compras' : 'Purchases') 
@@ -6525,7 +7224,7 @@ USING (true);`;
                   <div className="glass-card kpi-card">
                     <div className="kpi-header"><span className="kpi-title">{t.netFlow}</span><span className="kpi-icon">💶</span></div>
                     <div className="kpi-value" style={{ color: balanceData.totalIncome - balanceData.totalExpense >= 0 ? '#10b981' : '#ef4444' }}>
-                      €{Math.round((balanceData.totalIncome - balanceData.totalExpense) * 10) / 10}
+                      €{fmt1((balanceData.totalIncome - balanceData.totalExpense))}
                     </div>
                     <div className="kpi-trend trend-neutral">Beneficio Operativo</div>
                   </div>
@@ -6533,7 +7232,7 @@ USING (true);`;
                 {balanceTxFilter === 'all' && (
                   <div className="glass-card kpi-card">
                     <div className="kpi-header"><span className="kpi-title">Depósitos Activos</span><span className="kpi-icon">🔒</span></div>
-                    <div className="kpi-value" style={{ color: '#f59e0b' }}>€{Math.round(balanceData.activeDeposits * 10) / 10}</div>
+                    <div className="kpi-value" style={{ color: '#f59e0b' }}>€{fmt1(balanceData.activeDeposits)}</div>
                     <div className="kpi-trend trend-neutral">Garantía Retenida</div>
                   </div>
                 )}
@@ -6626,7 +7325,7 @@ USING (true);`;
                                 )}
                               </td>
                               <td style={{ textAlign: 'right', fontWeight: 'bold', color: tx.type === 'income' ? '#10b981' : '#ef4444' }}>
-                                {tx.type === 'income' ? '+' : '-'}€{tx.amount}
+                                {tx.type === 'income' ? '+' : '-'}€{fmt1(tx.amount)}
                                 <button
                                   onClick={async () => {
                                     if (await asyncConfirm(language === 'es' ? '¿Seguro que deseas eliminar esta transacción? Esta acción revertirá los efectos originales de la misma en la base de datos.' : 'Are you sure you want to delete this transaction? This will revert its original effects in the database.')) {
@@ -6781,7 +7480,7 @@ USING (true);`;
                               </td>
                               <td style={{ verticalAlign: 'middle' }}><strong>{bike.serial_number}</strong></td>
                               <td style={{ verticalAlign: 'middle' }}>{bike.name}</td>
-                              <td style={{ verticalAlign: 'middle' }}><span style={{ color: 'var(--color-primary)', fontWeight: 600 }}>€{bike.suggested_weekly_rate}/wk</span></td>
+                              <td style={{ verticalAlign: 'middle' }}><span style={{ color: 'var(--color-primary)', fontWeight: 600 }}>€{fmt1(bike.suggested_weekly_rate)}/wk</span></td>
                               <td style={{ verticalAlign: 'middle' }}>{bike.odometer} km</td>
                             </tr>
                           );
@@ -7171,7 +7870,7 @@ USING (true);`;
                                       {kitLocs.length > 0 ? (
                                         <select
                                           className="form-control"
-                                          style={{ height: '32px', fontSize: '12px', minWidth: '140px' }}
+                                          style={{ height: '36px', fontSize: '12px', width: '100%', minWidth: '200px', paddingRight: '28px' }}
                                           value={selectedLoc}
                                           onChange={e => setWizKitLocations(prev => ({ ...prev, [pid]: e.target.value }))}
                                         >
@@ -7236,6 +7935,7 @@ USING (true);`;
                                 setWizLastName(c.last_name);
                                 setWizEmail(c.email);
                                 setWizPhone(c.phone);
+                                setWizAddress(c.address ?? '');
                                 setWizNationality(c.nationality);
                                 setWizReferral(c.referral_source);
                                 setWizCustomerCode(c.customer_code ? c.customer_code.replace(/^US-?/i, '') : '');
@@ -7267,7 +7967,7 @@ USING (true);`;
                     </div>
                     <div className="form-group">
                       <label className="form-label">{language === 'es' ? 'Kilometraje de la Bici' : 'Bike Mileage'}</label>
-                      <input type="number" className="form-control" value={wizOdometer} onChange={e => setWizOdometer(e.target.value ? Number(e.target.value) : '')} />
+                      <input type="number" className="form-control" value={wizOdometer} onChange={e => { const v = readNumberInput(e); if (v !== undefined) setWizOdometer(v ?? ''); }} />
                     </div>
                     <div className="form-group">
                       <label className="form-label">{t.customerCode}</label>
@@ -7302,6 +8002,19 @@ USING (true);`;
                     <div className="form-group">
                       <label className="form-label">{language === 'es' ? 'Teléfono' : 'Phone'}</label>
                       <input type="text" className="form-control" placeholder="+353..." value={wizPhone} onChange={e => setWizPhone(e.target.value)} />
+                    </div>
+                    <div className="form-group">
+                      <label className="form-label">{language === 'es' ? 'Dirección' : 'Address'}</label>
+                      <input
+                        type="text"
+                        className="form-control"
+                        placeholder={language === 'es' ? 'Calle, número, ciudad' : 'Street, number, city'}
+                        value={wizAddress}
+                        onChange={e => setWizAddress(e.target.value)}
+                      />
+                      <small style={{ color: 'var(--text-muted)', fontSize: '11px' }}>
+                        {language === 'es' ? 'Aparece en el contrato de alquiler.' : 'Shown on the rental agreement.'}
+                      </small>
                     </div>
                     <div className="form-group">
                       <label className="form-label">{t.nationality}</label>
@@ -7513,7 +8226,7 @@ USING (true);`;
                   <div className="form-grid" style={{ marginBottom: '16px' }}>
                     <div className="form-group">
                       <label className="form-label">{language === 'es' ? 'Tarifa (€)' : 'Rate (€)'}</label>
-                      <input type="number" className="form-control" value={wizRate} onChange={e => setWizRate(Number(e.target.value))} />
+                      <NumberField className="form-control" value={wizRate} onValueChange={v => setWizRate(v ?? 0)} />
                     </div>
                     <div className="form-group">
                       <label className="form-label">{language === 'es' ? 'Tipo de Tarifa' : 'Rate Type'}</label>
@@ -7532,7 +8245,7 @@ USING (true);`;
                     </div>
                     <div className="form-group">
                       <label className="form-label">{language === 'es' ? 'Depósito (€)' : 'Deposit (€)'}</label>
-                      <input type="number" className="form-control" value={wizDeposit} onChange={e => setWizDeposit(Number(e.target.value))} />
+                      <NumberField className="form-control" value={wizDeposit} onValueChange={v => setWizDeposit(v ?? 0)} />
                     </div>
                     <div className="form-group">
                       <label className="form-label">{language === 'es' ? 'Depósito recibido vía' : 'Deposit received via'}</label>
@@ -7843,8 +8556,8 @@ USING (true);`;
                       ['📧 Email', wizEmail],
                       ['📱 Phone', wizPhone],
                       ['📅 Fecha Inicio / Start Date', wizStartDate],
-                      ['💶 Rate', `€${wizRate}/${wizRateType} (${wizRatePaymentMethod === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})`],
-                      ['🏦 Deposit', `€${wizDeposit} (${wizDepositPaymentMethod === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})`],
+                      ['💶 Rate', `€${fmt1(wizRate)}/${wizRateType} (${wizRatePaymentMethod === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})`],
+                      ['🏦 Deposit', `€${fmt1(wizDeposit)} (${wizDepositPaymentMethod === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})`],
                       ['📱 App Account', wizGigAccountId ? (appAccounts.find(a => a.id === wizGigAccountId)?.platform_account_number || 'Linked') : '—'],
                       ['📸 Fotos', `${wizConditionFiles.length} ${language === 'es' ? 'foto(s)' : 'photo(s)'}`],
                       ['📸 Fotos Instagram', `${wizInstagramFiles.length} ${language === 'es' ? 'foto(s)' : 'photo(s)'}`],
@@ -8190,10 +8903,10 @@ USING (true);`;
                                   </td>
                                   )}
 {stockVisibleCols.price !== false && (
-                                  <td>{prod.price_sold ? <strong>€{prod.price_sold}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td>{prod.price_sold ? <strong>€{fmt1(prod.price_sold)}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
                                   {stockVisibleCols.cost && (
-                                  <td>{prod.price_paid ? <strong>€{prod.price_paid}{isConsolidated ? <span style={{ fontWeight: 400, color: 'var(--text-muted)', fontSize: '11px' }}> /u</span> : null}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td>{prod.price_paid ? <strong>€{fmt1(prod.price_paid)}{isConsolidated ? <span style={{ fontWeight: 400, color: 'var(--text-muted)', fontSize: '11px' }}> /u</span> : null}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
 {stockVisibleCols.condition !== false && (
                                   <td>
@@ -9066,10 +9779,10 @@ USING (true);`;
                                   </td>
                                   )}
 {stockVisibleCols.price !== false && (
-                                  <td>{prod.price_sold ? <strong>€{prod.price_sold}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td>{prod.price_sold ? <strong>€{fmt1(prod.price_sold)}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
                                   {stockVisibleCols.cost && (
-                                  <td>{prod.price_paid ? <strong>€{prod.price_paid}{isConsolidated ? <span style={{ fontWeight: 400, color: 'var(--text-muted)', fontSize: '11px' }}> /u</span> : null}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td>{prod.price_paid ? <strong>€{fmt1(prod.price_paid)}{isConsolidated ? <span style={{ fontWeight: 400, color: 'var(--text-muted)', fontSize: '11px' }}> /u</span> : null}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
 {stockVisibleCols.condition !== false && (
                                   <td>
@@ -9861,8 +10574,6 @@ USING (true);`;
                     const totalRevenue = filteredSold.reduce((acc, p) => acc + (p.price_sold || 0), 0);
                     const totalCost = filteredSold.reduce((acc, p) => acc + (p.price_paid || 0), 0);
                     const totalProfit = totalRevenue - totalCost;
-                    const displayTotalProfit = totalProfit % 1 !== 0 ? totalProfit.toFixed(1) : totalProfit;
-                    const displayAbsTotalProfit = Math.abs(totalProfit) % 1 !== 0 ? Math.abs(totalProfit).toFixed(1) : Math.abs(totalProfit);
 
                     return (
                       <>
@@ -9873,16 +10584,16 @@ USING (true);`;
                           </div>
                           <div className="glass-card stat-card" style={{ padding: '16px' }}>
                             <div className="stat-label">{language === 'es' ? 'Ingresos de Venta' : 'Sales Revenue'}</div>
-                            <div className="stat-value" style={{ color: 'var(--text-bright)' }}>€{totalRevenue}</div>
+                            <div className="stat-value" style={{ color: 'var(--text-bright)' }}>€{fmt1(totalRevenue)}</div>
                           </div>
                           <div className="glass-card stat-card" style={{ padding: '16px' }}>
                             <div className="stat-label">{language === 'es' ? 'Costo de Adquisición' : 'Acquisition Cost'}</div>
-                            <div className="stat-value" style={{ color: 'var(--text-muted)' }}>€{totalCost % 1 !== 0 ? totalCost.toFixed(1) : totalCost}</div>
+                            <div className="stat-value" style={{ color: 'var(--text-muted)' }}>€{fmt1(totalCost)}</div>
                           </div>
                           <div className="glass-card stat-card" style={{ padding: '16px' }}>
                             <div className="stat-label">{language === 'es' ? 'Ganancia Neta' : 'Net Profit'}</div>
                             <div className="stat-value" style={{ color: totalProfit >= 0 ? '#34d399' : '#f87171' }}>
-                              {totalProfit >= 0 ? `+€${displayTotalProfit}` : `-€${displayAbsTotalProfit}`}
+                              {totalProfit >= 0 ? `+€${fmt1(totalProfit)}` : `-€${fmt1(Math.abs(totalProfit))}`}
                             </div>
                           </div>
                         </div>
@@ -9918,8 +10629,6 @@ USING (true);`;
                                 ) : (
                                   filteredSold.map(s => {
                                     const gain = (s.price_sold || 0) - (s.price_paid || 0);
-                                    const displayGain = gain % 1 !== 0 ? gain.toFixed(1) : gain;
-                                    const displayAbsGain = Math.abs(gain) % 1 !== 0 ? Math.abs(gain).toFixed(1) : Math.abs(gain);
                                     const serialDisplay = (s.serial_number || '').replace(/^([A-Za-z]+)(\d+)$/, '$1-$2');
                                     const catMatch = (categories || []).find(c => c && c.id === s.category_id);
                                     const categoryName = catMatch ? (language === 'es' ? catMatch.name_es : catMatch.name_en) : '';
@@ -9939,12 +10648,12 @@ USING (true);`;
                                         <td><span style={{ fontFamily: 'monospace', fontSize: '11px', background: 'rgba(255,255,255,0.06)', padding: '2px 6px', borderRadius: '4px', color: 'var(--text-bright)' }}>{serialDisplay}</span></td>
                                         <td>{s.name}</td>
                                         {soldVisibleCols.category     && <td style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{categoryName}</td>}
-                                        {soldVisibleCols.cost         && <td><strong>€{(s.price_paid || 0) % 1 !== 0 ? (s.price_paid || 0).toFixed(1) : (s.price_paid || 0)}</strong></td>}
-                                        {soldVisibleCols.price_sold   && <td><strong>€{s.price_sold || 0}</strong></td>}
+                                        {soldVisibleCols.cost         && <td><strong>€{fmt1(s.price_paid || 0)}</strong></td>}
+                                        {soldVisibleCols.price_sold   && <td><strong>€{fmt1(s.price_sold || 0)}</strong></td>}
                                         {soldVisibleCols.profit       && (
                                           <td>
                                             <span style={{ fontWeight: 'bold', color: gain >= 0 ? '#34d399' : '#f87171' }}>
-                                              {gain >= 0 ? `+€${displayGain}` : `-€${displayAbsGain}`}
+                                              {gain >= 0 ? `+€${fmt1(gain)}` : `-€${fmt1(Math.abs(gain))}`}
                                             </span>
                                           </td>
                                         )}
@@ -10009,6 +10718,14 @@ USING (true);`;
                                           >
                                             ✏️ {language === 'es' ? 'Editar' : 'Edit'}
                                           </button>
+                                          {s.category_id === catBikeId && (
+                                            <button
+                                              className="btn-secondary btn-xs"
+                                              onClick={() => { setSelectedProductId(s.id); setModalType('bikeHistory'); }}
+                                            >
+                                              📊 {language === 'es' ? 'Ver Historial' : 'View History'}
+                                            </button>
+                                          )}
                                           {isProductGeneric(s) && (
                                             <button 
                                               className={`btn-secondary btn-xs ${activeStockMenuId === s.id ? 'active' : ''}`}
@@ -10069,6 +10786,7 @@ USING (true);`;
                             <th>{language === 'es' ? 'Nombre' : 'Name'}</th>
                             <th>{language === 'es' ? 'Estado' : 'Status'}</th>
                             <th>{language === 'es' ? 'Notas' : 'Notes'}</th>
+                            <th>{t.actions}</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -10087,7 +10805,7 @@ USING (true);`;
                             if (lostFiltered.length === 0) {
                               return (
                                 <tr>
-                                  <td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-muted)', fontStyle: 'italic', padding: '24px' }}>
+                                  <td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-muted)', fontStyle: 'italic', padding: '24px' }}>
                                     {language === 'es' ? 'No hay artículos robados o perdidos registrados.' : 'No stolen or lost items registered.'}
                                   </td>
                                 </tr>
@@ -10115,6 +10833,16 @@ USING (true);`;
                                     </span>
                                   </td>
                                   <td style={{ color: 'var(--text-muted)', fontSize: '13px' }}>{p.notes || '-'}</td>
+                                  <td>
+                                    {p.category_id === catBikeId && (
+                                      <button
+                                        className="btn-secondary btn-xs"
+                                        onClick={() => { setSelectedProductId(p.id); setModalType('bikeHistory'); }}
+                                      >
+                                        📊 {language === 'es' ? 'Ver Historial' : 'View History'}
+                                      </button>
+                                    )}
+                                  </td>
                                 </tr>
                               );
                             });
@@ -10204,8 +10932,8 @@ USING (true);`;
                                     <td>
                                       {pm.category_id === catBikeId ? (
                                         <div style={{ display: 'flex', gap: '12px', fontSize: '12px' }}>
-                                          <span>💰 €{pm.suggested_weekly_rate || 0}/{language === 'es' ? 'sem' : 'wk'}</span>
-                                          <span>🛡️ €{pm.suggested_deposit || 0}</span>
+                                          <span>💰 €{fmt1(pm.suggested_weekly_rate || 0)}/{language === 'es' ? 'sem' : 'wk'}</span>
+                                          <span>🛡️ €{fmt1(pm.suggested_deposit || 0)}</span>
                                         </div>
                                       ) : (
                                         <span style={{ color: 'var(--text-muted)' }}>-</span>
@@ -10482,7 +11210,7 @@ USING (true);`;
                                   {rentalVisibleCols.earnings && (
                                     <td>
                                       <strong style={{ color: '#10b981', fontSize: '14px' }}>
-                                        €{stats.totalPaid}
+                                        €{fmt1(stats.totalPaid)}
                                       </strong>
                                     </td>
                                   )}
@@ -11537,6 +12265,51 @@ USING (true);`;
                           </div>
 
 
+                          {/* Digital rental agreement */}
+                          {(() => {
+                            if (!latestRental || latestRental.contract_type !== 'digital') return null;
+                            const signed = !!latestRental.contract_signed_at || !!latestRental.contract_url;
+                            const contractUrl = `${window.location.origin}${window.location.pathname}?firmar=${latestRental.id}`;
+                            return (
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '10px' }}>
+                                <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>📄 {language === 'es' ? 'Contrato digital:' : 'Digital contract:'}</span>
+                                <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                                  <span style={{
+                                    fontSize: '11px', padding: '2px 8px', borderRadius: '6px',
+                                    background: signed ? 'rgba(16,185,129,0.15)' : 'rgba(251,146,60,0.15)',
+                                    color: signed ? 'var(--color-primary)' : '#fb923c',
+                                    border: '1px solid rgba(255,255,255,0.08)'
+                                  }}>
+                                    {signed ? (language === 'es' ? '✓ Firmado' : '✓ Signed') : (language === 'es' ? '⏳ Pendiente' : '⏳ Pending')}
+                                  </span>
+                                  {signed && latestRental.contract_url ? (
+                                    <button
+                                      className="btn-secondary btn-xs"
+                                      style={{ padding: '2px 8px', height: '22px', minHeight: 'unset', fontSize: '11px' }}
+                                      onClick={() => {
+                                        setLightboxUrl(latestRental.contract_url!);
+                                        setLightboxTitle(language === 'es' ? `Firma del contrato – ${cust.first_name} ${cust.last_name}` : `Contract signature – ${cust.first_name} ${cust.last_name}`);
+                                      }}
+                                    >
+                                      👁️ {language === 'es' ? 'Ver firma' : 'View signature'}
+                                    </button>
+                                  ) : (
+                                    <button
+                                      className="btn-secondary btn-xs"
+                                      style={{ padding: '2px 8px', height: '22px', minHeight: 'unset', fontSize: '11px' }}
+                                      onClick={async () => {
+                                        try { await navigator.clipboard.writeText(contractUrl); } catch { /* ignore */ }
+                                        showToast(language === 'es' ? '🔗 Enlace del contrato copiado' : '🔗 Contract link copied', 'success');
+                                      }}
+                                    >
+                                      🔗 {language === 'es' ? 'Copiar enlace' : 'Copy link'}
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })()}
+
                           {/* Delivery checklist (E-bike) */}
                           {(() => {
                             const cl = latestRental
@@ -11655,10 +12428,10 @@ USING (true);`;
                     <h3 style={{ marginBottom: '16px' }}>💶 {t.financialSummary}</h3>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                       {[
-                        [language === 'es' ? 'Depósito' : 'Deposit', `€${totalDeposit}`],
-                        [language === 'es' ? 'Pagado por Alquiler' : 'Paid for Rental', `€${totalPaidForRental}`],
-                        [language === 'es' ? 'Mantenimiento' : 'Maintenance', `-€${totalMaintenance}`],
-                        [language === 'es' ? 'Total' : 'Total', `€${totalPaid}`],
+                        [language === 'es' ? 'Depósito' : 'Deposit', `€${fmt1(totalDeposit)}`],
+                        [language === 'es' ? 'Pagado por Alquiler' : 'Paid for Rental', `€${fmt1(totalPaidForRental)}`],
+                        [language === 'es' ? 'Mantenimiento' : 'Maintenance', `-€${fmt1(totalMaintenance)}`],
+                        [language === 'es' ? 'Total' : 'Total', `€${fmt1(totalPaid)}`],
                         [
                           latestRental
                             ? (latestRental.rate_type === 'diario'
@@ -11773,7 +12546,7 @@ USING (true);`;
                                 Desde: {r.start_date}
                               </p>
                               <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
-                                €{r.rental_rate}/{r.rate_type} · Depósito: €{r.deposit_amount}
+                                €{fmt1(r.rental_rate)}/{r.rate_type} · Depósito: €{fmt1(r.deposit_amount)}
                               </p>
                               <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
                                 Kilometraje Inicial: {r.odometer_start} km
@@ -11905,13 +12678,13 @@ USING (true);`;
                             // Chronological events timeline
                             const rentalEvents: { id: string | null, date: string, text: string, type: string, desc?: string, photos?: string[], regIndex: number }[] = [
                               { id: null, date: r.start_date, text: language === 'es' ? '🚲 Alquilado (Inicio)' : '🚲 Rented (Start)', type: 'start', regIndex: 0 },
-                              { id: null, date: r.start_date, text: (language === 'es' ? `🔒 Depósito: €${r.deposit_amount}` : `🔒 Deposit: €${r.deposit_amount}`) + (r.deposit_received_via ? ` (${r.deposit_received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''), type: 'deposit', regIndex: 1 },
+                              { id: null, date: r.start_date, text: (language === 'es' ? `🔒 Depósito: €${fmt1(r.deposit_amount)}` : `🔒 Deposit: €${fmt1(r.deposit_amount)}`) + (r.deposit_received_via ? ` (${r.deposit_received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''), type: 'deposit', regIndex: 1 },
                               ...expenses
                                 .filter(e => e.rental_id === r.id)
                                 .map((e, idx) => ({
                                   id: e.id,
                                   date: e.date,
-                                  text: language === 'es' ? `🛠️ Mantenimiento: -€${e.cost}` : `🛠️ Maintenance: -€${e.cost}`,
+                                  text: language === 'es' ? `🛠️ Mantenimiento: -€${fmt1(e.cost)}` : `🛠️ Maintenance: -€${fmt1(e.cost)}`,
                                   type: 'maintenance',
                                   desc: e.description,
                                   photos: e.photos || [],
@@ -11926,8 +12699,8 @@ USING (true);`;
                                     id: p.id,
                                     date: p.payment_date,
                                     text: (isOther
-                                      ? (language === 'es' ? `💵 Otro pago: €${p.amount}` : `💵 Other payment: €${p.amount}`)
-                                      : (language === 'es' ? `💵 Pago renta: €${p.amount}` : `💵 Rent payment: €${p.amount}`)) + (p.received_via ? ` (${p.received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''),
+                                      ? (language === 'es' ? `💵 Otro pago: €${fmt1(p.amount)}` : `💵 Other payment: €${fmt1(p.amount)}`)
+                                      : (language === 'es' ? `💵 Pago renta: €${fmt1(p.amount)}` : `💵 Rent payment: €${fmt1(p.amount)}`)) + (p.received_via ? ` (${p.received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''),
                                     type: 'payment',
                                     desc: note,
                                     regIndex: 1000 - idx
@@ -11943,7 +12716,7 @@ USING (true);`;
                               ...(r.deposit_refunded !== null && r.deposit_refunded > 0 ? [{
                                 id: null,
                                 date: r.end_date || r.start_date,
-                                text: language === 'es' ? `🔓 Depósito Devuelto: €${r.deposit_refunded}` : `🔓 Deposit Refunded: €${r.deposit_refunded}`,
+                                text: language === 'es' ? `🔓 Depósito Devuelto: €${fmt1(r.deposit_refunded)}` : `🔓 Deposit Refunded: €${fmt1(r.deposit_refunded)}`,
                                 type: 'deposit_refund',
                                 regIndex: 9998
                               }] : [])
@@ -12076,7 +12849,7 @@ USING (true);`;
                                 </div>
 
                                 {r.damage_report && <p style={{ fontSize: '11px', color: '#f87171', marginTop: '6px' }}>⚠️ {r.damage_report}</p>}
-                                {r.deposit_refunded !== null && <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>Depósito devuelto: €{r.deposit_refunded}</p>}
+                                {r.deposit_refunded !== null && <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>Depósito devuelto: €{fmt1(r.deposit_refunded)}</p>}
                               </div>
                             );
                           })
@@ -12451,8 +13224,8 @@ USING (true);`;
                               )}
                             </td>
                             <td>
-                              <div style={{ fontSize: '13px' }}>{language === 'es' ? 'Semanal: ' : 'Weekly: '}<strong>€{acc.weekly_rate}</strong></div>
-                              <div style={{ fontSize: '12px', color: 'var(--color-primary)', marginTop: '2px' }}>Total: <strong>€{totalEarned}</strong></div>
+                              <div style={{ fontSize: '13px' }}>{language === 'es' ? 'Semanal: ' : 'Weekly: '}<strong>€{fmt1(acc.weekly_rate)}</strong></div>
+                              <div style={{ fontSize: '12px', color: 'var(--color-primary)', marginTop: '2px' }}>Total: <strong>€{fmt1(totalEarned)}</strong></div>
                             </td>
                             <td>
                               {acc.current_renter_id && acc.start_date ? (() => {
@@ -12613,7 +13386,7 @@ USING (true);`;
                                   {earns.map(ae => (
                                     <tr key={ae.id}>
                                       <td>{ae.date}</td>
-                                      <td><strong>€{ae.amount}</strong></td>
+                                      <td><strong>€{fmt1(ae.amount)}</strong></td>
                                       <td>{ae.notes}</td>
                                       <td>
                                         <button
@@ -13112,8 +13885,15 @@ USING (true);`;
               ================================================ */}
           {currentTab === 'maintenance' && (
             <>
-              <div className="filter-row">
-                <button className="btn-primary" onClick={() => openServiceModal()}>🔧 {t.addServiceRecord}</button>
+              <div className="filter-row" style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                <button className="btn-primary" onClick={() => openServiceModal()}>📅 {t.addServiceRecord}</button>
+                <button
+                  className="btn-secondary"
+                  style={{ color: '#fbbf24', borderColor: 'rgba(251,191,36,0.4)' }}
+                  onClick={() => { setWorkshopPickerSearch(''); setModalType('directWorkshop'); }}
+                >
+                  🧰 {language === 'es' ? 'Ingresar al Taller' : 'Enter Workshop'}
+                </button>
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '24px' }}>
                 {[
@@ -13145,32 +13925,10 @@ USING (true);`;
                                </div>
                               {status === 'En Taller' && (
                                  <div style={{ display: 'flex', gap: '8px' }}>
-                                   <button className="btn-primary btn-xs" onClick={async () => {
-                                     try {
-                                       const todayStr = new Date().toISOString().split('T')[0];
-                                       
-                                       // Ensure we have a record in the maintenance timeline when finalizing service
-                                       const record = records.find(r => r.bike_id === bike.id && r.service_date === bike.last_service_date);
-                                       if (!record) {
-                                         await upsertRecord({
-                                           id: crypto.randomUUID(),
-                                           bike_id: bike.id,
-                                           service_date: todayStr,
-                                           location: 'Dublin Central Garage',
-                                           description: language === 'es' ? 'Mantenimiento finalizado / Puesta a punto' : 'Maintenance finished / Fine-tuning',
-                                           cost: 0,
-                                           performed_by: 'Mechanic Sean'
-                                         });
-                                       }
-
-                                       await upsertProduct({ 
-                                         ...bike, 
-                                         maintenance_status: 'Al día', 
-                                         status: 'Disponible',
-                                         last_service_date: todayStr
-                                       });
-                                       triggerReload(); showToast(`${bike.serial_number} marcada como lista.`, 'success');
-                                     } catch { showToast('Error.', 'error'); }
+                                   <button className="btn-primary btn-xs" onClick={() => {
+                                     setFinishServiceBikeId(bike.id);
+                                     setFinishServiceCost(0);
+                                     setModalType('finishService');
                                    }}>✓ {language === 'es' ? 'Finalizar Service' : 'Finish Service'}</button>
                                    <button className="btn-secondary btn-xs" onClick={async () => {
                                      try {
@@ -13464,7 +14222,7 @@ USING (true);`;
                                 <td>{rec.location}</td>
                                 <td>{rec.performed_by}</td>
                                 <td>{rec.description}</td>
-                                <td><strong style={{ color: '#ef4444' }}>€{rec.cost}</strong></td>
+                                <td><strong style={{ color: '#ef4444' }}>€{fmt1(rec.cost)}</strong></td>
                                 <td>
                                   <button
                                     className="btn-danger btn-xs"
@@ -13628,7 +14386,7 @@ USING (true);`;
                               </td>
                               <td>{sup?.name}</td>
                               <td>
-                                <strong style={{ fontSize: '15px' }}>€{sprod.cost}</strong>
+                                <strong style={{ fontSize: '15px' }}>€{fmt1(sprod.cost)}</strong>
                                 {isCheapest && <span className="badge status-available btn-xs" style={{ marginLeft: '8px', fontSize: '10px' }}>🏆 {t.cheapest}</span>}
                               </td>
                               <td>
@@ -13772,7 +14530,7 @@ USING (true);`;
                                 <span className="badge" style={{ background: 'rgba(255,255,255,0.05)', fontSize: '10px', marginTop: '4px' }}>{sprod.category}</span>
                               </td>
                               <td>{sup?.name ?? '-'}</td>
-                              <td><strong>€{sprod.cost}</strong></td>
+                              <td><strong>€{fmt1(sprod.cost)}</strong></td>
                               <td>{sprod.delivery_time_days} days</td>
                               <td>{sprod.moq}</td>
                               <td>
@@ -14427,7 +15185,7 @@ USING (true);`;
                 setUserFormPhone('');
                 setUserFormRole('');
                 setUserFormNotes('');
-                setUserFormCode(String(customers.length + 1).padStart(3, '0'));
+                setUserFormCode(getNextCustomerCode(customers).replace(/^US-?/i, ''));
                 setUserFormNationality('Brasil');
                 setUserFormRefType('Instagram');
                 setUserFormRefWhatsApp('');
@@ -15334,7 +16092,9 @@ USING (true);`;
                             max={maxDistTotal}
                             value={qty}
                             onChange={(e) => {
-                              let val = Math.max(0, Number(e.target.value));
+                              const raw = readNumberInput(e);
+                              if (raw === undefined) return;
+                              let val = Math.max(0, raw ?? 0);
                               const othersSum = Object.entries(prodFormLocDistribution).reduce((a, [k, v]) => k === loc ? a : a + (Number(v) || 0), 0);
                               const allowed = Math.max(0, maxDistTotal - othersSum);
                               if (val > allowed) {
@@ -15706,7 +16466,7 @@ USING (true);`;
                         min="1"
                         disabled={!!selectedProductId}
                         value={prodFormQuantity}
-                        onChange={e => setProdFormQuantity(Math.max(1, Number(e.target.value)))}
+                        onChange={e => { const v = readNumberInput(e); if (v !== undefined) setProdFormQuantity(Math.max(1, v ?? 1)); }}
                       />
                     </div>
                   </div>
@@ -15832,7 +16592,7 @@ USING (true);`;
                 <div className="form-grid">
                   <div className="form-group">
                     <label className="form-label">{prodFormIsGeneric ? (language === 'es' ? 'Costo por unidad (€)' : 'Unit Cost (€)') : (language === 'es' ? 'Costo (€)' : 'Acquisition Cost (€)')}</label>
-                    <input type="number" className="form-control" value={prodFormPricePaid} onChange={e => setProdFormPricePaid(Number(e.target.value))} />
+                    <NumberField className="form-control" value={prodFormPricePaid} onValueChange={v => setProdFormPricePaid(v ?? 0)} />
                     <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px', cursor: 'pointer', fontSize: '13px', color: 'var(--text-bright)' }}>
                       <input type="checkbox" checked={prodFormAddVat} onChange={e => setProdFormAddVat(e.target.checked)} style={{ width: '16px', height: '16px', cursor: 'pointer' }} />
                       {language === 'es' ? 'Agregar VAT (23% impuestos)' : 'Add VAT (23% tax)'}
@@ -15840,24 +16600,24 @@ USING (true);`;
                     {(prodFormAddVat || prodFormIsGeneric) && (() => {
                       const base = prodFormPricePaid || 0;
                       const qty = prodFormQuantity > 0 ? prodFormQuantity : 1;
-                      const vat = prodFormAddVat ? Math.round(base * 0.23 * 100) / 100 : 0;
+                      const vat = prodFormAddVat ? round1(base * 0.23) : 0;
                       const unitCost = base + vat;
                       const purchaseTotal = unitCost * qty;
                       return (
                         <div style={{ marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '2px', fontSize: '12px', color: 'var(--text-muted)', background: 'rgba(16, 185, 129, 0.05)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(16, 185, 129, 0.1)' }}>
                           {prodFormAddVat && (
                             <>
-                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>{language === 'es' ? 'Coste por unidad' : 'Unit cost'}</span><span>€{base.toLocaleString()}</span></div>
-                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>VAT (23%)</span><span>€{vat.toLocaleString()}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>{language === 'es' ? 'Coste por unidad' : 'Unit cost'}</span><span>€{fmt1(base)}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>VAT (23%)</span><span>€{fmt1(vat)}</span></div>
                               <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '3px', marginTop: '2px', color: 'var(--text-bright)', fontWeight: 700 }}>
-                                <span>{prodFormIsGeneric ? (language === 'es' ? 'Total por unidad' : 'Unit total') : 'Total'}</span><span>€{unitCost.toLocaleString()}</span>
+                                <span>{prodFormIsGeneric ? (language === 'es' ? 'Total por unidad' : 'Unit total') : 'Total'}</span><span>€{fmt1(unitCost)}</span>
                               </div>
                             </>
                           )}
                           {prodFormIsGeneric && (
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: prodFormAddVat ? '1px solid rgba(255,255,255,0.08)' : 'none', paddingTop: prodFormAddVat ? '4px' : '0', marginTop: prodFormAddVat ? '2px' : '0' }}>
-                              <span>{language === 'es' ? 'Total de la compra' : 'Total purchase'} ({qty} {language === 'es' ? 'uds' : 'units'} × €{unitCost.toLocaleString()})</span>
-                              <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{purchaseTotal.toLocaleString()}</strong>
+                              <span>{language === 'es' ? 'Total de la compra' : 'Total purchase'} ({qty} {language === 'es' ? 'uds' : 'units'} × €{fmt1(unitCost)})</span>
+                              <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{fmt1(purchaseTotal)}</strong>
                             </div>
                           )}
                         </div>
@@ -15866,12 +16626,12 @@ USING (true);`;
                   </div>
                   <div className="form-group">
                     <label className="form-label">{language === 'es' ? 'Precio de Venta (€)' : 'Sale Price (€)'}</label>
-                    <input type="number" className="form-control" value={prodFormPriceSold ?? ''} onChange={e => setProdFormPriceSold(e.target.value ? Number(e.target.value) : null)} placeholder={language === 'es' ? 'Opcional' : 'Optional'} />
+                    <NumberField className="form-control" value={prodFormPriceSold} onValueChange={v => setProdFormPriceSold(v)} placeholder={language === 'es' ? 'Opcional' : 'Optional'} />
                   </div>
                   {prodFormCategory === catBikeId && (
                     <div className="form-group">
                       <label className="form-label">{language === 'es' ? 'Tarifa Semanal Sugerida (€)' : 'Suggested Weekly Rate (€)'}</label>
-                      <input type="number" className="form-control" value={prodFormWeeklyRate} onChange={e => setProdFormWeeklyRate(Number(e.target.value))} />
+                      <NumberField className="form-control" value={prodFormWeeklyRate} onValueChange={v => setProdFormWeeklyRate(v ?? 0)} />
                     </div>
                   )}
                 </div>
@@ -15884,7 +16644,7 @@ USING (true);`;
                       <div className="form-group"><label className="form-label">{t.brand}</label><input type="text" className="form-control" value={prodFormBrand} onChange={e => setProdFormBrand(e.target.value)} /></div>
                       <div className="form-group"><label className="form-label">{t.model}</label><input type="text" className="form-control" value={prodFormModel} onChange={e => setProdFormModel(e.target.value)} /></div>
                       <div className="form-group"><label className="form-label">{t.frameSerial}</label><input type="text" className="form-control" value={prodFormFrame} onChange={e => setProdFormFrame(e.target.value)} /></div>
-                      <div className="form-group"><label className="form-label">{language === 'es' ? 'Kilometraje (KM)' : 'Odometer (KM)'}</label><input type="number" className="form-control" value={prodFormOdo} onChange={e => setProdFormOdo(Number(e.target.value))} /></div>
+                      <div className="form-group"><label className="form-label">{language === 'es' ? 'Kilometraje (KM)' : 'Odometer (KM)'}</label><input type="number" className="form-control" value={prodFormOdo} onChange={e => { const v = readNumberInput(e); if (v !== undefined) setProdFormOdo(v ?? 0); }} /></div>
                       <div className="form-group"><label className="form-label">{language === 'es' ? 'Nº Motor' : 'Motor Number'}</label><input type="text" className="form-control" value={prodFormMotor} onChange={e => setProdFormMotor(e.target.value)} /></div>
                       <div className="form-group"><label className="form-label">{t.purchaseDate}</label><input type="date" className="form-control" value={prodFormPurchase} onChange={e => setProdFormPurchase(e.target.value)} /></div>
                       <div className="form-group"><label className="form-label">{t.arrivalDate}</label><input type="date" className="form-control" value={prodFormArrival} onChange={e => setProdFormArrival(e.target.value)} /></div>
@@ -16014,9 +16774,9 @@ USING (true);`;
                                   onChange={e => setProdFormCustomValues(prev => ({ ...prev, [d.field_name]: e.target.value }))} />
                               )}
                               {d.field_type === 'number' && (
-                                <input type="number" className="form-control"
+                                <NumberField className="form-control"
                                   value={(prodFormCustomValues[d.field_name] as number) ?? ''}
-                                  onChange={e => setProdFormCustomValues(prev => ({ ...prev, [d.field_name]: e.target.value ? Number(e.target.value) : '' }))} />
+                                  onValueChange={v => setProdFormCustomValues(prev => ({ ...prev, [d.field_name]: v ?? '' }))} />
                               )}
                               {d.field_type === 'date' && (
                                 <input type="date" className="form-control"
@@ -16124,7 +16884,7 @@ USING (true);`;
                     }
 
                     // BAT (23% tax): the input holds the base cost; the stored price_paid includes the tax.
-                    const vatAmount = prodFormAddVat ? Math.round(prodFormPricePaid * 0.23 * 100) / 100 : 0;
+                    const vatAmount = prodFormAddVat ? round1(prodFormPricePaid * 0.23) : 0;
                     const effectiveCost = prodFormPricePaid + vatAmount;
                     const newProdBase = {
                       model_id: prodFormModelId || prod?.model_id || null,
@@ -16133,7 +16893,7 @@ USING (true);`;
                       name: [prodFormBrand, prodFormModel].filter(Boolean).join(' ') || (prodFormIsGeneric ? finalSerial : 'Item Stock'),
                       category_id: prodFormCategory,
                       price_paid: effectiveCost,
-                      price_sold: prodFormPriceSold !== null ? prodFormPriceSold : (prod?.price_sold ?? null), sold_date: prod?.sold_date ?? null,
+                      price_sold: prodFormPriceSold, sold_date: prod?.sold_date ?? null,
                       status: prod?.status ?? 'Disponible', notes: prodFormNotes,
                       suggested_weekly_rate: prodFormCategory === catBikeId ? prodFormWeeklyRate : null,
                       suggested_deposit: prodFormCategory === catBikeId ? prodFormDeposit : null,
@@ -16284,7 +17044,7 @@ USING (true);`;
 
         // Financed plan summary calculations
         const totalFinanced = Math.max(0, soldFormPrice - soldDownPayment);
-        const installmentAmount = soldInstallments > 0 ? Number((totalFinanced / soldInstallments).toFixed(2)) : 0;
+        const installmentAmount = soldInstallments > 0 ? round1(totalFinanced / soldInstallments) : 0;
         
         // Calculate next payment due date (1 week or 1 month after soldFormDate)
         let firstInstallmentDate = '';
@@ -16323,7 +17083,7 @@ USING (true);`;
                           <div>
                             <strong style={{ color: 'var(--color-primary)' }}>{p.serial_number}</strong> - {p.name}
                             <span style={{ marginLeft: '8px', color: 'var(--text-muted)', fontSize: '12px' }}>
-                              (Coste: €{p.price_paid})
+                              (Coste: €{fmt1(p.price_paid)})
                             </span>
                             {(() => {
                               const isGeneric = isProductGeneric(p);
@@ -16373,19 +17133,14 @@ USING (true);`;
                             <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
                               {language === 'es' ? 'Precio:' : 'Price:'}
                             </span>
-                            <input 
-                              type="number" 
-                              className="form-control" 
+                            <NumberField
+                              className="form-control"
                               style={{ width: '80px', padding: '2px 6px', height: '26px', fontSize: '13px', margin: 0 }}
-                              value={soldProductPrices[tempId] ?? ''} 
-                              onChange={e => {
-                                const val = Number(e.target.value);
-                                setSoldProductPrices(prev => {
-                                  const next = { ...prev, [tempId]: val };
-                                  const newSum = soldProducts.reduce((sum, x) => sum + (next[x.tempId] ?? 0), 0);
-                                  setSoldFormPrice(newSum);
-                                  return next;
-                                });
+                              value={soldProductPrices[tempId] ?? ''}
+                              onValueChange={v => {
+                                const next = { ...soldProductPrices, [tempId]: v ?? 0 };
+                                setSoldProductPrices(next);
+                                setSoldFormPrice(soldProducts.reduce((sum, x) => sum + (next[x.tempId] ?? 0), 0));
                               }}
                             />
                             {soldProducts.length > 1 && (
@@ -16452,7 +17207,7 @@ USING (true);`;
                               const newList = [...soldProducts, { tempId: newTempId, product: p }];
                               setSoldProducts(newList);
                               setSoldProductSearch('');
-                              const suggested = p.price_sold ?? (p.price_paid ? Math.round(p.price_paid * 1.5) : 500);
+                              const suggested = (p.price_sold ?? 0);
                               setSoldProductPrices(prev => {
                                 const next = { ...prev, [newTempId]: suggested };
                                 const newSum = newList.reduce((sum, x) => sum + (next[x.tempId] ?? 0), 0);
@@ -16465,7 +17220,7 @@ USING (true);`;
                             }}
                           >
                             <span><strong>{p.serial_number}</strong> - {p.name}</span>
-                            <span style={{ color: 'var(--color-primary)', fontWeight: 600 }}>€{p.price_sold ?? (p.price_paid ? Math.round(p.price_paid * 1.5) : 500)}</span>
+                            <span style={{ color: 'var(--color-primary)', fontWeight: 600 }}>€{fmt1((p.price_sold ?? 0))}</span>
                           </div>
                         ))}
                       </div>
@@ -16596,19 +17351,14 @@ USING (true);`;
                         <label className="form-label" style={{ fontSize: '13px', color: 'rgba(255,255,255,0.7)', fontWeight: 500 }}>
                           💶 {language === 'es' ? 'Monto en Efectivo' : 'Cash Amount'}
                         </label>
-                        <input
-                          type="number"
+                        <NumberField
                           className="form-control"
-                          step="0.01"
-                          min="0"
-                          max={soldPaymentType === 'financiado' ? soldDownPayment : soldFormPrice}
                           value={soldMixedCash}
-                          onChange={e => {
-                            const val = parseFloat(e.target.value) || 0;
+                          onValueChange={v => {
                             const targetAmount = soldPaymentType === 'financiado' ? soldDownPayment : soldFormPrice;
-                            const cash = Math.max(0, Math.min(targetAmount, val));
+                            const cash = Math.max(0, Math.min(targetAmount, v ?? 0));
                             setSoldMixedCash(cash);
-                            setSoldMixedTransfer(Number((targetAmount - cash).toFixed(2)));
+                            setSoldMixedTransfer(round1(targetAmount - cash));
                           }}
                         />
                       </div>
@@ -16616,19 +17366,14 @@ USING (true);`;
                         <label className="form-label" style={{ fontSize: '13px', color: 'rgba(255,255,255,0.7)', fontWeight: 500 }}>
                           🏦 {language === 'es' ? 'Monto por Transferencia' : 'Transfer Amount'}
                         </label>
-                        <input
-                          type="number"
+                        <NumberField
                           className="form-control"
-                          step="0.01"
-                          min="0"
-                          max={soldPaymentType === 'financiado' ? soldDownPayment : soldFormPrice}
                           value={soldMixedTransfer}
-                          onChange={e => {
-                            const val = parseFloat(e.target.value) || 0;
+                          onValueChange={v => {
                             const targetAmount = soldPaymentType === 'financiado' ? soldDownPayment : soldFormPrice;
-                            const transfer = Math.max(0, Math.min(targetAmount, val));
+                            const transfer = Math.max(0, Math.min(targetAmount, v ?? 0));
                             setSoldMixedTransfer(transfer);
-                            setSoldMixedCash(Number((targetAmount - transfer).toFixed(2)));
+                            setSoldMixedCash(round1(targetAmount - transfer));
                           }}
                         />
                       </div>
@@ -16718,7 +17463,7 @@ USING (true);`;
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '12px' }}>
                         <div className="form-group">
                           <label className="form-label">💶 {language === 'es' ? 'Monto Entrada' : 'Down Payment'}</label>
-                          <input type="number" className="form-control" value={soldDownPayment} onChange={e => setSoldDownPayment(Number(e.target.value))} />
+                          <NumberField className="form-control" value={soldDownPayment} onValueChange={v => setSoldDownPayment(v ?? 0)} />
                         </div>
                         <div className="form-group">
                           <label className="form-label">🔢 {language === 'es' ? 'Cantidad Cuotas' : 'Installments'}</label>
@@ -16728,7 +17473,7 @@ USING (true);`;
                             min={1}
                             step={1}
                             value={soldInstallments}
-                            onChange={e => setSoldInstallments(Math.max(1, Math.floor(Number(e.target.value) || 1)))}
+                            onChange={e => { const v = readNumberInput(e); if (v !== undefined) setSoldInstallments(Math.max(1, Math.floor(v || 1))); }}
                           />
                         </div>
                         <div className="form-group">
@@ -16749,10 +17494,10 @@ USING (true);`;
                       {/* PLAN SUMMARY */}
                       <div style={{ background: 'rgba(139, 92, 246, 0.1)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(139, 92, 246, 0.2)', fontSize: '13px', lineHeight: '1.5' }}>
                         <strong style={{ color: '#a78bfa', display: 'block', marginBottom: '4px' }}>📊 {language === 'es' ? 'Resumen del Financiamiento' : 'Financing Plan Summary'}</strong>
-                        <div>• {language === 'es' ? 'Total Venta' : 'Total Sale'}: <strong>€{soldFormPrice}</strong></div>
-                        <div>• {language === 'es' ? 'Entrada (Hoy)' : 'Down Payment (Today)'}: <strong>€{soldDownPayment}</strong></div>
-                        <div>• {language === 'es' ? 'Monto a Financiar' : 'Financed Balance'}: <strong>€{totalFinanced}</strong></div>
-                        <div>• {language === 'es' ? 'Cuotas' : 'Installments'}: <strong>{soldInstallments} cuotas de €{installmentAmount}</strong> ({soldFrequency === 'semanal' ? 'semanal' : 'mensual'} sin interés)</div>
+                        <div>• {language === 'es' ? 'Total Venta' : 'Total Sale'}: <strong>€{fmt1(soldFormPrice)}</strong></div>
+                        <div>• {language === 'es' ? 'Entrada (Hoy)' : 'Down Payment (Today)'}: <strong>€{fmt1(soldDownPayment)}</strong></div>
+                        <div>• {language === 'es' ? 'Monto a Financiar' : 'Financed Balance'}: <strong>€{fmt1(totalFinanced)}</strong></div>
+                        <div>• {language === 'es' ? 'Cuotas' : 'Installments'}: <strong>{soldInstallments} cuotas de €{fmt1(installmentAmount)}</strong> ({soldFrequency === 'semanal' ? 'semanal' : 'mensual'} sin interés)</div>
                         {firstInstallmentDate && (
                           <div>• {language === 'es' ? 'Primer Vencimiento' : 'First Due Date'}: <strong style={{ color: '#f59e0b' }}>{firstInstallmentDate}</strong></div>
                         )}
@@ -16782,7 +17527,7 @@ USING (true);`;
                       if (soldPaymentType === 'financiado' || (soldPaymentType === 'contado' && (soldCustomerFirstName.trim() || soldCustomerEmail.trim()))) {
                         if (!finalCustId) {
                           const newId = crypto.randomUUID();
-                          const finalCode = 'US-' + (1001 + customers.length);
+                          const finalCode = getNextCustomerCode(customers);
                           const newCust: Customer = {
                             id: newId,
                             customer_code: finalCode,
@@ -16818,7 +17563,7 @@ USING (true);`;
                         email_language: soldEmailLang,
                         notes: (soldPaymentType === 'financiado' 
                           ? `Venta financiada en ${soldInstallments} cuotas ${soldFrequency}.` 
-                          : 'Venta de contado.') + (soldReceivedVia === 'mixto' ? ` [Pago Mixto] Efectivo: €${soldMixedCash} | Transferencia: €${soldMixedTransfer}` : ''),
+                          : 'Venta de contado.') + (soldReceivedVia === 'mixto' ? ` [Pago Mixto] Efectivo: €${fmt1(soldMixedCash)} | Transferencia: €${fmt1(soldMixedTransfer)}` : ''),
                         status: soldPaymentType === 'financiado' ? 'Financiada' : 'Completada',
                         created_at: new Date().toISOString(),
                         received_via: soldReceivedVia,
@@ -16844,7 +17589,7 @@ USING (true);`;
                       for (const item of soldProducts) {
                         const p = item.product;
                         const tempId = item.tempId;
-                        const actualUnitPrice = soldProductPrices[tempId] ?? p.price_sold ?? (p.price_paid ? Math.round(p.price_paid * 1.5) : 500);
+                        const actualUnitPrice = soldProductPrices[tempId] ?? (p.price_sold ?? 0);
                         const statusToSet = soldPaymentType === 'financiado' ? 'Financiada' : 'Vendida';
                         const isGeneric = isProductGeneric(p);
                         const selectedLoc = soldProductLocations[tempId] || 'Almacén Central';
@@ -17074,7 +17819,7 @@ USING (true);`;
                           const reminderEvent = {
                             id: crypto.randomUUID(),
                             title: `💳 Cuota 1/${soldInstallments}: ${soldCustomerFirstName} ${soldCustomerLastName}`,
-                            description: `Vencimiento de la primera cuota del financiamiento por la compra de: ${bikeSerials}. Monto: €${installmentAmount}.`,
+                            description: `Vencimiento de la primera cuota del financiamiento por la compra de: ${bikeSerials}. Monto: €${fmt1(installmentAmount)}.`,
                             event_date: firstInstallmentDate,
                             remind_one_week: true,
                             remind_one_day: true,
@@ -17154,7 +17899,7 @@ USING (true);`;
                     <h4 style={{ margin: '0 0 8px 0', color: '#a78bfa' }}>📦 {language === 'es' ? 'Producto' : 'Product'}</h4>
                     <div><strong>{prod.serial_number}</strong> - {prod.name}</div>
                     <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
-                      {language === 'es' ? 'Coste' : 'Acq. Cost'}: €{prod.price_paid} | {language === 'es' ? 'Precio venta' : 'Sale Price'}: €{prod.price_sold}
+                      {language === 'es' ? 'Coste' : 'Acq. Cost'}: €{fmt1(prod.price_paid)} | {language === 'es' ? 'Precio venta' : 'Sale Price'}: €{fmt1(prod.price_sold)}
                     </div>
                   </div>
                   <div>
@@ -17183,10 +17928,10 @@ USING (true);`;
                     </div>
                     
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 16px', fontSize: '13px' }}>
-                      <div>• {language === 'es' ? 'Total Venta' : 'Total Sale'}: <strong>€{sale?.total_amount}</strong></div>
-                      <div>• {language === 'es' ? 'Monto Financiado' : 'Financed Amount'}: <strong>€{plan.total_financed}</strong></div>
-                      <div>• {language === 'es' ? 'Entrada Pagada' : 'Down Payment Paid'}: <strong>€{sale?.down_payment}</strong></div>
-                      <div>• {language === 'es' ? 'Monto de Cuota' : 'Installment Amount'}: <strong>€{plan.installment_amount} ({plan.payment_frequency === 'semanal' ? 'Semanal' : 'Mensual'})</strong></div>
+                      <div>• {language === 'es' ? 'Total Venta' : 'Total Sale'}: <strong>€{fmt1(sale?.total_amount)}</strong></div>
+                      <div>• {language === 'es' ? 'Monto Financiado' : 'Financed Amount'}: <strong>€{fmt1(plan.total_financed)}</strong></div>
+                      <div>• {language === 'es' ? 'Entrada Pagada' : 'Down Payment Paid'}: <strong>€{fmt1(sale?.down_payment)}</strong></div>
+                      <div>• {language === 'es' ? 'Monto de Cuota' : 'Installment Amount'}: <strong>€{fmt1(plan.installment_amount)} ({plan.payment_frequency === 'semanal' ? 'Semanal' : 'Mensual'})</strong></div>
                     </div>
                   </div>
                 )}
@@ -17236,7 +17981,7 @@ USING (true);`;
                             </div>
                             
                             <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                              <span style={{ fontWeight: 'bold', fontSize: '14px', marginRight: '4px' }}>€{p.amount}</span>
+                              <span style={{ fontWeight: 'bold', fontSize: '14px', marginRight: '4px' }}>€{fmt1(p.amount)}</span>
                               <span className={`badge ${p.status === 'Pagada' ? 'status-available' : isOverdue ? 'status-lost' : 'status-maintenance'}`} style={{ fontSize: '11px' }}>
                                 {p.status === 'Pagada' 
                                   ? (language === 'es' ? 'Pagada' : 'Paid') 
@@ -17266,8 +18011,8 @@ USING (true);`;
                       style={{ background: '#8b5cf6', borderColor: '#a78bfa', display: 'flex', alignItems: 'center', gap: '8px', width: '100%', justifyContent: 'center', padding: '12px' }}
                     >
                       🪙 {language === 'es' 
-                        ? `Cobrar Cuota ${nextPending.installment_number} (€${nextPending.amount})` 
-                        : `Collect Installment ${nextPending.installment_number} (€${nextPending.amount})`}
+                        ? `Cobrar Cuota ${nextPending.installment_number} (€${fmt1(nextPending.amount)})` 
+                        : `Collect Installment ${nextPending.installment_number} (€${fmt1(nextPending.amount)})`}
                     </button>
                   </div>
                 )}
@@ -17311,7 +18056,7 @@ USING (true);`;
                       <strong>{language === 'es' ? 'Cuota:' : 'Installment:'}</strong> {nextPending.installment_number} / {plan?.num_installments}
                     </div>
                     <div>
-                      <strong>{language === 'es' ? 'Monto:' : 'Amount:'}</strong> €{nextPending.amount}
+                      <strong>{language === 'es' ? 'Monto:' : 'Amount:'}</strong> €{fmt1(nextPending.amount)}
                     </div>
                   </div>
                 </div>
@@ -17388,11 +18133,11 @@ USING (true);`;
                 <div className="form-grid">
                   <div className="form-group">
                     <label className="form-label">{t.odometerEnd}</label>
-                    <input type="number" className="form-control" value={returnFormOdo} onChange={e => setReturnFormOdo(Number(e.target.value))} />
+                    <input type="number" className="form-control" value={returnFormOdo} onChange={e => { const v = readNumberInput(e); if (v !== undefined) setReturnFormOdo(v ?? 0); }} />
                   </div>
                   <div className="form-group">
                     <label className="form-label">{t.depositRefunded}</label>
-                    <input type="number" className="form-control" value={returnFormDeposit} onChange={e => setReturnFormDeposit(Number(e.target.value))} />
+                    <NumberField className="form-control" value={returnFormDeposit} onValueChange={v => setReturnFormDeposit(v ?? 0)} />
                   </div>
                 </div>
                 <div className="form-group">
@@ -17608,7 +18353,7 @@ USING (true);`;
                       }} 
                       style={{ width: '16px', height: '16px', accentColor: 'var(--color-primary)', cursor: 'pointer' }}
                     />
-                    {rentLabel} (€{rental.rental_rate})
+                    {rentLabel} (€{fmt1(rental.rental_rate)})
                   </label>
                   <label className="form-checkbox" style={{ margin: 0, fontWeight: payFormType === 'other' ? 'bold' : 'normal', display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
                     <input 
@@ -17626,11 +18371,10 @@ USING (true);`;
                 {payFormType === 'other' && (
                   <div className="form-group">
                     <label className="form-label">{language === 'es' ? 'Monto (€)' : 'Amount (€)'}</label>
-                    <input 
-                      type="number" 
-                      className="form-control" 
-                      value={payFormAmount} 
-                      onChange={e => setPayFormAmount(Number(e.target.value))} 
+                    <NumberField
+                      className="form-control"
+                      value={payFormAmount}
+                      onValueChange={v => setPayFormAmount(v ?? 0)}
                     />
                   </div>
                 )}
@@ -17768,13 +18512,13 @@ USING (true);`;
               {/* Expense Amount */}
               <div className="form-group">
                 <label className="form-label">💶 {language === 'es' ? 'Monto (€)' : 'Amount (€)'}</label>
-                <input 
-                  type="number" 
-                  step="0.01"
-                  className="form-control" 
-                  placeholder="0.00"
-                  value={expenseFormAmount} 
-                  onChange={e => setExpenseFormAmount(e.target.value)} 
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  className="form-control"
+                  placeholder="0.0"
+                  value={expenseFormAmount}
+                  onChange={e => setExpenseFormAmount(e.target.value.replace(',', '.').replace(/[^0-9.-]/g, ''))}
                 />
               </div>
 
@@ -18008,7 +18752,7 @@ USING (true);`;
               {/* Odometer Start */}
               <div className="form-group">
                 <label className="form-label">🚲 {language === 'es' ? 'Kilometraje Inicial (km)' : 'Starting Odometer (km)'}</label>
-                <input type="number" className="form-control" value={editRentalOdometer} onChange={e => setEditRentalOdometer(e.target.value ? Number(e.target.value) : '')} />
+                <input type="number" className="form-control" value={editRentalOdometer} onChange={e => { const v = readNumberInput(e); if (v !== undefined) setEditRentalOdometer(v ?? ''); }} />
               </div>
 
               {/* Batteries Selector */}
@@ -18244,7 +18988,7 @@ USING (true);`;
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               <div className="form-group">
                 <label className="form-label">{language === 'es' ? 'Costo de mantenimiento (€)' : 'Maintenance cost (€)'}</label>
-                <input type="number" className="form-control" value={maintExpenseFormCost} onChange={e => setMaintExpenseFormCost(e.target.value ? Number(e.target.value) : '')} />
+                <NumberField className="form-control" value={maintExpenseFormCost} onValueChange={v => setMaintExpenseFormCost(v ?? '')} />
               </div>
               <div className="form-group">
                 <label className="form-label">{language === 'es' ? 'Descripción del arreglo' : 'Repair detail/note'}</label>
@@ -18443,7 +19187,7 @@ USING (true);`;
                   <div style={{ background: 'rgba(255, 255, 255, 0.03)', border: '1px solid rgba(255, 255, 255, 0.06)', padding: '12px', borderRadius: '10px', textAlign: 'center' }}>
                     <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px 0' }}>{t.totalInvested}</p>
                     <p style={{ fontSize: '16px', fontWeight: 'bold', color: netProfit >= 0 ? '#10b981' : '#ef4444', margin: 0 }}>
-                      {netProfit >= 0 ? '+' : '-'}€{Math.abs(netProfit)}
+                      {netProfit >= 0 ? '+' : '-'}€{fmt1(Math.abs(netProfit))}
                     </p>
                   </div>
                   <div style={{ background: 'rgba(255, 255, 255, 0.03)', border: '1px solid rgba(255, 255, 255, 0.06)', padding: '12px', borderRadius: '10px', textAlign: 'center' }}>
@@ -18453,17 +19197,55 @@ USING (true);`;
                 </div>
 
                 {/* Action button to schedule service */}
-                <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', flexWrap: 'wrap' }}>
                   <button
                     className="btn-secondary"
-                    style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', padding: '8px 16px', fontSize: '13px' }}
+                    style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '8px', height: '40px', padding: '0 16px', fontSize: '13px', boxSizing: 'border-box' }}
                     onClick={() => setShowBikeUsers(v => !v)}
                   >
                     👥 {language === 'es' ? 'Usuarios' : 'Users'}
                   </button>
                   <button
+                    className="btn-secondary"
+                    style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '8px', height: '40px', padding: '0 16px', fontSize: '13px', boxSizing: 'border-box', color: '#fbbf24', borderColor: 'rgba(251,191,36,0.4)' }}
+                    onClick={async () => {
+                      if (bike.status === 'Rentada') {
+                        showToast(language === 'es' ? 'No es posible ingresar al taller un vehículo mientras esté rentado.' : 'Cannot put a vehicle in the workshop while it is rented.', 'error');
+                        return;
+                      }
+                      try {
+                        const todayStr = new Date().toISOString().split('T')[0];
+                        const record = records.find(r => r.bike_id === bike.id && r.service_date === bike.next_service_date);
+                        if (record) {
+                          await upsertRecord({ ...record, service_date: todayStr });
+                          const existingEv = events.find(ev => ev.description.includes(`Service ID: ${record.id}`) && !ev.description.includes('Recordatorio personalizado'));
+                          if (existingEv) {
+                            await upsertEvent({ ...existingEv, event_date: todayStr, status: 'Realizado' });
+                          }
+                        } else {
+                          await upsertRecord({
+                            id: crypto.randomUUID(),
+                            bike_id: bike.id,
+                            service_date: todayStr,
+                            location: 'Dublin Central Garage',
+                            description: language === 'es' ? 'Ingreso directo a taller / Revisión general' : 'Direct check-in to workshop / General review',
+                            cost: 0,
+                            performed_by: 'Mechanic Sean'
+                          });
+                        }
+                        await upsertProduct({ ...bike, maintenance_status: 'En Taller', status: 'Mantenimiento', last_service_date: todayStr, next_service_date: null });
+                        triggerReload();
+                        showToast(language === 'es' ? `${bike.serial_number} ingresada al taller.` : `${bike.serial_number} entered workshop.`, 'success');
+                      } catch {
+                        showToast('Error.', 'error');
+                      }
+                    }}
+                  >
+                    🧰 {language === 'es' ? 'Ingresar al Taller' : 'Enter Shop'}
+                  </button>
+                  <button
                     className="btn-primary"
-                    style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', padding: '8px 16px', fontSize: '13px' }}
+                    style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '8px', height: '40px', padding: '0 16px', fontSize: '13px', boxSizing: 'border-box' }}
                     onClick={() => {
                       openServiceModal(bike.id);
                     }}
@@ -18620,7 +19402,7 @@ USING (true);`;
                               </span>
                             </div>
                             {item.cost !== undefined && (
-                              <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{item.cost}</strong>
+                              <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{fmt1(item.cost)}</strong>
                             )}
                           </div>
 
@@ -18916,7 +19698,7 @@ USING (true);`;
                           min={1}
                           max={transferFrom ? dist[transferFrom] || 1 : 1}
                           value={transferQty}
-                          onChange={(e) => setTransferQty(Math.max(1, Number(e.target.value)))}
+                          onChange={e => { const v = readNumberInput(e); if (v !== undefined) setTransferQty(Math.max(1, v ?? 1)); }}
                         />
                         {transferFrom && (
                           <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
@@ -19157,6 +19939,7 @@ USING (true);`;
 
         const handleSave = async (bikeId: string) => {
           try {
+            const today = new Date().toISOString().split('T')[0];
             const updatedLock = {
               ...lock,
               custom_field_values: {
@@ -19165,6 +19948,13 @@ USING (true);`;
               }
             };
             await upsertProduct(updatedLock);
+            // Record the link event on the bike's chronological history
+            const targetBike = products.find(p => p.id === bikeId);
+            if (targetBike) {
+              const events = Array.isArray(targetBike.custom_field_values?.lock_events) ? [...targetBike.custom_field_values.lock_events] : [];
+              events.push({ type: 'link', lock_serial: lock.serial_number, lock_name: lock.name, date: today });
+              await upsertProduct({ ...targetBike, custom_field_values: { ...targetBike.custom_field_values, lock_events: events } });
+            }
             triggerReload();
             setModalType(null);
             setSelectedProductId(null);
@@ -19249,6 +20039,7 @@ USING (true);`;
 
         const handleUnlink = async () => {
           try {
+            const today = new Date().toISOString().split('T')[0];
             const updatedLock = {
               ...lock,
               custom_field_values: {
@@ -19257,6 +20048,12 @@ USING (true);`;
               }
             };
             await upsertProduct(updatedLock);
+            // Record the unlink event on the bike's chronological history
+            if (bike) {
+              const events = Array.isArray(bike.custom_field_values?.lock_events) ? [...bike.custom_field_values.lock_events] : [];
+              events.push({ type: 'unlink', lock_serial: lock.serial_number, lock_name: lock.name, date: today });
+              await upsertProduct({ ...bike, custom_field_values: { ...bike.custom_field_values, lock_events: events } });
+            }
             triggerReload();
             setModalType(null);
             setSelectedProductId(null);
@@ -19735,6 +20532,123 @@ USING (true);`;
 
 
       {/* MODAL: Service Record */}
+      {modalType === 'finishService' && finishServiceBikeId && (() => {
+        const bike = products.find(p => p.id === finishServiceBikeId);
+        if (!bike) return null;
+        const handleFinish = async () => {
+          try {
+            const todayStr = new Date().toISOString().split('T')[0];
+            const record = records.find(r => r.bike_id === bike.id && r.service_date === bike.last_service_date);
+            if (record) {
+              await upsertRecord({ ...record, cost: finishServiceCost });
+            } else {
+              await upsertRecord({
+                id: crypto.randomUUID(),
+                bike_id: bike.id,
+                service_date: todayStr,
+                location: 'Dublin Central Garage',
+                description: language === 'es' ? 'Mantenimiento finalizado / Puesta a punto' : 'Maintenance finished / Fine-tuning',
+                cost: finishServiceCost,
+                performed_by: 'Mechanic Sean'
+              });
+            }
+            await upsertProduct({ ...bike, maintenance_status: 'Al día', status: 'Disponible', last_service_date: todayStr });
+            triggerReload();
+            setModalType(null);
+            setFinishServiceBikeId(null);
+            showToast(language === 'es' ? `${bike.serial_number} marcada como lista (Recién Revisada).` : `${bike.serial_number} marked as ready (Recently Serviced).`, 'success');
+          } catch { showToast('Error.', 'error'); }
+        };
+        return (
+          <div className="modal-overlay" style={{ zIndex: 1300 }} onClick={() => { setModalType(null); setFinishServiceBikeId(null); }}>
+            <div className="modal-content" style={{ maxWidth: '420px', padding: '24px' }} onClick={e => e.stopPropagation()}>
+              <div className="modal-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                <h3>✓ {language === 'es' ? 'Finalizar Service' : 'Finish Service'}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setFinishServiceBikeId(null); }}>✕</button>
+              </div>
+              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                <p style={{ fontSize: '13px', color: 'var(--text-muted)', margin: 0 }}>
+                  {language === 'es'
+                    ? `${bike.serial_number} — ${bike.name}. Ingresá el costo gastado en el taller para finalizar.`
+                    : `${bike.serial_number} — ${bike.name}. Enter the cost spent at the workshop to finish.`}
+                </p>
+                <div className="form-group">
+                  <label className="form-label">{language === 'es' ? 'Costo de reparación (€)' : 'Repair cost (€)'}</label>
+                  <NumberField
+                    className="form-control"
+                    autoFocus
+                    value={finishServiceCost}
+                    onValueChange={v => setFinishServiceCost(Math.max(0, v ?? 0))}
+                  />
+                </div>
+              </div>
+              <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
+                <button className="btn-secondary" onClick={() => { setModalType(null); setFinishServiceBikeId(null); }}>{t.cancel}</button>
+                <button className="btn-primary" onClick={handleFinish}>
+                  {language === 'es' ? 'Continuar' : 'Continue'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {modalType === 'directWorkshop' && (() => {
+        const eligible = (products || [])
+          .filter(p => p && (p.category_id === catBikeId || p.category_id === catBattId) && p.status === 'Disponible')
+          .filter(p => {
+            if (!workshopPickerSearch.trim()) return true;
+            const q = workshopPickerSearch.toLowerCase();
+            return `${p.name || ''} ${p.serial_number || ''}`.toLowerCase().includes(q);
+          })
+          .sort((a, b) => (a.serial_number || '').localeCompare(b.serial_number || ''));
+        return (
+          <div className="modal-overlay" onClick={() => setModalType(null)}>
+            <div className="modal-content" style={{ maxWidth: '560px' }} onClick={e => e.stopPropagation()}>
+              <div className="modal-header">
+                <h3>🧰 {language === 'es' ? 'Ingresar al Taller' : 'Enter Workshop'}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
+              </div>
+              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <p style={{ fontSize: '13px', color: 'var(--text-muted)', margin: 0 }}>
+                  {language === 'es' ? 'Selecciona el vehículo a ingresar directamente al taller (sin programar service).' : 'Select the vehicle to put directly into the workshop (no scheduling).'}
+                </p>
+                <input
+                  className="form-control"
+                  placeholder={language === 'es' ? '🔍 Buscar por serial o nombre...' : '🔍 Search by serial or name...'}
+                  value={workshopPickerSearch}
+                  onChange={e => setWorkshopPickerSearch(e.target.value)}
+                  style={{ height: '38px' }}
+                />
+                <div style={{ maxHeight: '320px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  {eligible.length === 0 ? (
+                    <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '16px', fontSize: '13px', fontStyle: 'italic' }}>
+                      {language === 'es' ? 'No hay vehículos disponibles para ingresar.' : 'No available vehicles to check in.'}
+                    </div>
+                  ) : eligible.map(p => {
+                    const cat = (categories || []).find(c => c.id === p.category_id);
+                    return (
+                      <div key={p.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', padding: '10px 12px', background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: '8px' }}>
+                        <div>
+                          <strong style={{ color: 'var(--text-bright)', fontSize: '13px' }}>{p.serial_number} — {p.name}</strong>
+                          <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{language === 'es' ? cat?.name_es : cat?.name_en}</div>
+                        </div>
+                        <button className="btn-primary btn-xs" onClick={async () => { await enterWorkshopDirect(p); }}>
+                          🧰 {language === 'es' ? 'Ingresar' : 'Check in'}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+              <div className="modal-footer" style={{ marginTop: '12px' }}>
+                <button className="btn-secondary" onClick={() => setModalType(null)}>{t.cancel}</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {modalType === 'service' && (
         <div className="modal-overlay">
           <div className="modal-content">
@@ -19742,7 +20656,7 @@ USING (true);`;
               <h3>
                 {servFormRecordId
                   ? (language === 'es' ? '🔍 Detalle' : '🔍 Detail')
-                  : (language === 'es' ? '🔧 Registrar Entrada a Taller' : '🔧 Register Garage Entry')
+                  : (language === 'es' ? '📅 Programar Entrada a Taller' : '📅 Schedule Workshop Entry')
                 }
               </h3>
               <button className="btn-secondary btn-xs" onClick={() => setModalType(null)}>✕</button>
@@ -19773,8 +20687,6 @@ USING (true);`;
               <div className="form-grid">
                 <div className="form-group"><label className="form-label">{language === 'es' ? 'Fecha del Service' : 'Service Date'}</label><input type="date" className="form-control" value={servFormDate} onChange={e => setServFormDate(e.target.value)} /></div>
                 <div className="form-group"><label className="form-label">{t.serviceLocation}</label><input type="text" className="form-control" value={servFormLoc} onChange={e => setServFormLoc(e.target.value)} /></div>
-                <div className="form-group"><label className="form-label">{t.performedBy}</label><input type="text" className="form-control" value={servFormBy} onChange={e => setServFormBy(e.target.value)} /></div>
-                <div className="form-group"><label className="form-label">{t.serviceCost} (€)</label><input type="number" className="form-control" value={servFormCost} onChange={e => setServFormCost(Number(e.target.value))} /></div>
               </div>
               <div className="form-group">
                 <label className="form-label">{t.serviceDescription}</label>
@@ -20969,17 +21881,17 @@ USING (true);`;
                 </div>
                 <div className="form-group">
                   <label className="form-label">{language === 'es' ? 'Costo (€)' : 'Cost (€)'}</label>
-                  <input type="number" className="form-control" value={spFormCost} onChange={e => setSpFormCost(e.target.value ? Number(e.target.value) : '')} />
+                  <NumberField className="form-control" value={spFormCost} onValueChange={v => setSpFormCost(v ?? '')} />
                 </div>
               </div>
               <div className="form-grid">
                 <div className="form-group">
                   <label className="form-label">MOQ (Min Order Qty)</label>
-                  <input type="number" className="form-control" value={spFormMoq} onChange={e => setSpFormMoq(e.target.value ? Number(e.target.value) : '')} />
+                  <input type="number" className="form-control" value={spFormMoq} onChange={e => { const v = readNumberInput(e); if (v !== undefined) setSpFormMoq(v ?? ''); }} />
                 </div>
                 <div className="form-group">
                   <label className="form-label">{language === 'es' ? 'Tiempo de Entrega (Días)' : 'Delivery Time (Days)'}</label>
-                  <input type="number" className="form-control" value={spFormDelivery} onChange={e => setSpFormDelivery(e.target.value ? Number(e.target.value) : '')} />
+                  <input type="number" className="form-control" value={spFormDelivery} onChange={e => { const v = readNumberInput(e); if (v !== undefined) setSpFormDelivery(v ?? ''); }} />
                 </div>
               </div>
               <div className="form-group">
@@ -21036,7 +21948,7 @@ USING (true);`;
                 <div style={{ background: 'rgba(255,255,255,0.04)', padding: '12px', borderRadius: '8px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <span style={{ color: 'var(--text-muted)', fontSize: '13px' }}>{language === 'es' ? 'Monto semanal:' : 'Weekly amount:'}</span>
-                    <strong style={{ color: 'var(--color-primary)', fontSize: '15px' }}>€{earnFormAmount}</strong>
+                    <strong style={{ color: 'var(--color-primary)', fontSize: '15px' }}>€{fmt1(earnFormAmount)}</strong>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <span style={{ color: 'var(--text-muted)', fontSize: '13px' }}>{language === 'es' ? 'Fecha de pago:' : 'Payment date:'}</span>
@@ -21214,20 +22126,20 @@ USING (true);`;
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '12px' }}>
                   <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.04)' }}>
                     <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Inversión Inicial' : 'Initial Investment'}</span>
-                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#f87171' }}>-€{stats.cost}</h5>
+                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#f87171' }}>-€{fmt1(stats.cost)}</h5>
                   </div>
                   <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.04)' }}>
                     <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Ingresos Totales' : 'Total Revenues'}</span>
-                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#34d399' }}>+€{totalRevenues}</h5>
+                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#34d399' }}>+€{fmt1(totalRevenues)}</h5>
                   </div>
                   <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.04)' }}>
                     <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Gastos Taller/Otros' : 'Garage/Other Exp.'}</span>
-                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#fb923c' }}>-€{stats.totalExp}</h5>
+                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#fb923c' }}>-€{fmt1(stats.totalExp)}</h5>
                   </div>
                   <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.04)' }}>
                     <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Retorno Neto' : 'Net Returns'}</span>
                     <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: netProfit >= 0 ? '#34d399' : '#f87171' }}>
-                      {netProfit >= 0 ? '+' : ''}€{netProfit}
+                      {netProfit >= 0 ? '+' : ''}€{fmt1(netProfit)}
                     </h5>
                   </div>
                 </div>
@@ -21253,7 +22165,7 @@ USING (true);`;
                               <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>📅 {formatDate(item.date)}</span>
                             </div>
                             <strong style={{ color: amtColor, fontSize: '14px', whiteSpace: 'nowrap', marginLeft: '12px' }}>
-                              {isPositive ? '+' : ''}€{item.amount}
+                              {isPositive ? '+' : ''}€{fmt1(item.amount)}
                             </strong>
                           </div>
                         );
@@ -21841,7 +22753,7 @@ USING (true);`;
                       : [];
                     const totalEarnedForRider = activeEarns.reduce((sum, e) => sum + e.amount, 0);
 
-                    const noteText = `Finalizacion de vinculo con el Rider ${riderName} (Total: €${totalEarnedForRider})`;
+                    const noteText = `Finalizacion de vinculo con el Rider ${riderName} (Total: €${fmt1(totalEarnedForRider)})`;
                     
                     await insertAccountNote({
                       id: crypto.randomUUID(),
@@ -21974,7 +22886,7 @@ USING (true);`;
                   <div className="form-group"><label className="form-label">{language === 'es' ? 'Contraseña' : 'Password'}</label><input type="text" className="form-control" disabled={accFormRiderReadOnly} value={accFormPass} onChange={e => setAccFormPass(e.target.value)} /></div>
                   <div className="form-group"><label className="form-label">Email</label><input type="email" className="form-control" disabled={accFormRiderReadOnly} value={accFormEmail} onChange={e => setAccFormEmail(e.target.value)} /></div>
                   <div className="form-group"><label className="form-label">{language === 'es' ? 'Banco / IBAN' : 'Bank / IBAN'}</label><input type="text" className="form-control" disabled={accFormRiderReadOnly} value={accFormBank} onChange={e => setAccFormBank(e.target.value)} /></div>
-                  <div className="form-group"><label className="form-label">{language === 'es' ? 'Tarifa Semanal (€)' : 'Weekly Rate (€)'}</label><input type="number" className="form-control" disabled={accFormRiderReadOnly} value={accFormRate} onChange={e => setAccFormRate(Number(e.target.value))} /></div>
+                  <div className="form-group"><label className="form-label">{language === 'es' ? 'Tarifa Semanal (€)' : 'Weekly Rate (€)'}</label><NumberField className="form-control" disabled={accFormRiderReadOnly} value={accFormRate} onValueChange={v => setAccFormRate(v ?? 0)} /></div>
                   {!accFormRiderReadOnly && (
                     <div className="form-group">
                       <label className="form-label">{language === 'es' ? 'Estado' : 'Status'}</label>
@@ -22180,7 +23092,7 @@ USING (true);`;
                           : [];
                         const totalEarnedForRider = activeEarns.reduce((sum, e) => sum + e.amount, 0);
 
-                        const noteText = `Finalizacion de vinculo con el Rider ${oldRiderName} (Total: €${totalEarnedForRider})`;
+                        const noteText = `Finalizacion de vinculo con el Rider ${oldRiderName} (Total: €${fmt1(totalEarnedForRider)})`;
                         
                         await insertAccountNote({
                           id: crypto.randomUUID(),
@@ -22339,11 +23251,11 @@ USING (true);`;
                   <>
                     <div className="form-group">
                       <label className="form-label">{language === 'es' ? 'Tarifa Semanal (€)' : 'Weekly Rate (€)'}</label>
-                      <input type="number" className="form-control" value={tmplWeeklyRate} onChange={e => setTmplWeeklyRate(Number(e.target.value))} />
+                      <NumberField className="form-control" value={tmplWeeklyRate} onValueChange={v => setTmplWeeklyRate(v ?? 0)} />
                     </div>
                     <div className="form-group">
                       <label className="form-label">{language === 'es' ? 'Depósito (€)' : 'Deposit (€)'}</label>
-                      <input type="number" className="form-control" value={tmplDeposit} onChange={e => setTmplDeposit(Number(e.target.value))} />
+                      <NumberField className="form-control" value={tmplDeposit} onValueChange={v => setTmplDeposit(v ?? 0)} />
                     </div>
                   </>
                 )}
@@ -22494,7 +23406,7 @@ USING (true);`;
                       <strong style={{ color: 'var(--text-bright)' }}>{batchModel.brand} {batchModel.model_name}</strong>
                       <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
                         {pfStr && <span>Prefix: {pfStr} | </span>}
-                        €{batchModel.suggested_weekly_rate}/{language === 'es' ? 'sem' : 'wk'}
+                        €{fmt1(batchModel.suggested_weekly_rate)}/{language === 'es' ? 'sem' : 'wk'}
                       </div>
                     </div>
                   </div>
@@ -22503,19 +23415,19 @@ USING (true);`;
                 <div className="form-grid">
                   <div className="form-group">
                     <label className="form-label">{language === 'es' ? 'Cantidad de unidades' : 'Number of units'}</label>
-                    <input type="number" className="form-control" min={1} max={100} value={batchQuantity} onChange={e => setBatchQuantity(Math.max(1, Number(e.target.value)))} />
+                    <input type="number" className="form-control" min={1} max={100} value={batchQuantity} onChange={e => { const v = readNumberInput(e); if (v !== undefined) setBatchQuantity(Math.max(1, v ?? 1)); }} />
                   </div>
                   <div className="form-group">
                     <label className="form-label">{language === 'es' ? 'Número inicial' : 'Start number'}</label>
-                    <input type="number" className="form-control" min={1} value={batchStartNum} onChange={e => setBatchStartNum(Math.max(1, Number(e.target.value)))} />
+                    <input type="number" className="form-control" min={1} value={batchStartNum} onChange={e => { const v = readNumberInput(e); if (v !== undefined) setBatchStartNum(Math.max(1, v ?? 1)); }} />
                   </div>
                   <div className="form-group">
                     <label className="form-label">{language === 'es' ? 'Coste por unidad (€)' : 'Cost per unit (€)'}</label>
-                    <input type="number" className="form-control" value={batchCost} onChange={e => setBatchCost(Number(e.target.value))} />
+                    <NumberField className="form-control" value={batchCost} onValueChange={v => setBatchCost(v ?? 0)} />
                   </div>
                   <div className="form-group">
                     <label className="form-label">{language === 'es' ? 'Depósito (€)' : 'Deposit (€)'}</label>
-                    <input type="number" className="form-control" value={batchDeposit} onChange={e => setBatchDeposit(Number(e.target.value))} />
+                    <NumberField className="form-control" value={batchDeposit} onValueChange={v => setBatchDeposit(v ?? 0)} />
                   </div>
                 </div>
 
@@ -22811,7 +23723,7 @@ USING (true);`;
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderLeft: `4px solid ${amtColor}`, paddingLeft: '12px' }}>
                   <span className="badge">{txDetail.category}</span>
-                  <strong style={{ color: amtColor, fontSize: '20px' }}>{isPositive ? '+' : '-'}€{txDetail.amount}</strong>
+                  <strong style={{ color: amtColor, fontSize: '20px' }}>{isPositive ? '+' : '-'}€{fmt1(txDetail.amount)}</strong>
                 </div>
                 <div>
                   <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{language === 'es' ? 'Descripción' : 'Description'}</p>
@@ -22855,7 +23767,7 @@ USING (true);`;
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderLeft: `4px solid ${amtColor}`, paddingLeft: '12px' }}>
                   <span style={{ fontSize: '12px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{typeLabel}</span>
-                  <strong style={{ color: amtColor, fontSize: '20px' }}>{isPositive ? '+' : ''}€{ledgerDetail.amount}</strong>
+                  <strong style={{ color: amtColor, fontSize: '20px' }}>{isPositive ? '+' : ''}€{fmt1(ledgerDetail.amount)}</strong>
                 </div>
                 <div>
                   <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{language === 'es' ? 'Descripción' : 'Description'}</p>
@@ -23368,7 +24280,7 @@ USING (true);`;
                     className="form-control" 
                     min={1} 
                     value={genStockQty} 
-                    onChange={e => setGenStockQty(Math.max(1, Number(e.target.value)))} 
+                    onChange={e => { const v = readNumberInput(e); if (v !== undefined) setGenStockQty(Math.max(1, v ?? 1)); }}
                   />
                 </div>
                 <div className="form-group" style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
@@ -23419,20 +24331,18 @@ USING (true);`;
                 </div>
                 <div className="form-group">
                   <label className="form-label">{language === 'es' ? 'Costo unitario (€)' : 'Unit Cost (€)'}</label>
-                  <input
-                    type="number"
+                  <NumberField
                     className="form-control"
-                    min={0}
                     value={genStockCost}
-                    onChange={e => setGenStockCost(Math.max(0, Number(e.target.value)))}
+                    onValueChange={v => setGenStockCost(Math.max(0, v ?? 0))}
                   />
                   {(() => {
                     const qty = genStockQty > 0 ? genStockQty : 1;
                     const total = (genStockCost || 0) * qty;
                     return (
                       <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '6px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(16, 185, 129, 0.05)', padding: '6px 10px', borderRadius: '6px', border: '1px solid rgba(16, 185, 129, 0.1)' }}>
-                        <span>{language === 'es' ? 'Total de la compra' : 'Total purchase'} ({qty} {language === 'es' ? 'uds' : 'units'} × €{genStockCost || 0})</span>
-                        <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{total.toLocaleString()}</strong>
+                        <span>{language === 'es' ? 'Total de la compra' : 'Total purchase'} ({qty} {language === 'es' ? 'uds' : 'units'} × €{fmt1(genStockCost || 0)})</span>
+                        <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{fmt1(total)}</strong>
                       </div>
                     );
                   })()}
@@ -23551,7 +24461,7 @@ USING (true);`;
                       min={1} 
                       max={maxQty}
                       value={genStockQty} 
-                      onChange={e => setGenStockQty(Math.min(maxQty, Math.max(1, Number(e.target.value))))} 
+                      onChange={e => { const v = readNumberInput(e); if (v !== undefined) setGenStockQty(Math.min(maxQty, Math.max(1, v ?? 1))); }} 
                     />
                   </div>
                 </div>
@@ -23739,6 +24649,28 @@ USING (true);`;
               >
                 ✏️ {t.edit}
               </button>
+
+              {/* View full chronological history (works for any bike, incl. sold/lost/stolen) */}
+              {prod.category_id === catBikeId && (
+                <button
+                  className="dropdown-item"
+                  style={{
+                    width: '100%', textAlign: 'left', background: 'transparent', border: 'none',
+                    borderRadius: '6px', padding: '8px 12px', fontSize: '12px', color: 'var(--text-muted)',
+                    cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px', transition: 'all 0.2s ease'
+                  }}
+                  onClick={() => {
+                    setActiveStockMenuId(null);
+                    setMenuCoords(null);
+                    setSelectedProductId(prod.id);
+                    setModalType('bikeHistory');
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)'; e.currentTarget.style.color = 'var(--text-bright)'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}
+                >
+                  📊 {language === 'es' ? 'Ver Historial' : 'View History'}
+                </button>
+              )}
 
               {/* Lock Association Option */}
               {prod.category_id === catLockId && (
