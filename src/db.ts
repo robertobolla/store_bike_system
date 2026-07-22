@@ -97,7 +97,10 @@ export interface RentalContractSnapshot {
   lessee_email: string;
   email_lang: 'es' | 'en' | 'pt';
   bike_brand_model: string;
+  // Numero de serie real del fabricante (products.frame_serial), que es el que
+  // identifica legalmente la bici. bike_ref es el codigo interno de inventario.
   bike_serial: string;
+  bike_ref: string;
   start_date: string;
   payment_due_weekday: string;
   rate_amount: number;
@@ -144,6 +147,43 @@ export interface RentalItem {
   rental_id: string;
   product_id: string;
   item_type: 'battery' | 'kit_accessory';
+}
+
+// Un cambio concreto recogido en un anexo: "Weekly Rental Fee: 80.5 -> 70".
+export interface AmendmentChange {
+  label: string;
+  before: string;
+  after: string;
+}
+
+// Anexo firmable al contrato. El contrato original nunca se modifica: cada
+// cambio de condiciones genera un anexo numerado que lo referencia.
+export interface RentalContractAmendment {
+  id: string;
+  rental_id: string;
+  number: number;
+  effective_date: string;
+  changes: AmendmentChange[];
+  snapshot_after: RentalContractSnapshot | null;
+  note: string | null;
+  customer_name: string;
+  customer_email: string;
+  email_lang: 'es' | 'en' | 'pt';
+  status: 'pending' | 'signed';
+  signature_url: string | null;
+  signed_at: string | null;
+  created_at: string;
+}
+
+// Tramo en el que una bici concreta estuvo asignada a un alquiler.
+// to_date null = tramo vigente.
+export interface RentalBikeAssignment {
+  id: string;
+  rental_id: string;
+  product_id: string;
+  from_date: string;
+  to_date: string | null;
+  created_at: string;
 }
 
 export interface RentalPayment {
@@ -344,7 +384,10 @@ export function calculateProductROI(
   rentalItems: RentalItem[],
   payments: RentalPayment[],
   expenses: MaintenanceExpense[],
-  records: MaintenanceRecord[]
+  records: MaintenanceRecord[],
+  // Historial de asignacion. Si se omite, se atribuye como antes: todo el
+  // alquiler a su bici actual.
+  assignments: RentalBikeAssignment[] = []
 ): { roi: number; totalPaid: number; totalExp: number; cost: number; soldPrice: number } {
   const prod = products.find(p => p.id === productId);
   if (!prod) return { roi: 0, totalPaid: 0, totalExp: 0, cost: 0, soldPrice: 0 };
@@ -358,11 +401,43 @@ export function calculateProductROI(
   const associatedRentalIds = new Set<string>();
   rentals.forEach(r => { if (r.bike_id === productId) associatedRentalIds.add(r.id); });
   rentalItems.forEach(ri => { if (ri.product_id === productId) associatedRentalIds.add(ri.rental_id); });
+  // Tras un cambio de bici, rentals.bike_id apunta a la nueva: sin esto la bici
+  // saliente perderia los cobros de su tramo.
+  assignments.forEach(a => { if (a.product_id === productId) associatedRentalIds.add(a.rental_id); });
+
+  // Todos los tramos de cada alquiler, ordenados por fecha.
+  const allSpansByRental = new Map<string, RentalBikeAssignment[]>();
+  assignments.forEach(a => {
+    const list = allSpansByRental.get(a.rental_id) ?? [];
+    list.push(a);
+    allSpansByRental.set(a.rental_id, list);
+  });
+  allSpansByRental.forEach(list => list.sort((x, y) => x.from_date.localeCompare(y.from_date)));
+
+  // Un cobro pertenece a la bici que estaba asignada el dia del cobro. No se
+  // prorratea: la semana ya cobrada queda entera para la bici que se usaba.
+  //
+  // Si el alquiler nunca cambio de bici hay un solo tramo, y entonces no se
+  // filtra por fecha: cualquier cobro es suyo. Asi un pago atrasado, o hecho el
+  // mismo dia del cierre, no se pierde. El filtrado solo entra en juego cuando
+  // hubo un cambio de bici, que es cuando hay algo que repartir.
+  const paymentBelongsHere = (rentalId: string, date: string): boolean => {
+    const spans = allSpansByRental.get(rentalId);
+    if (!spans || spans.length === 0) return true;  // sin historial: como antes
+    if (spans.length === 1) return spans[0].product_id === productId;
+    // Con varios tramos, los extremos se abren para no dejar cobros huerfanos.
+    const idx = spans.findIndex((s, i) => {
+      const startsBefore = i === 0 || date >= s.from_date;
+      const endsAfter = i === spans.length - 1 || !s.to_date || date < s.to_date;
+      return startsBefore && endsAfter;
+    });
+    return idx >= 0 && spans[idx].product_id === productId;
+  };
 
   let totalPaid = 0;
   if (catName === 'Bicicleta') {
     payments.forEach(p => {
-      if (associatedRentalIds.has(p.rental_id)) {
+      if (associatedRentalIds.has(p.rental_id) && paymentBelongsHere(p.rental_id, p.payment_date)) {
         totalPaid += p.amount;
       }
     });
@@ -370,7 +445,10 @@ export function calculateProductROI(
     rentals.forEach(r => {
       if (associatedRentalIds.has(r.id)) {
         const retained = r.deposit_amount - (r.deposit_refunded || 0);
-        if (retained > 0) {
+        // El deposito retenido cubre danos al devolver, asi que se imputa a la
+        // bici que tenia el rider al cerrar el alquiler.
+        const closingDate = r.end_date || r.scheduled_return_date || r.start_date;
+        if (retained > 0 && paymentBelongsHere(r.id, closingDate)) {
           totalPaid += retained;
         }
       }
@@ -889,7 +967,9 @@ export interface DeliveryChecklist {
   customer_email: string;
   email_lang: 'es' | 'en' | 'pt';
   bike_model: string;
+  // Numero de serie real del fabricante; bike_ref es el codigo interno (B-018).
   bike_serial: string;
+  bike_ref?: string | null;
   delivery_date: string;
   battery_level: string;
   items: Record<string, boolean>;
@@ -902,7 +982,7 @@ export interface DeliveryChecklist {
 
 export async function createDeliveryChecklist(
   data: Pick<DeliveryChecklist, 'rental_id' | 'customer_name' | 'customer_email' | 'email_lang' | 'bike_model' | 'bike_serial' | 'delivery_date'> &
-    Partial<Pick<DeliveryChecklist, 'audience'>>
+    Partial<Pick<DeliveryChecklist, 'audience' | 'bike_ref'>>
 ): Promise<DeliveryChecklist> {
   const { data: row, error } = await supabase
     .from('delivery_checklists')
@@ -914,6 +994,7 @@ export async function createDeliveryChecklist(
       email_lang: data.email_lang,
       bike_model: data.bike_model,
       bike_serial: data.bike_serial,
+      bike_ref: data.bike_ref ?? null,
       delivery_date: data.delivery_date,
     })
     .select('*')
@@ -925,6 +1006,7 @@ export async function createDeliveryChecklist(
 // Create an internal (operator-filled) technical inspection checklist.
 export async function createInternalChecklist(
   data: Pick<DeliveryChecklist, 'rental_id' | 'customer_name' | 'bike_model' | 'bike_serial' | 'delivery_date'> & {
+    bike_ref?: string | null;
     battery_level?: string;
     items?: Record<string, boolean>;
     notes?: Record<string, string>;
@@ -941,6 +1023,7 @@ export async function createInternalChecklist(
       email_lang: 'en',
       bike_model: data.bike_model,
       bike_serial: data.bike_serial,
+      bike_ref: data.bike_ref ?? null,
       delivery_date: data.delivery_date,
       battery_level: data.battery_level ?? '',
       items: data.items ?? {},
@@ -1264,6 +1347,93 @@ export async function getRentalItems(): Promise<RentalItem[]> {
   const { data, error } = await supabase.from('rental_items').select('*');
   if (error) throw error;
   return (data ?? []) as RentalItem[];
+}
+
+// ----------------------------------------------------------------
+// HISTORIAL DE ASIGNACION DE BICI
+// ----------------------------------------------------------------
+
+export async function getBikeAssignments(): Promise<RentalBikeAssignment[]> {
+  const { data, error } = await supabase
+    .from('rental_bike_assignments').select('*').order('from_date');
+  if (error) throw error;
+  return (data ?? []) as RentalBikeAssignment[];
+}
+
+// Cierra el tramo vigente y abre uno nuevo para la bici entrante.
+export async function switchRentalBike(
+  rentalId: string,
+  newBikeId: string,
+  effectiveDate: string
+): Promise<void> {
+  const { error: closeErr } = await supabase
+    .from('rental_bike_assignments')
+    .update({ to_date: effectiveDate })
+    .eq('rental_id', rentalId)
+    .is('to_date', null);
+  if (closeErr) throw closeErr;
+
+  const { error: openErr } = await supabase
+    .from('rental_bike_assignments')
+    .insert({ rental_id: rentalId, product_id: newBikeId, from_date: effectiveDate });
+  if (openErr) throw openErr;
+}
+
+// ----------------------------------------------------------------
+// ANEXOS AL CONTRATO
+// ----------------------------------------------------------------
+
+export async function getContractAmendments(): Promise<RentalContractAmendment[]> {
+  const { data, error } = await supabase
+    .from('rental_contract_amendments').select('*').order('number');
+  if (error) throw error;
+  return (data ?? []) as RentalContractAmendment[];
+}
+
+// Lectura publica para la pagina de firma (el rider no esta logueado).
+export async function getContractAmendment(id: string): Promise<RentalContractAmendment | null> {
+  const { data, error } = await supabase
+    .from('rental_contract_amendments').select('*').eq('id', id).maybeSingle();
+  if (error) throw error;
+  return (data as RentalContractAmendment) ?? null;
+}
+
+export async function createContractAmendment(
+  data: Omit<RentalContractAmendment, 'id' | 'created_at' | 'status' | 'signature_url' | 'signed_at'>
+): Promise<RentalContractAmendment> {
+  const { data: row, error } = await supabase
+    .from('rental_contract_amendments').insert(data).select('*').single();
+  if (error) throw error;
+  return row as RentalContractAmendment;
+}
+
+export async function signContractAmendment(id: string, signatureUrl: string): Promise<void> {
+  const { error } = await supabase
+    .from('rental_contract_amendments')
+    .update({ status: 'signed', signature_url: signatureUrl, signed_at: new Date().toISOString() })
+    .eq('id', id);
+  if (error) throw error;
+}
+
+// Siguiente numero correlativo de anexo para un alquiler.
+export async function nextAmendmentNumber(rentalId: string): Promise<number> {
+  const { data, error } = await supabase
+    .from('rental_contract_amendments')
+    .select('number').eq('rental_id', rentalId).order('number', { ascending: false }).limit(1);
+  if (error) throw error;
+  return ((data?.[0]?.number as number) ?? 0) + 1;
+}
+
+// Alta del primer tramo, al crear el alquiler.
+export async function openBikeAssignment(
+  rentalId: string,
+  bikeId: string,
+  fromDate: string
+): Promise<void> {
+  const { error } = await supabase
+    .from('rental_bike_assignments')
+    .insert({ rental_id: rentalId, product_id: bikeId, from_date: fromDate });
+  if (error) throw error;
 }
 
 export async function insertRentalItems(items: RentalItem[]): Promise<void> {

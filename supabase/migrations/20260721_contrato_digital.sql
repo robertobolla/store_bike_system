@@ -17,3 +17,8 @@ alter table rentals
 -- Clausula 13: consentimiento opcional de uso de imagen. NULL = contrato aun sin firmar.
 alter table rentals
   add column if not exists contract_image_consent boolean;
+
+-- Codigo interno de inventario (B-018). El campo bike_serial pasa a guardar el
+-- numero de serie real del fabricante, que es el que identifica legalmente la bici.
+alter table delivery_checklists
+  add column if not exists bike_ref text;

@@ -8,7 +8,7 @@ import type {
   SerialPrefix, Category, CustomFieldDefinition, MaintenanceRecord,
   AppAccountNote, AppAccountEarning, AppPlatform, AppVehicleType,
   ProductModel, QuickReply,
-  Sale, SaleItem, FinancingPlan, FinancingPayment, EmailTemplate,
+  Sale, SaleItem, FinancingPlan, FinancingPayment, EmailTemplate, RentalBikeAssignment,
   TaskCard, TaskItem,
 } from './db';
 import {
@@ -20,6 +20,8 @@ import {
   getProductModels, upsertProductModel, deleteProductModel, uploadModelImage, batchCreateProducts, batchInsertProducts,
   getCustomers, upsertCustomer, deleteCustomer,
   getRentals, upsertRental, getRentalItems, insertRentalItems, deleteRentalItems, deleteRental,
+  getBikeAssignments, openBikeAssignment, switchRentalBike,
+  getContractAmendments, getContractAmendment, createContractAmendment, signContractAmendment, nextAmendmentNumber,
   getPayments, insertPayment, deletePayment,
   getExpenses, insertExpense,
   uploadRentalPhoto, uploadRiderDocument, uploadContractPhoto, uploadSignatureImage,
@@ -44,7 +46,7 @@ import {
   uploadChecklistSignature, createDeliveryChecklist, getDeliveryChecklist, getDeliveryChecklists, submitDeliveryChecklist,
   createInternalChecklist, updateDeliveryChecklist,
 } from './db';
-import type { AllowedEmail, BikeModification, DeliveryChecklist, RentalContractSnapshot } from './db';
+import type { AllowedEmail, BikeModification, DeliveryChecklist, RentalContractSnapshot, RentalContractAmendment, AmendmentChange } from './db';
 import { downloadBackupXlsx } from './backup';
 
 
@@ -813,6 +815,7 @@ function sendDeliveryChecklistCopyEmail(
       <table style="width:100%; font-size: 13px; border-collapse: collapse; margin-bottom: 8px;">
         <tr><td style="padding:4px 0; color:#6b7280;">E-Bike Model</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.bike_model}</td></tr>
         <tr><td style="padding:4px 0; color:#6b7280;">E-Bike Serial Number</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.bike_serial}</td></tr>
+        <tr><td style="padding:4px 0; color:#6b7280;">Unit Reference</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.bike_ref ?? '—'}</td></tr>
         <tr><td style="padding:4px 0; color:#6b7280;">Date</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.delivery_date}</td></tr>
         <tr><td style="padding:4px 0; color:#6b7280;">Battery Charge Level</td><td style="padding:4px 0; text-align:right; font-weight:600;">${payload.battery_level || '—'}</td></tr>
         <tr><td style="padding:4px 0; color:#6b7280;">Customer Name</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.customer_name}</td></tr>
@@ -1046,13 +1049,12 @@ const contractDetailRows = (s: RentalContractSnapshot): [string, string][] => [
   ['Email', s.lessee_email || '—'],
   ['Brand and Model', s.bike_brand_model || '—'],
   ['Serial Number', s.bike_serial || '—'],
+  ['Unit Reference', s.bike_ref || '—'],
   ['Rental Start Date', s.start_date || '—'],
   ['Weekly Payment Due Every', s.payment_due_weekday || '—'],
   [contractRatePeriodLabel(s.rate_type), `€${fmt1(s.rate_amount)}`],
   ['Security Deposit', `€${fmt1(s.deposit_amount)}`],
   ['Number of Batteries Supplied', String(s.battery_count)],
-  // Kept visible and blank: filled in by hand only when an extra battery is charged.
-  ['Additional Battery (if applicable)', '€ ______ / week'],
 ];
 
 const CONTRACT_EMAIL_T = {
@@ -1178,6 +1180,130 @@ function sendRentalContractCopyEmail(
     </div>`;
   executeEmailSend(snapshot.lessee_email, t.copySubject, html);
 }
+
+// ====================================================
+// ANEXOS AL CONTRATO
+// El contrato firmado no se toca: cada cambio de condiciones emite un anexo
+// numerado que lo referencia y que el rider firma aparte. El documento es corto
+// a proposito: solo lista lo que cambia, y remite al contrato para el resto.
+// Igual que el contrato, va en ingles; solo el correo sigue el idioma del rider.
+// ====================================================
+const AMENDMENT_CONTINUITY_CLAUSE =
+  'All other terms and conditions of the Agreement, including clauses 1 to 16, remain in full force ' +
+  'and effect. This Amendment forms an integral part of the Agreement.';
+
+const AMENDMENT_RATE_CLAUSE =
+  'The new rental fee applies to payments falling due on or after the effective date. Payments already ' +
+  'made are not subject to refund or pro-rata adjustment.';
+
+const AMENDMENT_ACKNOWLEDGEMENTS = [
+  'they have read and understood this Amendment;',
+  'they accept the modified terms set out above;',
+  'where equipment was exchanged, they received it in good working condition.',
+];
+
+const AMENDMENT_EMAIL_T = {
+  es: {
+    inviteSubject: (n: number) => `Anexo Nº ${n} a tu contrato de alquiler - The Fast Sheep`,
+    greeting: (n: string) => `Hola ${n},`,
+    intro: 'Hemos registrado un cambio en las condiciones de tu alquiler. Para dejarlo formalizado, revisá y firmá el anexo desde este enlace.',
+    button: 'Leer y firmar el anexo',
+    fallback: 'Si el botón no funciona, copiá y pegá este enlace en tu navegador:',
+    note: 'El anexo está redactado en inglés, igual que el contrato original.',
+    copySubject: (n: number) => `Copia del Anexo Nº ${n} firmado - The Fast Sheep`,
+    copyIntro: (n: string) => `Hola ${n}, a continuación encontrarás una copia del anexo que firmaste.`,
+  },
+  en: {
+    inviteSubject: (n: number) => `Amendment No. ${n} to your rental agreement - The Fast Sheep`,
+    greeting: (n: string) => `Hi ${n},`,
+    intro: 'We have recorded a change to your rental terms. Please review and sign the amendment using the link below.',
+    button: 'Read &amp; sign the amendment',
+    fallback: 'If the button does not work, copy and paste this link into your browser:',
+    note: '',
+    copySubject: (n: number) => `Copy of signed Amendment No. ${n} - The Fast Sheep`,
+    copyIntro: (n: string) => `Hi ${n}, below is a copy of the amendment you signed.`,
+  },
+  pt: {
+    inviteSubject: (n: number) => `Anexo Nº ${n} ao teu contrato de aluguer - The Fast Sheep`,
+    greeting: (n: string) => `Olá ${n},`,
+    intro: 'Registámos uma alteração nas condições do teu aluguer. Para a formalizar, revê e assina o anexo através deste link.',
+    button: 'Ler e assinar o anexo',
+    fallback: 'Se o botão não funcionar, copia e cola este link no teu navegador:',
+    note: 'O anexo está redigido em inglês, tal como o contrato original.',
+    copySubject: (n: number) => `Cópia do Anexo Nº ${n} assinado - The Fast Sheep`,
+    copyIntro: (n: string) => `Olá ${n}, em baixo encontras uma cópia do anexo que assinaste.`,
+  },
+} as const;
+
+const amendmentChangesHtml = (changes: AmendmentChange[]) => `
+  <table style="width:100%; border-collapse:collapse; margin-top:8px;">
+    <tr>
+      <th style="text-align:left; font-size:11px; color:#6b7280; border-bottom:1px solid #e5e7eb; padding:4px 0;">Item</th>
+      <th style="text-align:left; font-size:11px; color:#6b7280; border-bottom:1px solid #e5e7eb; padding:4px 0;">Before</th>
+      <th style="text-align:left; font-size:11px; color:#6b7280; border-bottom:1px solid #e5e7eb; padding:4px 0;">After</th>
+    </tr>
+    ${changes.map(c => `
+      <tr>
+        <td style="padding:5px 0; font-size:12px;">${c.label}</td>
+        <td style="padding:5px 0; font-size:12px; color:#6b7280;">${c.before}</td>
+        <td style="padding:5px 0; font-size:12px; font-weight:600;">${c.after}</td>
+      </tr>`).join('')}
+  </table>`;
+
+function sendAmendmentInviteEmail(am: RentalContractAmendment, url: string) {
+  const t = AMENDMENT_EMAIL_T[am.email_lang] ?? AMENDMENT_EMAIL_T.en;
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 560px; margin: 0 auto; color: #1f2937;">
+      <div style="text-align:center; padding: 16px 0;">
+        <div style="font-size: 28px;">🐏</div>
+        <h2 style="margin: 4px 0;">The Fast Sheep</h2>
+        <p style="margin:0; font-size: 13px; color:#6b7280;">Amendment No. ${am.number} to the Rental Agreement</p>
+      </div>
+      <p>${t.greeting(am.customer_name)}</p>
+      <p>${t.intro}</p>
+      ${amendmentChangesHtml(am.changes)}
+      <p style="font-size:12px; color:#6b7280; margin-top:10px;">Effective from ${am.effective_date}.</p>
+      <div style="text-align:center; margin: 26px 0;">
+        <a href="${url}" style="background:#10b981; color:#fff; text-decoration:none; padding: 14px 28px; border-radius: 10px; font-weight: 600; display:inline-block;">
+          ${t.button}
+        </a>
+      </div>
+      ${t.note ? `<p style="font-size: 12px; color:#6b7280;">${t.note}</p>` : ''}
+      <p style="font-size: 12px; color:#6b7280;">${t.fallback}<br>
+        <a href="${url}" style="color:#10b981;">${url}</a></p>
+      ${CONTRACT_EMAIL_FOOTER}
+    </div>`;
+  executeEmailSend(am.customer_email, t.inviteSubject(am.number), html);
+}
+
+function sendAmendmentCopyEmail(am: RentalContractAmendment, signatureUrl: string, signedAt: string) {
+  const t = AMENDMENT_EMAIL_T[am.email_lang] ?? AMENDMENT_EMAIL_T.en;
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 620px; margin: 0 auto; color: #1f2937;">
+      <div style="text-align:center; padding: 16px 0;">
+        <div style="font-size: 28px;">🐏</div>
+        <h2 style="margin: 4px 0;">THE FAST SHEEP LIMITED</h2>
+        <p style="margin:0; font-size: 13px; color:#6b7280;">Amendment No. ${am.number} to the Electric Bicycle Rental Agreement</p>
+      </div>
+      <p style="font-size:13px;">${t.copyIntro(am.customer_name)}</p>
+      <h3 style="font-size:14px; margin:18px 0 4px;">AMENDED TERMS</h3>
+      ${amendmentChangesHtml(am.changes)}
+      <p style="font-size:12px; margin-top:10px;">Effective from <strong>${am.effective_date}</strong>.</p>
+      ${am.changes.some(c => /Fee|Rate/i.test(c.label)) ? `<p style="font-size:12px; line-height:1.5;">${AMENDMENT_RATE_CLAUSE}</p>` : ''}
+      <p style="font-size:12px; line-height:1.5;">${AMENDMENT_CONTINUITY_CLAUSE}</p>
+      <h3 style="font-size:14px; margin:18px 0 4px;">SIGNATURE</h3>
+      <ul style="margin:4px 0 4px 18px; padding:0;">
+        ${AMENDMENT_ACKNOWLEDGEMENTS.map(a => `<li style="font-size:12px; line-height:1.5;">${a}</li>`).join('')}
+      </ul>
+      <div style="margin-top:12px;">
+        <img src="${signatureUrl}" alt="signature" style="max-width: 320px; border:1px solid #e5e7eb; border-radius: 8px; background:#fff;" />
+      </div>
+      <p style="font-size: 12px; color:#6b7280; margin-top: 8px;">Signed by ${am.customer_name} — ${signedAt}</p>
+      ${CONTRACT_EMAIL_FOOTER}
+    </div>`;
+  executeEmailSend(am.customer_email, t.copySubject(am.number), html);
+}
+
 
 
 
@@ -2417,6 +2543,7 @@ USING (true);`;
     customerName: string;
     bikeModel: string;
     bikeSerial: string;
+    bikeRef: string;
     deliveryDate: string;
     value: InternalChecklistValue;
   }): Promise<void> => {
@@ -2431,6 +2558,7 @@ USING (true);`;
         customer_name: params.customerName,
         bike_model: params.bikeModel,
         bike_serial: params.bikeSerial,
+        bike_ref: params.bikeRef,
         delivery_date: params.deliveryDate,
         battery_level: value.battery_level,
         items: value.items,
@@ -2494,10 +2622,12 @@ USING (true);`;
   const [viewChecklist,   setViewChecklist]   = useState<DeliveryChecklist | null>(null);
   const [ledgerDetail,    setLedgerDetail]    = useState<{ date: string; description: string; amount: number; type: 'cost' | 'sale' | 'payment' | 'deposit' | 'expense' } | null>(null);
   const [txDetail,        setTxDetail]        = useState<{ id: string; date: string; type: 'income' | 'expense'; amount: number; description: string; category: string; received_via?: string; productName?: string; brand?: string; model?: string } | null>(null);
-  const [editInternalChecklist, setEditInternalChecklist] = useState<{ rentalId: string; existingId: string | null; customerName: string; bikeModel: string; bikeSerial: string; deliveryDate: string } | null>(null);
+  const [editInternalChecklist, setEditInternalChecklist] = useState<{ rentalId: string; existingId: string | null; customerName: string; bikeModel: string; bikeSerial: string; bikeRef: string; deliveryDate: string } | null>(null);
   const [editInternalValue, setEditInternalValue] = useState<InternalChecklistValue>(emptyInternalChecklist());
   const [editInternalSaving, setEditInternalSaving] = useState(false);
   const [rentalItems,     setRentalItems]     = useState<RentalItem[]>([]);
+  const [bikeAssignments, setBikeAssignments] = useState<RentalBikeAssignment[]>([]);
+  const [contractAmendments, setContractAmendments] = useState<RentalContractAmendment[]>([]);
   const [payments,        setPayments]        = useState<RentalPayment[]>([]);
   const [expenses,        setExpenses]        = useState<MaintenanceExpense[]>([]);
   const [leadCats,        setLeadCats]        = useState<LeadCategory[]>([]);
@@ -2605,6 +2735,20 @@ USING (true);`;
         setDeliveryChecklists(await getDeliveryChecklists());
       } catch (err) {
         console.warn('[FastSheep] delivery_checklists table not found in Supabase.', err);
+      }
+
+      // Historial de asignacion de bici. Si la tabla aun no existe, el ROI se
+      // calcula como antes (todo el alquiler a su bici actual).
+      try {
+        setBikeAssignments(await getBikeAssignments());
+      } catch (err) {
+        console.warn('[FastSheep] rental_bike_assignments table not found in Supabase.', err);
+      }
+
+      try {
+        setContractAmendments(await getContractAmendments());
+      } catch (err) {
+        console.warn('[FastSheep] rental_contract_amendments table not found in Supabase.', err);
       }
 
       // Check if category_id exists in serial_prefixes
@@ -3953,6 +4097,18 @@ USING (true);`;
   // Edit Odometer modal states
 
   // Edit Rental Details Modal states
+  // --- Cambio de bici de un alquiler vivo (genera anexo al contrato) ---
+  const [swapModalRentalId, setSwapModalRentalId] = useState<string | null>(null);
+  const [swapNewBikeId, setSwapNewBikeId] = useState('');
+  const [swapEffectiveDate, setSwapEffectiveDate] = useState(new Date().toISOString().split('T')[0]);
+  const [swapOldBikeStatus, setSwapOldBikeStatus] = useState<'Requiere Service' | 'Disponible'>('Requiere Service');
+  const [swapBatteryIds, setSwapBatteryIds] = useState<string[]>([]);
+  const [swapKeepLock, setSwapKeepLock] = useState(true);
+  const [swapNewLockId, setSwapNewLockId] = useState('');
+  const [swapRate, setSwapRate] = useState(0);
+  const [swapDeposit, setSwapDeposit] = useState(0);
+  const [swapSubmitting, setSwapSubmitting] = useState(false);
+
   const [editRentalModalOpen, setEditRentalModalOpen] = useState(false);
   const [editRentalId, setEditRentalId] = useState('');
   const [editRentalOdometer, setEditRentalOdometer] = useState<number | ''>('');
@@ -4310,8 +4466,13 @@ USING (true);`;
       });
 
     // 3. Fetch starting and ending rental odometer readings
+    // Incluye tambien los alquileres en los que esta bici estuvo asignada aunque
+    // ya no sea la actual: tras un cambio, bike_id apunta a la bici entrante.
+    const rentalIdsWithThisBike = new Set(
+      bikeAssignments.filter(a => a.product_id === selectedProductId).map(a => a.rental_id)
+    );
     const bikeRentals = rentals
-      .filter(r => r.bike_id === selectedProductId)
+      .filter(r => r.bike_id === selectedProductId || rentalIdsWithThisBike.has(r.id))
       .flatMap(r => {
         const cust = customers.find(c => c.id === r.customer_id);
         const customerName = cust ? `${cust.first_name} ${cust.last_name}` : '';
@@ -4346,10 +4507,56 @@ USING (true);`;
         return events;
       });
 
-    const combined = [...extraEvents, ...bikeRecords, ...bikeExpenses, ...bikeRentals];
+    // 4. Cambios de bici. Salen de los tramos de asignacion: si un tramo termina
+    // y otro empieza en el mismo alquiler, hubo una sustitucion. Se anota en las
+    // dos bicis, cada una contando desde su propio tramo.
+    const swapEvents: any[] = [];
+    const spansByRental = new Map<string, typeof bikeAssignments>();
+    bikeAssignments.forEach(a => {
+      const list = spansByRental.get(a.rental_id) ?? [];
+      list.push(a);
+      spansByRental.set(a.rental_id, list);
+    });
+    spansByRental.forEach((spans, rentalId) => {
+      if (spans.length < 2) return;
+      const ordered = [...spans].sort((x, y) => x.from_date.localeCompare(y.from_date));
+      const rental = rentals.find(r => r.id === rentalId);
+      const cust = rental ? customers.find(c => c.id === rental.customer_id) : null;
+      const customerName = cust ? `${cust.first_name} ${cust.last_name}` : '';
+      const codeOf = (id: string) => products.find(p => p.id === id)?.serial_number ?? '—';
+      const daysBetween = (from: string, to: string) =>
+        Math.max(0, Math.round((new Date(to).getTime() - new Date(from).getTime()) / 86400000));
+
+      for (let i = 1; i < ordered.length; i++) {
+        const prev = ordered[i - 1];
+        const next = ordered[i];
+        const used = daysBetween(prev.from_date, next.from_date);
+        const dias = language === 'es' ? 'días' : 'days';
+        if (prev.product_id === selectedProductId) {
+          swapEvents.push({
+            id: `${next.id}-out`, date: next.from_date, type: 'bike_swap' as const,
+            description: language === 'es'
+              ? `Sustituida por ${codeOf(next.product_id)} — estuvo asignada ${used} ${dias} (${prev.from_date} → ${next.from_date})`
+              : `Replaced by ${codeOf(next.product_id)} — assigned for ${used} ${dias} (${prev.from_date} → ${next.from_date})`,
+            customerName, cost: undefined,
+          });
+        }
+        if (next.product_id === selectedProductId) {
+          swapEvents.push({
+            id: `${next.id}-in`, date: next.from_date, type: 'bike_swap' as const,
+            description: language === 'es'
+              ? `Sustituye a ${codeOf(prev.product_id)} — la anterior estuvo asignada ${used} ${dias}`
+              : `Replaces ${codeOf(prev.product_id)} — the previous one was assigned for ${used} ${dias}`,
+            customerName, cost: undefined,
+          });
+        }
+      }
+    });
+
+    const combined = [...extraEvents, ...bikeRecords, ...bikeExpenses, ...bikeRentals, ...swapEvents];
     combined.sort((a, b) => b.date.localeCompare(a.date));
     return combined;
-  }, [selectedProductId, products, records, expenses, rentals, customers, language, catLockId]);
+  }, [selectedProductId, products, records, expenses, rentals, customers, language, catLockId, bikeAssignments]);
 
   // ----------------------------------------------------------
   // MODAL OPENERS (initialize form state cleanly)
@@ -5423,6 +5630,204 @@ USING (true);`;
     );
   };
 
+  // Sustituye la bici de un alquiler vivo. El alquiler es el mismo (rider,
+  // contrato y pagos siguen), solo cambia la unidad: por eso se cierra el tramo
+  // de asignacion anterior y se abre uno nuevo, en vez de tocar el historial.
+  const handleConfirmBikeSwap = async (rental: Rental) => {
+    if (!swapNewBikeId) return;
+    setSwapSubmitting(true);
+    try {
+      const oldBike = products.find(p => p.id === rental.bike_id);
+      const newBike = products.find(p => p.id === swapNewBikeId);
+      if (!newBike) throw new Error('bici destino no encontrada');
+
+      // 1. Historial de asignacion: cierra el tramo vivo y abre el nuevo.
+      await switchRentalBike(rental.id, swapNewBikeId, swapEffectiveDate);
+
+      // 2. El alquiler pasa a apuntar a la bici nueva, con las condiciones nuevas.
+      await upsertRental({
+        ...rental,
+        bike_id: swapNewBikeId,
+        rental_rate: swapRate,
+        deposit_amount: swapDeposit,
+      });
+
+      // 3. Estados de stock de las dos bicis.
+      const updates: Promise<void>[] = [];
+      if (oldBike) {
+        // "A taller" la saca del pool de disponibles y la deja marcada para revisar.
+        updates.push(upsertProduct(swapOldBikeStatus === 'Requiere Service'
+          ? { ...oldBike, status: 'Mantenimiento', maintenance_status: 'Requiere Service' }
+          : { ...oldBike, status: 'Disponible' }));
+      }
+      updates.push(upsertProduct({ ...newBike, status: 'Rentada' }));
+
+      // 4. Baterias: liberar las que salen, ocupar las que entran.
+      const prevBatteryIds = rentalItems
+        .filter(i => i.rental_id === rental.id && i.item_type === 'battery')
+        .map(i => i.product_id);
+      prevBatteryIds.filter(id => !swapBatteryIds.includes(id)).forEach(id => {
+        const p = products.find(x => x.id === id);
+        if (p) updates.push(upsertProduct({ ...p, status: 'Disponible' }));
+      });
+      swapBatteryIds.filter(id => !prevBatteryIds.includes(id)).forEach(id => {
+        const p = products.find(x => x.id === id);
+        if (p) updates.push(upsertProduct({ ...p, status: 'Rentada' }));
+      });
+
+      // 5. Candado: o se revincula a la bici nueva, o se cambia por otro.
+      const prevLock = rentalItems
+        .filter(i => i.rental_id === rental.id && i.item_type === 'kit_accessory')
+        .map(i => products.find(p => p.id === i.product_id))
+        .find(p => p && p.category_id === catLockId) || null;
+      let finalLockId = '';
+      if (swapKeepLock && prevLock) {
+        finalLockId = prevLock.id;
+        updates.push(upsertProduct({
+          ...prevLock,
+          status: 'Rentada',
+          custom_field_values: { ...prevLock.custom_field_values, associated_bike_id: swapNewBikeId },
+        }));
+      } else {
+        if (prevLock) {
+          updates.push(upsertProduct({
+            ...prevLock,
+            status: 'Disponible',
+            custom_field_values: { ...prevLock.custom_field_values, associated_bike_id: null },
+          }));
+        }
+        if (swapNewLockId) {
+          const nl = products.find(p => p.id === swapNewLockId);
+          if (nl) {
+            finalLockId = nl.id;
+            updates.push(upsertProduct({
+              ...nl,
+              status: 'Rentada',
+              custom_field_values: { ...nl.custom_field_values, associated_bike_id: swapNewBikeId },
+            }));
+          }
+        }
+      }
+      await Promise.all(updates);
+
+      // 6. Rehacer los items del alquiler (baterias + candado + resto del kit).
+      const otherKitIds = rentalItems
+        .filter(i => i.rental_id === rental.id && i.item_type === 'kit_accessory')
+        .map(i => i.product_id)
+        .filter(id => {
+          const p = products.find(x => x.id === id);
+          return p && p.category_id !== catLockId;
+        });
+      await deleteRentalItems(rental.id);
+      const items: RentalItem[] = [
+        ...swapBatteryIds.map(id => ({ id: crypto.randomUUID(), rental_id: rental.id, product_id: id, item_type: 'battery' as const })),
+        ...(finalLockId ? [{ id: crypto.randomUUID(), rental_id: rental.id, product_id: finalLockId, item_type: 'kit_accessory' as const }] : []),
+        ...otherKitIds.map(id => ({ id: crypto.randomUUID(), rental_id: rental.id, product_id: id, item_type: 'kit_accessory' as const })),
+      ];
+      if (items.length) await insertRentalItems(items);
+
+      // 7. Anexo al contrato. Solo lista lo que efectivamente cambia: si las
+      // baterias siguen siendo las mismas, ni se mencionan.
+      const changes: AmendmentChange[] = [];
+      const serialOf = (p?: Product) => `${p?.frame_serial || '—'} (${p?.serial_number || '—'})`;
+      // El modelo solo se lista si de verdad cambia: sustituir una unidad por
+      // otra del mismo modelo no es un cambio de condiciones.
+      if ((oldBike?.name ?? '') !== newBike.name) {
+        changes.push({ label: 'Brand and Model', before: oldBike?.name ?? '—', after: newBike.name });
+      }
+      changes.push({ label: 'Serial Number', before: serialOf(oldBike), after: serialOf(newBike) });
+      const sameBatteries =
+        prevBatteryIds.length === swapBatteryIds.length &&
+        prevBatteryIds.every(id => swapBatteryIds.includes(id));
+      if (!sameBatteries) {
+        const listOf = (ids: string[]) => ids.length
+          ? ids.map(id => { const p = products.find(x => x.id === id); return `${p?.battery_serial || '—'} (${p?.serial_number || '—'})`; }).join(', ')
+          : '—';
+        changes.push({ label: 'Batteries', before: listOf(prevBatteryIds), after: listOf(swapBatteryIds) });
+      }
+      if (swapRate !== rental.rental_rate) {
+        changes.push({ label: contractRatePeriodLabel(rental.rate_type), before: `€${fmt1(rental.rental_rate)}`, after: `€${fmt1(swapRate)}` });
+      }
+      if (swapDeposit !== rental.deposit_amount) {
+        changes.push({ label: 'Security Deposit', before: `€${fmt1(rental.deposit_amount)}`, after: `€${fmt1(swapDeposit)}` });
+      }
+
+      let avisoAnexo = '';
+      const cust = customers.find(c => c.id === rental.customer_id);
+      const priorSnapshot = rental.contract_snapshot;
+      const snapshotAfter: RentalContractSnapshot | null = priorSnapshot ? {
+        ...priorSnapshot,
+        bike_brand_model: newBike.name,
+        bike_serial: newBike.frame_serial ?? '',
+        bike_ref: newBike.serial_number ?? '',
+        rate_amount: swapRate,
+        deposit_amount: swapDeposit,
+        battery_count: swapBatteryIds.length,
+      } : null;
+
+      try {
+        const number = await nextAmendmentNumber(rental.id);
+        const amendment = await createContractAmendment({
+          rental_id: rental.id,
+          number,
+          effective_date: swapEffectiveDate,
+          changes,
+          snapshot_after: snapshotAfter,
+          note: null,
+          customer_name: cust ? `${cust.first_name} ${cust.last_name}`.trim() : '',
+          customer_email: cust?.email ?? '',
+          email_lang: priorSnapshot?.email_lang ?? 'en',
+        });
+        const url = `${window.location.origin}${window.location.pathname}?anexo=${amendment.id}`;
+        if (amendment.customer_email) sendAmendmentInviteEmail(amendment, url);
+        try { await navigator.clipboard.writeText(url); } catch { /* ignore */ }
+        avisoAnexo = language === 'es' ? ` · 📄 Anexo Nº ${number} enviado` : ` · 📄 Amendment No. ${number} sent`;
+      } catch (err) {
+        console.error('No se pudo crear el anexo:', err);
+        avisoAnexo = language === 'es' ? ' · ⚠️ no se pudo emitir el anexo' : ' · ⚠️ amendment could not be issued';
+      }
+
+      // 8. Checklist de entrega de la unidad nueva: deja constancia firmada del
+      // estado en que se entrega, igual que en el alta.
+      let avisoChecklist = '';
+      if (cust?.email) {
+        try {
+          const checklist = await createDeliveryChecklist({
+            rental_id: rental.id,
+            audience: 'customer',
+            customer_name: cust ? `${cust.first_name} ${cust.last_name}`.trim() : '',
+            customer_email: cust.email,
+            email_lang: priorSnapshot?.email_lang ?? 'en',
+            bike_model: newBike.name,
+            bike_serial: newBike.frame_serial ?? '',
+            bike_ref: newBike.serial_number ?? '',
+            delivery_date: swapEffectiveDate,
+          });
+          const clUrl = `${window.location.origin}${window.location.pathname}?checklist=${checklist.id}`;
+          sendDeliveryChecklistInviteEmail(checklist, clUrl, priorSnapshot?.email_lang ?? 'en');
+          avisoChecklist = language === 'es' ? ' · 📋 checklist enviada' : ' · 📋 checklist sent';
+        } catch (err) {
+          console.error('No se pudo emitir la checklist del cambio:', err);
+          avisoChecklist = language === 'es' ? ' · ⚠️ sin checklist' : ' · ⚠️ no checklist';
+        }
+      }
+
+      setSwapModalRentalId(null);
+      triggerReload();
+      // Un solo aviso: dos toasts en el mismo milisegundo comparten clave en React.
+      showToast(
+        (language === 'es'
+          ? `🔄 Cambio aplicado: ${oldBike?.serial_number ?? '—'} → ${newBike.serial_number}`
+          : `🔄 Swap applied: ${oldBike?.serial_number ?? '—'} → ${newBike.serial_number}`) + avisoAnexo + avisoChecklist,
+        'success'
+      );
+    } catch (err) {
+      console.error('Bike swap failed:', err);
+      showToast(language === 'es' ? 'No se pudo aplicar el cambio de bici.' : 'Could not apply the bike swap.', 'error');
+    }
+    setSwapSubmitting(false);
+  };
+
   const handleConfirmRental = async () => {
     if (!wizBikeId || !wizFirstName || !wizLastName) {
       showToast('Falta información requerida (Bike, Nombre).', 'error'); return;
@@ -5530,6 +5935,13 @@ USING (true);`;
         deposit_received_via: wizDepositPaymentMethod,
       };
       await upsertRental(newRental);
+
+      // Primer tramo del historial de asignacion de bici.
+      try {
+        await openBikeAssignment(newRentId, wizBikeId, wizStartDate);
+      } catch (err) {
+        console.warn('No se pudo abrir el tramo de asignacion de bici:', err);
+      }
 
       // Trigger Rental Confirmation Email
       if (rider) {
@@ -5660,7 +6072,8 @@ USING (true);`;
           lessee_email: wizEmail,
           email_lang: wizEmailLang,
           bike_brand_model: bikeProduct?.name ?? '',
-          bike_serial: bikeProduct?.serial_number ?? '',
+          bike_serial: bikeProduct?.frame_serial ?? '',
+          bike_ref: bikeProduct?.serial_number ?? '',
           start_date: wizStartDate,
           payment_due_weekday: contractPaymentWeekday(wizStartDate),
           rate_amount: wizRate,
@@ -5689,7 +6102,8 @@ USING (true);`;
             customer_email: wizEmail,
             email_lang: wizEmailLang,
             bike_model: bikeProduct?.name ?? '',
-            bike_serial: bikeProduct?.serial_number ?? '',
+            bike_serial: bikeProduct?.frame_serial ?? '',
+            bike_ref: bikeProduct?.serial_number ?? '',
             delivery_date: new Date().toISOString().split('T')[0],
           });
           const checklistUrl = `${window.location.origin}${window.location.pathname}?checklist=${checklist.id}`;
@@ -5710,7 +6124,8 @@ USING (true);`;
           rentalId: newRentId,
           customerName: `${rider.first_name} ${rider.last_name}`.trim(),
           bikeModel: bikeProduct?.name ?? '',
-          bikeSerial: bikeProduct?.serial_number ?? '',
+          bikeSerial: bikeProduct?.frame_serial ?? '',
+          bikeRef: bikeProduct?.serial_number ?? '',
           deliveryDate: new Date().toISOString().split('T')[0],
           value: wizInternalChecklist,
         });
@@ -5749,7 +6164,7 @@ USING (true);`;
   // ROI BADGE HELPER
   // ----------------------------------------------------------
   const renderROIBadge = (productId: string) => {
-    const stats = calculateProductROI(productId, products, categories, rentals, rentalItems, payments, expenses, records);
+    const stats = calculateProductROI(productId, products, categories, rentals, rentalItems, payments, expenses, records, bikeAssignments);
     const cls = stats.roi < 10 ? 'roi-red' : stats.roi < 50 ? 'roi-orange' : 'roi-green';
     return (
       <span 
@@ -5932,7 +6347,8 @@ USING (true);`;
       lessee_email: customer.email ?? '',
       email_lang: 'en',
       bike_brand_model: bike.name ?? '',
-      bike_serial: bike.serial_number ?? '',
+      bike_serial: bike.frame_serial ?? '',
+      bike_ref: bike.serial_number ?? '',
       start_date: rental.start_date,
       payment_due_weekday: contractPaymentWeekday(rental.start_date),
       rate_amount: rental.rental_rate,
@@ -6109,6 +6525,7 @@ USING (true);`;
                 {[
                   ['E-Bike Model', checklistData.bike_model || '—'],
                   ['E-Bike Serial Number', checklistData.bike_serial || '—'],
+                  ['Unit Reference', checklistData.bike_ref || '—'],
                   ['Date', checklistData.delivery_date],
                   ['Customer Name', checklistData.customer_name],
                 ].map(([label, val]) => (
@@ -6194,6 +6611,148 @@ USING (true);`;
     );
   }
 
+
+  // ============================================================
+  // PAGINA PUBLICA DEL ANEXO (?anexo=ID)
+  // Reutiliza el canvas y los handlers de la firma del contrato: nunca se
+  // renderizan las dos paginas a la vez.
+  // ============================================================
+  const amendmentId = useMemo(() => new URLSearchParams(window.location.search).get('anexo'), []);
+  const [amendmentData, setAmendmentData] = useState<RentalContractAmendment | null>(null);
+  const [amendmentLoading, setAmendmentLoading] = useState(true);
+  const [amendmentSuccess, setAmendmentSuccess] = useState(false);
+  const [amendmentSubmitting, setAmendmentSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (!amendmentId) return;
+    (async () => {
+      try {
+        setAmendmentData(await getContractAmendment(amendmentId));
+      } catch (err) {
+        console.error('No se pudo cargar el anexo:', err);
+      }
+      setAmendmentLoading(false);
+    })();
+  }, [amendmentId]);
+
+  const submitAmendmentSignature = async () => {
+    const canvas = signCanvasRef.current;
+    if (!canvas || !amendmentData || !signHasSignature) return;
+    setAmendmentSubmitting(true);
+    try {
+      const url = await uploadSignatureImage(`amendment-${amendmentData.id}`, canvas.toDataURL('image/png'));
+      await signContractAmendment(amendmentData.id, url);
+      sendAmendmentCopyEmail(amendmentData, url, new Date().toLocaleString('en-IE'));
+      setAmendmentSuccess(true);
+    } catch (err) {
+      console.error('No se pudo guardar la firma del anexo:', err);
+      alert('Error al guardar la firma. Inténtalo de nuevo.');
+    }
+    setAmendmentSubmitting(false);
+  };
+
+  if (amendmentId) {
+    const am = amendmentData;
+    return (
+      <div className="sign-page">
+        <div className="sign-page-card">
+          <div className="sign-logo">
+            <p style={{ fontSize: '28px', marginBottom: '4px' }}>🐏</p>
+            <h2>THE FAST SHEEP LIMITED</h2>
+            <p style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+              {am ? `Amendment No. ${am.number} to the Electric Bicycle Rental Agreement` : 'Amendment to the Rental Agreement'}
+            </p>
+          </div>
+
+          {amendmentLoading ? (
+            <div style={{ textAlign: 'center', padding: '40px' }}>
+              <p style={{ color: 'var(--text-muted)' }}>⏳ Loading amendment...</p>
+            </div>
+          ) : !am ? (
+            <div style={{ textAlign: 'center', padding: '40px' }}>
+              <p style={{ fontSize: '48px', marginBottom: '12px' }}>❌</p>
+              <h3 style={{ marginBottom: '8px' }}>Amendment not found</h3>
+              <p style={{ color: 'var(--text-muted)', fontSize: '13px' }}>This link is invalid or has expired.</p>
+            </div>
+          ) : amendmentSuccess || am.status === 'signed' ? (
+            <div className="sign-success">
+              <span className="check-icon">✅</span>
+              <h3>Amendment signed successfully!</h3>
+              <p>Thank you, {am.customer_name}. A copy has been emailed to you.</p>
+              <p style={{ marginTop: '12px', fontSize: '12px', color: 'var(--text-muted)' }}>You can close this window.</p>
+            </div>
+          ) : (
+            <>
+              <div className="terms-box">
+                <p style={{ fontWeight: 700, marginTop: 0 }}>BACKGROUND</p>
+                <p>
+                  The parties entered into an Electric Bicycle Rental Agreement (the "Agreement"). By this
+                  Amendment they agree to modify the terms listed below, with effect from <strong>{am.effective_date}</strong>.
+                </p>
+              </div>
+
+              <p style={{ fontSize: '14px', fontWeight: 700, margin: '0 0 8px' }}>AMENDED TERMS</p>
+              <div className="contract-details">
+                {am.changes.map((c, i) => (
+                  <div key={i} className="detail-row" style={{ alignItems: 'flex-start' }}>
+                    <span className="detail-label">{c.label}</span>
+                    <span className="detail-value" style={{ textAlign: 'right' }}>
+                      <span style={{ color: 'var(--text-muted)', textDecoration: 'line-through' }}>{c.before}</span>
+                      {'  →  '}
+                      <strong>{c.after}</strong>
+                    </span>
+                  </div>
+                ))}
+              </div>
+
+              <div className="terms-box">
+                {am.changes.some(c => /Fee|Rate/i.test(c.label)) && <p>{AMENDMENT_RATE_CLAUSE}</p>}
+                <p>{AMENDMENT_CONTINUITY_CLAUSE}</p>
+              </div>
+
+              <div className="terms-box">
+                <p style={{ fontWeight: 700, marginTop: 0 }}>SIGNATURE</p>
+                <p>By signing below, the LESSEE confirms that:</p>
+                <ul style={{ margin: '4px 0 4px 18px', padding: 0 }}>
+                  {AMENDMENT_ACKNOWLEDGEMENTS.map(a => <li key={a} style={{ marginBottom: '3px' }}>{a}</li>)}
+                </ul>
+              </div>
+
+              <label style={{ display: 'flex', gap: '10px', alignItems: 'flex-start', margin: '12px 0', cursor: 'pointer', fontSize: '12px', lineHeight: 1.5 }}>
+                <input type="checkbox" checked={signAccepted} onChange={e => setSignAccepted(e.target.checked)}
+                  style={{ width: '18px', height: '18px', marginTop: '1px', flexShrink: 0, cursor: 'pointer' }} />
+                <span><strong>I have read and accept the terms of this Amendment.</strong></span>
+              </label>
+
+              <div className="sign-canvas-container">
+                <label>✍️ Sign here:</label>
+                <canvas
+                  ref={signCanvasRef}
+                  width={480}
+                  height={160}
+                  onMouseDown={startSign}
+                  onMouseMove={drawSign}
+                  onMouseUp={stopSign}
+                  onMouseLeave={stopSign}
+                  onTouchStart={startSign}
+                  onTouchMove={drawSign}
+                  onTouchEnd={stopSign}
+                />
+              </div>
+              <div className="sign-actions">
+                <button className="btn-secondary" style={{ flex: 1 }} onClick={clearSign}>🗑️ Clear</button>
+                <button className="btn-primary" style={{ flex: 2 }}
+                  disabled={amendmentSubmitting || !signAccepted || !signHasSignature}
+                  onClick={submitAmendmentSignature}>
+                  {amendmentSubmitting ? '⏳ Saving...' : '✅ Sign & Accept'}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   // Render signing page if ?firmar= is present (no auth required)
   if (signRentalId) {
@@ -11129,7 +11688,7 @@ USING (true);`;
                             .map(bike => {
                               const activeRental = rentals.find(r => r.bike_id === bike.id && (r.status === 'Activo' || r.status === 'Devolución en Proceso'));
                               const rider = activeRental ? customers.find(c => c.id === activeRental.customer_id) : null;
-                              const stats = calculateProductROI(bike.id, products, categories, rentals, rentalItems, payments, expenses, records);
+                              const stats = calculateProductROI(bike.id, products, categories, rentals, rentalItems, payments, expenses, records, bikeAssignments);
 
                               // 1. Linked app account type
                               const linkedAccount = rider ? appAccounts.find(a => a.current_renter_id === rider.id && a.status === 'Activa') : null;
@@ -12265,6 +12824,81 @@ USING (true);`;
                           </div>
 
 
+                          {/* Anexos al contrato, con enlace por si el email no llega */}
+                          {latestRental && contractAmendments
+                            .filter(a => a.rental_id === latestRental.id)
+                            .sort((a, b) => a.number - b.number)
+                            .map(a => {
+                              const url = `${window.location.origin}${window.location.pathname}?anexo=${a.id}`;
+                              const firmado = a.status === 'signed';
+                              return (
+                                <div key={a.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '10px' }}>
+                                  <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>
+                                    📎 {language === 'es' ? `Anexo Nº ${a.number}` : `Amendment No. ${a.number}`}
+                                    <span style={{ fontSize: '11px', opacity: 0.7 }}> · {a.effective_date}</span>
+                                  </span>
+                                  <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                                    <span style={{
+                                      fontSize: '11px', padding: '2px 8px', borderRadius: '6px',
+                                      background: firmado ? 'rgba(16,185,129,0.15)' : 'rgba(251,146,60,0.15)',
+                                      color: firmado ? 'var(--color-primary)' : '#fb923c',
+                                      border: '1px solid rgba(255,255,255,0.08)',
+                                    }}>
+                                      {firmado ? (language === 'es' ? '✓ Firmado' : '✓ Signed') : (language === 'es' ? '⏳ Pendiente' : '⏳ Pending')}
+                                    </span>
+                                    <button
+                                      className="btn-secondary btn-xs"
+                                      style={{ padding: '2px 8px', height: '22px', minHeight: 'unset', fontSize: '11px' }}
+                                      onClick={async () => {
+                                        try { await navigator.clipboard.writeText(url); } catch { /* ignore */ }
+                                        showToast(language === 'es' ? '🔗 Enlace del anexo copiado' : '🔗 Amendment link copied', 'success');
+                                      }}
+                                    >
+                                      🔗 {language === 'es' ? 'Copiar enlace' : 'Copy link'}
+                                    </button>
+                                    {firmado && a.signature_url && (
+                                      <button
+                                        className="btn-secondary btn-xs"
+                                        style={{ padding: '2px 8px', height: '22px', minHeight: 'unset', fontSize: '11px' }}
+                                        onClick={() => {
+                                          setLightboxUrl(a.signature_url!);
+                                          setLightboxTitle(language === 'es' ? `Firma del Anexo Nº ${a.number}` : `Amendment No. ${a.number} signature`);
+                                        }}
+                                      >
+                                        👁️ {language === 'es' ? 'Ver firma' : 'View signature'}
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            })}
+
+                          {/* Cambio de bici: solo con un alquiler vivo */}
+                          {latestRental && latestRental.status !== 'Inactivo' && (
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '10px' }}>
+                              <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>🔄 {language === 'es' ? 'Bicicleta asignada:' : 'Assigned bike:'}</span>
+                              <button
+                                className="btn-secondary btn-xs"
+                                style={{ padding: '2px 8px', height: '22px', minHeight: 'unset', fontSize: '11px' }}
+                                onClick={() => {
+                                  setSwapModalRentalId(latestRental.id);
+                                  setSwapNewBikeId('');
+                                  setSwapEffectiveDate(new Date().toISOString().split('T')[0]);
+                                  setSwapOldBikeStatus('Requiere Service');
+                                  setSwapBatteryIds(
+                                    rentalItems.filter(i => i.rental_id === latestRental.id && i.item_type === 'battery').map(i => i.product_id)
+                                  );
+                                  setSwapKeepLock(true);
+                                  setSwapNewLockId('');
+                                  setSwapRate(latestRental.rental_rate);
+                                  setSwapDeposit(latestRental.deposit_amount);
+                                }}
+                              >
+                                🔄 {language === 'es' ? 'Cambiar bici' : 'Swap bike'}
+                              </button>
+                            </div>
+                          )}
+
                           {/* Digital rental agreement */}
                           {(() => {
                             if (!latestRental || latestRental.contract_type !== 'digital') return null;
@@ -12376,7 +13010,8 @@ USING (true);`;
                                 existingId: icl ? icl.id : null,
                                 customerName: `${cust.first_name} ${cust.last_name}`.trim(),
                                 bikeModel: icl?.bike_model || bike?.name || '',
-                                bikeSerial: icl?.bike_serial || bike?.serial_number || '',
+                                bikeSerial: icl?.bike_serial || bike?.frame_serial || '',
+                                bikeRef: icl?.bike_ref || bike?.serial_number || '',
                                 deliveryDate: icl?.delivery_date || new Date().toISOString().split('T')[0],
                               });
                               setEditInternalValue(icl
@@ -18740,6 +19375,168 @@ USING (true);`;
 
 
       {/* MODAL: Edit Rental Details */}
+      {/* MODAL: cambiar la bici de un alquiler vivo */}
+      {swapModalRentalId && (() => {
+        const rental = rentals.find(r => r.id === swapModalRentalId);
+        if (!rental) return null;
+        const oldBike = products.find(p => p.id === rental.bike_id);
+        const cust = customers.find(c => c.id === rental.customer_id);
+        const availableBikes = products.filter(p => p.category_id === catBikeId && p.status === 'Disponible' && p.id !== rental.bike_id);
+        const currentLock = rentalItems
+          .filter(i => i.rental_id === rental.id && i.item_type === 'kit_accessory')
+          .map(i => products.find(p => p.id === i.product_id))
+          .find(p => p && p.category_id === catLockId) || null;
+        const availableLocks = products.filter(p => p.category_id === catLockId && p.status === 'Disponible');
+        const assignedBatteries = swapBatteryIds.map(id => products.find(p => p.id === id)).filter(Boolean) as Product[];
+        const freeBatteries = products.filter(p => p.category_id === catBattId && p.status === 'Disponible' && !swapBatteryIds.includes(p.id));
+        const newBike = products.find(p => p.id === swapNewBikeId);
+
+        return (
+          <div className="modal-overlay" style={{ zIndex: 1200 }}>
+            <div className="modal-content" style={{ maxWidth: '520px', maxHeight: '90vh', overflowY: 'auto' }}>
+              <div className="modal-header">
+                <h3>🔄 {language === 'es' ? 'Cambiar Bicicleta' : 'Swap Bike'}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => setSwapModalRentalId(null)}>✕</button>
+              </div>
+              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+
+                <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                  {language === 'es' ? 'Rider' : 'Rider'}: <strong style={{ color: 'var(--text-bright)' }}>{cust ? `${cust.first_name} ${cust.last_name}` : '—'}</strong>
+                  {' · '}{language === 'es' ? 'Bici actual' : 'Current bike'}: <strong style={{ color: 'var(--text-bright)' }}>{oldBike?.serial_number ?? '—'}</strong>
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">🚲 {language === 'es' ? 'Nueva bicicleta' : 'New bike'}</label>
+                  <select className="form-control" value={swapNewBikeId} onChange={e => setSwapNewBikeId(e.target.value)}>
+                    <option value="">{language === 'es' ? '-- Seleccione --' : '-- Select --'}</option>
+                    {availableBikes.map(b => (
+                      <option key={b.id} value={b.id}>{b.serial_number} — {b.name}</option>
+                    ))}
+                  </select>
+                  {availableBikes.length === 0 && (
+                    <small style={{ color: '#fb923c', fontSize: '11px' }}>
+                      {language === 'es' ? 'No hay bicicletas disponibles.' : 'No available bikes.'}
+                    </small>
+                  )}
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">📅 {language === 'es' ? 'Fecha de efecto' : 'Effective date'}</label>
+                  <input type="date" className="form-control" value={swapEffectiveDate} onChange={e => setSwapEffectiveDate(e.target.value)} />
+                  <small style={{ color: 'var(--text-muted)', fontSize: '11px' }}>
+                    {language === 'es'
+                      ? 'Los cobros anteriores a esta fecha siguen contando para la bici saliente.'
+                      : 'Payments before this date remain attributed to the outgoing bike.'}
+                  </small>
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">📦 {language === 'es' ? 'La bici saliente pasa a' : 'Outgoing bike goes to'}</label>
+                  <select className="form-control" value={swapOldBikeStatus} onChange={e => setSwapOldBikeStatus(e.target.value as 'Requiere Service' | 'Disponible')}>
+                    <option value="Requiere Service">{language === 'es' ? '🔧 Requiere Service' : '🔧 Needs Service'}</option>
+                    <option value="Disponible">{language === 'es' ? '✅ Disponible' : '✅ Available'}</option>
+                  </select>
+                </div>
+
+                {/* Baterias */}
+                <div className="form-group" style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px' }}>
+                  <label className="form-label" style={{ fontWeight: 'bold' }}>🔋 {language === 'es' ? 'Baterías' : 'Batteries'}</label>
+                  {assignedBatteries.length === 0 && (
+                    <p style={{ fontSize: '12px', color: 'var(--text-muted)', margin: '4px 0' }}>
+                      {language === 'es' ? 'Ninguna asignada.' : 'None assigned.'}
+                    </p>
+                  )}
+                  {assignedBatteries.map(b => (
+                    <div key={b.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px', padding: '3px 0' }}>
+                      <span>{b.serial_number}</span>
+                      <button className="btn-xs btn-secondary" style={{ color: '#ef4444' }}
+                        onClick={() => setSwapBatteryIds(prev => prev.filter(x => x !== b.id))}>
+                        {language === 'es' ? 'Quitar' : 'Remove'}
+                      </button>
+                    </div>
+                  ))}
+                  {freeBatteries.length > 0 && (
+                    <select className="form-control" style={{ marginTop: '6px' }} value=""
+                      onChange={e => { if (e.target.value) setSwapBatteryIds(prev => [...prev, e.target.value]); }}>
+                      <option value="">{language === 'es' ? '+ Agregar batería...' : '+ Add battery...'}</option>
+                      {freeBatteries.map(b => <option key={b.id} value={b.id}>{b.serial_number}</option>)}
+                    </select>
+                  )}
+                </div>
+
+                {/* Candado */}
+                <div className="form-group" style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px' }}>
+                  <label className="form-label" style={{ fontWeight: 'bold' }}>🔒 {language === 'es' ? 'Candado' : 'Lock'}</label>
+                  <p style={{ fontSize: '12px', color: 'var(--text-muted)', margin: '4px 0' }}>
+                    {currentLock
+                      ? (language === 'es' ? `¿Sigue con el mismo candado (${currentLock.serial_number})?` : `Keeps the same lock (${currentLock.serial_number})?`)
+                      : (language === 'es' ? 'Este alquiler no tiene candado asignado.' : 'This rental has no lock assigned.')}
+                  </p>
+                  {currentLock && (
+                    <div style={{ display: 'flex', gap: '14px', fontSize: '12px' }}>
+                      <label style={{ display: 'flex', gap: '5px', cursor: 'pointer' }}>
+                        <input type="radio" checked={swapKeepLock} onChange={() => setSwapKeepLock(true)} />
+                        {language === 'es' ? 'Sí, el mismo' : 'Yes, same one'}
+                      </label>
+                      <label style={{ display: 'flex', gap: '5px', cursor: 'pointer' }}>
+                        <input type="radio" checked={!swapKeepLock} onChange={() => setSwapKeepLock(false)} />
+                        {language === 'es' ? 'No, otro' : 'No, another'}
+                      </label>
+                    </div>
+                  )}
+                  {(!swapKeepLock || !currentLock) && (
+                    <select className="form-control" style={{ marginTop: '8px' }} value={swapNewLockId} onChange={e => setSwapNewLockId(e.target.value)}>
+                      <option value="">{language === 'es' ? '-- Sin candado --' : '-- No lock --'}</option>
+                      {availableLocks.map(l => <option key={l.id} value={l.id}>{l.serial_number} — {l.name}</option>)}
+                    </select>
+                  )}
+                </div>
+
+                {/* Condiciones economicas */}
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+                  <div className="form-group">
+                    <label className="form-label">💶 {language === 'es' ? 'Tarifa (€)' : 'Rate (€)'}</label>
+                    <NumberField className="form-control" value={swapRate} onValueChange={v => setSwapRate(v ?? 0)} />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">🏦 {language === 'es' ? 'Depósito (€)' : 'Deposit (€)'}</label>
+                    <NumberField className="form-control" value={swapDeposit} onValueChange={v => setSwapDeposit(v ?? 0)} />
+                  </div>
+                </div>
+
+                {/* Resumen de lo que va a cambiar */}
+                {swapNewBikeId && (
+                  <div style={{ background: 'rgba(16,185,129,0.06)', border: '1px solid rgba(16,185,129,0.15)', borderRadius: '8px', padding: '10px', fontSize: '12px' }}>
+                    <strong style={{ color: 'var(--color-primary)' }}>{language === 'es' ? 'Se registrará:' : 'Will be recorded:'}</strong>
+                    <div style={{ marginTop: '4px' }}>
+                      {oldBike?.serial_number} → {newBike?.serial_number}
+                      {swapRate !== rental.rental_rate && <> · {language === 'es' ? 'tarifa' : 'rate'} €{fmt1(rental.rental_rate)} → €{fmt1(swapRate)}</>}
+                      {swapDeposit !== rental.deposit_amount && <> · {language === 'es' ? 'depósito' : 'deposit'} €{fmt1(rental.deposit_amount)} → €{fmt1(swapDeposit)}</>}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="modal-footer" style={{ display: 'flex', gap: '10px', marginTop: '16px' }}>
+                <button className="btn-secondary" style={{ flex: 1 }} onClick={() => setSwapModalRentalId(null)}>
+                  {language === 'es' ? 'Cancelar' : 'Cancel'}
+                </button>
+                <button
+                  className="btn-primary"
+                  style={{ flex: 2 }}
+                  disabled={!swapNewBikeId || swapSubmitting}
+                  onClick={() => handleConfirmBikeSwap(rental)}
+                >
+                  {swapSubmitting
+                    ? (language === 'es' ? '⏳ Aplicando...' : '⏳ Applying...')
+                    : (language === 'es' ? '🔄 Confirmar cambio' : '🔄 Confirm swap')}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {editRentalModalOpen && (
         <div className="modal-overlay" style={{ zIndex: 1100 }}>
           <div className="modal-content" style={{ maxWidth: '480px', maxHeight: '90vh', overflowY: 'auto' }}>
@@ -19140,7 +19937,7 @@ USING (true);`;
         const bike = selectedProductId ? products.find(p => p.id === selectedProductId) : null;
         if (!bike) return null;
 
-        const stats = calculateProductROI(bike.id, products, categories, rentals, rentalItems, payments, expenses, records);
+        const stats = calculateProductROI(bike.id, products, categories, rentals, rentalItems, payments, expenses, records, bikeAssignments);
         const totalRevenues = stats ? stats.totalPaid + (bike.status === 'Vendida' ? (bike.price_sold || 0) : 0) : 0;
         const totalExpenses = stats ? stats.cost + stats.totalExp : 0;
         const netProfit = totalRevenues - totalExpenses;
@@ -21982,7 +22779,7 @@ USING (true);`;
         const prod = products.find(p => p.id === selectedProductId);
         if (!prod) return null;
 
-        const stats = calculateProductROI(prod.id, products, categories, rentals, rentalItems, payments, expenses, records);
+        const stats = calculateProductROI(prod.id, products, categories, rentals, rentalItems, payments, expenses, records, bikeAssignments);
 
         // 1. Gather all events (ledger items)
         const ledgerItems: { date: string; description: string; amount: number; type: 'cost' | 'sale' | 'payment' | 'deposit' | 'expense' }[] = [];
@@ -23861,6 +24658,7 @@ USING (true);`;
               {[
                 ['E-Bike Model', editInternalChecklist.bikeModel || '—'],
                 ['E-Bike Serial Number', editInternalChecklist.bikeSerial || '—'],
+                ['Unit Reference', editInternalChecklist.bikeRef || '—'],
                 ['Date', editInternalChecklist.deliveryDate],
               ].map(([label, val]) => (
                 <div key={label} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0', fontSize: '13px' }}>
@@ -23893,6 +24691,7 @@ USING (true);`;
                       customerName: editInternalChecklist.customerName,
                       bikeModel: editInternalChecklist.bikeModel,
                       bikeSerial: editInternalChecklist.bikeSerial,
+                      bikeRef: editInternalChecklist.bikeRef,
                       deliveryDate: editInternalChecklist.deliveryDate,
                       value: editInternalValue,
                     });
@@ -23942,6 +24741,7 @@ USING (true);`;
               {[
                 ['E-Bike Model', viewChecklist.bike_model || '—'],
                 ['E-Bike Serial Number', viewChecklist.bike_serial || '—'],
+                ['Unit Reference', viewChecklist.bike_ref || '—'],
                 ['Date', viewChecklist.delivery_date],
                 ['Battery Charge Level', viewChecklist.battery_level || '—'],
                 ['Customer Name', viewChecklist.customer_name],
