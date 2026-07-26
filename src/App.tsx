@@ -43,10 +43,11 @@ import {
   getTaskCards, upsertTaskCard, deleteTaskCard,
   getTaskItems, upsertTaskItem, deleteTaskItem,
   getColorTags, upsertColorTag, deleteColorTag,
+  getStockAlarms, upsertStockAlarm, deleteStockAlarm, claimStockAlarm, rearmStockAlarm,
   uploadChecklistSignature, createDeliveryChecklist, getDeliveryChecklist, getDeliveryChecklists, submitDeliveryChecklist,
   createInternalChecklist, updateDeliveryChecklist,
 } from './db';
-import type { AllowedEmail, BikeModification, DeliveryChecklist, RentalContractSnapshot, RentalContractAmendment, AmendmentChange } from './db';
+import type { AllowedEmail, BikeModification, DeliveryChecklist, RentalContractSnapshot, RentalContractAmendment, AmendmentChange, StockAlarm } from './db';
 import { downloadBackupXlsx } from './backup';
 import { formatDate as fmtDMY, formatDateTime as fmtDMYTime } from './utils/date';
 import { DocumentsView } from './invoicing/DocumentsView';
@@ -58,6 +59,7 @@ import {
 } from './invoicing/api';
 import type { FiscalDocument } from './invoicing/types';
 import { matchInvoicesToPayments } from './invoicing/paymentInvoices';
+import { stockBySku, evaluateAlarms } from './stock/alarms';
 import {
   getBusinessExpenses, insertBusinessExpense, deleteBusinessExpense,
   getExpenseCategories as getDbExpenseCategories,
@@ -438,6 +440,11 @@ function isWithinLast30Days(dateStr: string | null | undefined): boolean {
 }
 
 // Helper to send emails securely via Supabase Edge Function
+// Destinatario por defecto de las alarmas de stock. Se guarda en cada
+// alarma y se puede cambiar en el modal, para no tener que tocar codigo
+// si manaña avisa otra persona.
+const ALARM_DEFAULT_EMAIL = 'emilianoaguilera1990@outlook.com';
+
 async function executeEmailSend(to: string, subject: string, html: string) {
   if (!to || !to.trim()) {
     console.warn('[EMAIL] Cannot send email: recipient address is empty.');
@@ -453,6 +460,54 @@ async function executeEmailSend(to: string, subject: string, html: string) {
   } catch (err: any) {
     console.error(`[EMAIL ERROR] Failed to send email to ${to}:`, err.message || err);
   }
+}
+
+// Aviso de stock bajo. Va en ingles como el resto de los correos que
+// salen del sistema, y lleva el umbral ademas de la cantidad: sin el, el
+// que lo recibe no sabe si 3 unidades es un problema o lo normal.
+async function sendStockAlarmEmail(
+  alarm: { product_key: string; label: string; threshold: number; notify_email: string },
+  productName: string,
+  qty: number,
+) {
+  const destino = (alarm.notify_email || '').trim() || ALARM_DEFAULT_EMAIL;
+  const etiqueta = alarm.label ? ` (${alarm.label})` : '';
+  const agotado = qty === 0;
+  const subject = agotado
+    ? `Out of stock: ${productName}`
+    : `Low stock: ${productName} — ${qty} left`;
+
+  const html = `
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+                font-size:15px;line-height:1.6;color:#1a1a1a;max-width:560px">
+      <p style="font-size:22px;margin:0 0 4px">${agotado ? '🚨' : '⚠️'}</p>
+      <h2 style="margin:0 0 12px;font-size:18px">
+        ${agotado ? 'Out of stock' : 'Stock below threshold'}${etiqueta}
+      </h2>
+      <p><strong>${productName}</strong> has reached the level you configured.</p>
+      <table style="width:100%;font-size:14px;border-collapse:collapse;margin:14px 0;">
+        <tr>
+          <td style="padding:6px 0;color:#6b7280;">Item code</td>
+          <td style="padding:6px 0;text-align:right;font-weight:600;font-family:monospace;">${alarm.product_key}</td>
+        </tr>
+        <tr>
+          <td style="padding:6px 0;color:#6b7280;">Units left</td>
+          <td style="padding:6px 0;text-align:right;font-weight:700;color:${agotado ? '#dc2626' : '#b45309'};">${qty}</td>
+        </tr>
+        <tr>
+          <td style="padding:6px 0;color:#6b7280;">Alarm threshold</td>
+          <td style="padding:6px 0;text-align:right;font-weight:600;">${alarm.threshold}</td>
+        </tr>
+      </table>
+      <p style="color:#555">${agotado
+        ? 'There are no units left in stock.'
+        : 'Time to reorder before it runs out.'}</p>
+      <p style="margin-top:28px;padding-top:14px;border-top:1px solid #e4e4e4;font-size:12px;color:#777">
+        The Fast Sheep — automatic stock alarm
+      </p>
+    </div>`;
+
+  await executeEmailSend(destino, subject, html);
 }
 
 // DELIVERY CHECKLIST – content & emails
@@ -2677,6 +2732,13 @@ USING (true);`;
   // de Facturacion, porque el historial de cada alquiler enlaza sus pagos
   // con la factura correspondiente.
   const [documents,       setDocuments]       = useState<FiscalDocument[]>([]);
+  // Alarmas de stock. alarmModalSku es el serial del articulo cuyo modal
+  // esta abierto; alarmDrafts son las filas que se estan editando, para
+  // poder añadir y quitar varias antes de guardar.
+  const [stockAlarms,     setStockAlarms]     = useState<StockAlarm[]>([]);
+  const [alarmModalSku,   setAlarmModalSku]   = useState<string | null>(null);
+  const [alarmDrafts,     setAlarmDrafts]     = useState<StockAlarm[]>([]);
+  const [alarmSaving,     setAlarmSaving]     = useState(false);
   const [expenses,        setExpenses]        = useState<MaintenanceExpense[]>([]);
   const [leadCats,        setLeadCats]        = useState<LeadCategory[]>([]);
   const [leads,           setLeads]           = useState<Lead[]>([]);
@@ -2751,6 +2813,36 @@ USING (true);`;
     [documents, payments],
   );
 
+  // Unidades en stock por SKU y alarmas agrupadas por SKU. El mismo
+  // recuento que usa el disparo se muestra en el modal, para que no haya
+  // duda de contra que numero compara el umbral.
+  const stockQtyBySku = useMemo(() => stockBySku(products), [products]);
+  const alarmsBySku = useMemo(() => {
+    const m = new Map<string, StockAlarm[]>();
+    stockAlarms.forEach(a => {
+      const l = m.get(a.product_key);
+      if (l) l.push(a); else m.set(a.product_key, [a]);
+    });
+    return m;
+  }, [stockAlarms]);
+
+  const openAlarmModal = useCallback((sku: string) => {
+    setAlarmModalSku(sku);
+    // Si el articulo no tiene ninguna, se abre ya con una fila en blanco:
+    // el menu dice "Crear alarma", asi que llegar a una lista vacia y
+    // tener que pulsar "Añadir" seria un paso de mas.
+    const existentes = (alarmsBySku.get(sku) ?? []).map(a => ({ ...a }));
+    setAlarmDrafts(existentes.length > 0 ? existentes : [{
+      id: crypto.randomUUID(),
+      product_key: sku,
+      label: '',
+      threshold: 5,
+      notify_email: ALARM_DEFAULT_EMAIL,
+      active: true,
+      last_notified_qty: null,
+    }]);
+  }, [alarmsBySku]);
+
   // Abre el PDF de un documento. Si aun no se genero (p.ej. porque fallo el
   // envio al emitirlo), se genera en el momento y sin mandar email.
   const openDocumentPdf = useCallback(async (doc: FiscalDocument) => {
@@ -2775,7 +2867,7 @@ USING (true);`;
         rents, ri, pays, exps, lcs,
         lds, sups, supProds, plats, vehs,
         accs, acNotes, acEarns, evs, recs,
-        pms, qrs, sls, sis, fps, fpays, emts, docs
+        pms, qrs, sls, sis, fps, fpays, emts, docs, alarms
       ] = await Promise.all([
         getPrefixes(), getCategories(), getCustomFieldDefinitions(), getProducts(), getCustomers(),
         getRentals(), getRentalItems(), getPayments(), getExpenses(), getLeadCategories(),
@@ -2786,6 +2878,7 @@ USING (true);`;
         // Si la facturacion aun no esta migrada en este entorno, el resto
         // de la app tiene que cargar igual: se queda sin documentos.
         getDocuments().catch(() => [] as FiscalDocument[]),
+        getStockAlarms().catch(() => [] as StockAlarm[]),
       ]);
       setPrefixes(pf); setCategories(cats); setCustomFieldDefs(cfd);
       setProducts(prods); setCustomers(custs); setRentals(rents);
@@ -2795,7 +2888,7 @@ USING (true);`;
       setAppAccounts(accs); setAccountNotes(acNotes); setAccountEarnings(acEarns);
       setEvents(evs); setRecords(recs); setProductModels(pms); setQuickReplies(qrs);
       setSales(sls); setSaleItems(sis); setFinancingPlans(fps); setFinancingPaymentsData(fpays);
-      setEmailTemplates(emts); setDocuments(docs);
+      setEmailTemplates(emts); setDocuments(docs); setStockAlarms(alarms);
 
       // Automatically detect and fix duplicate customer codes
       deduplicateCustomerCodes(custs, setCustomers);
@@ -3212,8 +3305,69 @@ USING (true);`;
       }
     });
 
+    // Alarmas de stock por debajo de su umbral. Se listan siempre que
+    // sigan bajas, no solo el dia que saltaron: el correo avisa una vez,
+    // pero el panel tiene que seguir recordandolo mientras no se repone.
+    stockAlarms.forEach(a => {
+      if (!a.active || !stockQtyBySku.has(a.product_key)) return;
+      const qty = stockQtyBySku.get(a.product_key)!;
+      if (qty > a.threshold) return;
+      const prod = products.find(p => p.serial_number === a.product_key);
+      const nombre = prod?.name || a.product_key;
+      const etiqueta = a.label ? ` (${a.label})` : '';
+      alerts.push({
+        id: `stock-alarm-${a.id}`,
+        type: 'stock',
+        message: language === 'es'
+          ? `📦 Stock bajo${etiqueta}: ${nombre} — quedan ${qty} (umbral ${a.threshold})`
+          : `📦 Low stock${etiqueta}: ${nombre} — ${qty} left (threshold ${a.threshold})`,
+        priority: qty === 0 ? 'high' : 'normal',
+      });
+    });
+
     return alerts;
-  }, [events, products, catBikeId, language, financingPaymentsData, financingPlans, sales, saleItems, customers]);
+  }, [events, products, catBikeId, language, financingPaymentsData, financingPlans, sales, saleItems, customers, stockAlarms, stockQtyBySku]);
+
+  // Disparo de las alarmas de stock.
+  //
+  // Quien avisa se decide en la base (claim_stock_alarm): si la app esta
+  // abierta en dos sitios, las dos detectan la misma caida, pero solo una
+  // se queda el aviso y sale un unico correo.
+  //
+  // No se dispara mientras loading: durante la carga products puede estar
+  // a medias y un recuento incompleto mandaria un correo de "stock 0" de
+  // algo que si esta.
+  useEffect(() => {
+    if (loading || stockAlarms.length === 0) return;
+    let cancelado = false;
+
+    (async () => {
+      const { decisiones } = evaluateAlarms(stockAlarms, stockQtyBySku);
+      let huboCambios = false;
+
+      for (const d of decisiones) {
+        if (cancelado) return;
+        try {
+          if (d.disparar) {
+            if (!(await claimStockAlarm(d.alarm.id, d.qty))) continue;
+            huboCambios = true;
+            const prod = products.find(p => p.serial_number === d.alarm.product_key);
+            await sendStockAlarmEmail(d.alarm, prod?.name || d.alarm.product_key, d.qty);
+          } else if (d.rearmar) {
+            await rearmStockAlarm(d.alarm.id, d.qty);
+            huboCambios = true;
+          }
+        } catch (e) {
+          // Una alarma que falla no puede dejar sin evaluar a las demas.
+          console.error(`Alarma de stock ${d.alarm.product_key}:`, e);
+        }
+      }
+
+      if (huboCambios && !cancelado) setStockAlarms(await getStockAlarms());
+    })();
+
+    return () => { cancelado = true; };
+  }, [stockAlarms, stockQtyBySku, products, loading]);
 
   // ----------------------------------------------------------
   // MAINTENANCE LOG GROUPING BY MONTH
@@ -26051,6 +26205,181 @@ USING (true);`;
       {/* ===== GOOGLE AUTH ACCESS CONTROL WHITELIST MODAL ===== */}
       
       {/* ===== GLOBAL STOCK ACTIONS DROPDOWN ===== */}
+      {/* MODAL: Alarmas de stock de un articulo */}
+      {alarmModalSku !== null && (() => {
+        const sku = alarmModalSku;
+        const prodRef = products.find(p => p.serial_number === sku);
+        const qty = stockQtyBySku.get(sku) ?? 0;
+        const es = language === 'es';
+        const guardadas = alarmsBySku.get(sku) ?? [];
+
+        const cerrar = () => { setAlarmModalSku(null); setAlarmDrafts([]); };
+
+        const setDraft = (id: string, patch: Partial<StockAlarm>) =>
+          setAlarmDrafts(prev => prev.map(d => d.id === id ? { ...d, ...patch } : d));
+
+        const guardar = async () => {
+          setAlarmSaving(true);
+          try {
+            // Umbral invalido o vacio: se descarta la fila en vez de
+            // guardar una alarma que nunca saltaria.
+            const validas = alarmDrafts.filter(d => Number.isFinite(d.threshold) && d.threshold >= 0);
+            // Lo que estaba guardado y ya no esta en la lista, se borra.
+            const idsVivos = new Set(validas.map(d => d.id));
+            for (const g of guardadas) {
+              if (!idsVivos.has(g.id)) await deleteStockAlarm(g.id);
+            }
+            for (const d of validas) {
+              const antes = guardadas.find(g => g.id === d.id);
+              // Si se sube el umbral, la alarma se re-arma: con el umbral
+              // nuevo la situacion es otra y tiene que poder volver a
+              // avisar sin esperar a que el stock se reponga.
+              const cambioUmbral = antes && antes.threshold !== d.threshold;
+              await upsertStockAlarm({
+                ...d,
+                product_key: sku,
+                notify_email: (d.notify_email || '').trim() || ALARM_DEFAULT_EMAIL,
+                last_notified_qty: cambioUmbral ? null : d.last_notified_qty,
+              });
+            }
+            setStockAlarms(await getStockAlarms());
+            showToast(es ? 'Alarmas guardadas.' : 'Alarms saved.', 'success');
+            cerrar();
+          } catch (e) {
+            console.error('No se pudieron guardar las alarmas de stock:', e);
+            showToast(es ? 'No se pudieron guardar las alarmas.' : 'Could not save the alarms.', 'error');
+          } finally {
+            setAlarmSaving(false);
+          }
+        };
+
+        return (
+          <div className="modal-overlay" style={{ zIndex: 1250 }} onClick={cerrar}>
+            <div className="modal-content" style={{ maxWidth: '560px' }} onClick={e => e.stopPropagation()}>
+              <div className="modal-header">
+                <h3 style={{ margin: 0 }}>🔔 {es ? 'Alarmas de stock' : 'Stock alarms'}</h3>
+                <button className="btn-secondary btn-xs" onClick={cerrar}>✕</button>
+              </div>
+              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+
+                <div style={{ background: 'rgba(255,255,255,0.04)', padding: '10px 12px', borderRadius: '8px' }}>
+                  <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-bright)' }}>
+                    {prodRef?.name || sku}
+                  </div>
+                  <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '2px' }}>
+                    <span style={{ fontFamily: 'monospace' }}>{sku}</span>
+                    {' · '}
+                    {es ? 'en stock ahora' : 'in stock now'}: <strong style={{ color: 'var(--text-bright)' }}>{qty}</strong>
+                  </div>
+                </div>
+
+                <p style={{ fontSize: '11.5px', color: 'var(--text-muted)', margin: 0, lineHeight: 1.5 }}>
+                  {es
+                    ? 'Se avisa cuando las unidades en stock llegan al umbral o bajan de él. Con umbral 5, quedarse en 5 ya avisa. El aviso no se repite hasta que el stock se repone por encima del umbral y vuelve a caer.'
+                    : 'You are notified when units in stock reach the threshold or drop below it. With threshold 5, hitting 5 already notifies. It will not repeat until stock goes back above the threshold and falls again.'}
+                </p>
+
+                {alarmDrafts.length === 0 && (
+                  <p style={{ fontSize: '12px', color: 'var(--text-muted)', fontStyle: 'italic', margin: 0 }}>
+                    {es ? 'Sin alarmas. Añadí una abajo.' : 'No alarms. Add one below.'}
+                  </p>
+                )}
+
+                {alarmDrafts.map((d, idx) => {
+                  const saltaria = Number.isFinite(d.threshold) && qty <= d.threshold;
+                  return (
+                    <div key={d.id} style={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '12px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <strong style={{ fontSize: '12px', color: 'var(--text-bright)' }}>
+                          {es ? `Alarma ${idx + 1}` : `Alarm ${idx + 1}`}
+                        </strong>
+                        {saltaria && (
+                          <span style={{ fontSize: '10px', background: 'rgba(248,113,113,0.18)', color: '#f87171', padding: '2px 6px', borderRadius: '4px', fontWeight: 700 }}>
+                            {es ? 'ya por debajo' : 'already below'}
+                          </span>
+                        )}
+                        <label style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', color: 'var(--text-muted)', cursor: 'pointer' }}>
+                          <input
+                            type="checkbox"
+                            checked={d.active}
+                            onChange={e => setDraft(d.id, { active: e.target.checked })}
+                          />
+                          {es ? 'Activa' : 'Active'}
+                        </label>
+                        <button
+                          onClick={() => setAlarmDrafts(prev => prev.filter(x => x.id !== d.id))}
+                          title={es ? 'Quitar esta alarma' : 'Remove this alarm'}
+                          style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#f87171', fontSize: '13px', padding: '0 2px' }}
+                        >
+                          🗑️
+                        </button>
+                      </div>
+
+                      <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                        <div className="form-group" style={{ flex: '0 0 110px', marginBottom: 0 }}>
+                          <label className="form-label" style={{ fontSize: '11px' }}>{es ? 'Umbral' : 'Threshold'}</label>
+                          <NumberField
+                            className="form-control"
+                            value={d.threshold}
+                            onValueChange={v => setDraft(d.id, { threshold: v ?? 0 })}
+                          />
+                        </div>
+                        <div className="form-group" style={{ flex: 1, minWidth: '180px', marginBottom: 0 }}>
+                          <label className="form-label" style={{ fontSize: '11px' }}>{es ? 'Nombre (opcional)' : 'Label (optional)'}</label>
+                          <input
+                            type="text"
+                            className="form-control"
+                            value={d.label}
+                            placeholder={es ? 'Ej: aviso, crítico' : 'e.g. warning, critical'}
+                            onChange={e => setDraft(d.id, { label: e.target.value })}
+                          />
+                        </div>
+                      </div>
+
+                      <div className="form-group" style={{ marginBottom: 0 }}>
+                        <label className="form-label" style={{ fontSize: '11px' }}>{es ? 'Avisar a' : 'Notify'}</label>
+                        <input
+                          type="email"
+                          className="form-control"
+                          value={d.notify_email}
+                          placeholder={ALARM_DEFAULT_EMAIL}
+                          onChange={e => setDraft(d.id, { notify_email: e.target.value })}
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+
+                <button
+                  className="btn-secondary btn-xs"
+                  style={{ alignSelf: 'flex-start' }}
+                  onClick={() => setAlarmDrafts(prev => [...prev, {
+                    id: crypto.randomUUID(),
+                    product_key: sku,
+                    label: '',
+                    // Una por debajo de la mas baja que ya exista, que es
+                    // el uso normal: un segundo aviso mas critico.
+                    threshold: Math.max(0, Math.min(...prev.map(p => p.threshold), 5) - 1),
+                    notify_email: ALARM_DEFAULT_EMAIL,
+                    active: true,
+                    last_notified_qty: null,
+                  }])}
+                >
+                  ➕ {es ? 'Añadir alarma' : 'Add alarm'}
+                </button>
+
+                <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '4px' }}>
+                  <button className="btn-secondary" onClick={cerrar}>{es ? 'Cancelar' : 'Cancel'}</button>
+                  <button className="btn-primary" disabled={alarmSaving} onClick={guardar}>
+                    {alarmSaving ? (es ? 'Guardando…' : 'Saving…') : (es ? 'Guardar' : 'Save')}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {activeStockMenuId && menuCoords && activeStockMenuData && (() => {
         const { prod, group, hasRentals, isGeneric, hasAvailableStock } = activeStockMenuData;
         return (
@@ -26119,6 +26448,37 @@ USING (true);`;
                 }}
               >
                 ✏️ {t.edit}
+              </button>
+
+              {/* Alarmas de stock de este articulo. */}
+              <button
+                className="dropdown-item"
+                style={{
+                  width: '100%', textAlign: 'left', background: 'transparent', border: 'none',
+                  borderRadius: '6px', padding: '8px 12px', fontSize: '12px', color: 'var(--text-muted)',
+                  cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px',
+                  transition: 'all 0.2s ease'
+                }}
+                onClick={() => {
+                  setActiveStockMenuId(null);
+                  setMenuCoords(null);
+                  openAlarmModal(prod.serial_number);
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)';
+                  e.currentTarget.style.color = 'var(--text-bright)';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = 'transparent';
+                  e.currentTarget.style.color = 'var(--text-muted)';
+                }}
+              >
+                🔔 {language === 'es' ? 'Crear alarma' : 'Create alarm'}
+                {alarmsBySku.get(prod.serial_number)?.length
+                  ? <span style={{ marginLeft: 'auto', fontSize: '10px', background: 'rgba(251,191,36,0.18)', color: '#fbbf24', padding: '1px 6px', borderRadius: '4px', fontWeight: 700 }}>
+                      {alarmsBySku.get(prod.serial_number)!.length}
+                    </span>
+                  : null}
               </button>
 
               {/* Consumir para uso interno: descuenta stock sin venta. */}

@@ -2616,3 +2616,64 @@ export async function deleteColorTag(color: string): Promise<void> {
 
 
 
+
+// ============================================================
+// ALARMAS DE STOCK
+// Avisan cuando las unidades de un articulo caen a un umbral.
+// Se guardan contra el serial_number (el SKU que comparten todas las
+// unidades del lote), no contra el id de una fila: al vender la unidad
+// apuntada la alarma se quedaria huerfana justo cuando hace falta.
+// ============================================================
+
+export interface StockAlarm {
+  id: string;
+  product_key: string;      // serial_number del articulo vigilado
+  label: string;
+  threshold: number;        // avisa cuando las unidades son <= threshold
+  notify_email: string;
+  active: boolean;
+  // Cantidad del ultimo aviso. Es lo que evita repetir el correo en cada
+  // recarga: hasta que el stock no sube por encima del umbral, la alarma
+  // no se vuelve a armar. Null = nunca aviso.
+  last_notified_qty: number | null;
+  last_triggered_at?: string | null;
+  created_at?: string;
+  created_by?: string | null;
+}
+
+export async function getStockAlarms(): Promise<StockAlarm[]> {
+  const { data, error } = await supabase
+    .from('stock_alarms')
+    .select('*')
+    .order('product_key', { ascending: true })
+    .order('threshold', { ascending: false });
+  if (error) throw error;
+  return (data ?? []) as StockAlarm[];
+}
+
+export async function upsertStockAlarm(alarm: StockAlarm): Promise<void> {
+  const { error } = await supabase.from('stock_alarms').upsert(alarm);
+  if (error) throw error;
+}
+
+export async function deleteStockAlarm(id: string): Promise<void> {
+  const { error } = await supabase.from('stock_alarms').delete().eq('id', id);
+  if (error) throw error;
+}
+
+// Pide permiso para avisar de esta alarma. Devuelve true solo a quien se
+// lo queda: la comprobacion y la marca ocurren en la misma sentencia del
+// lado de Postgres, asi que con la app abierta en dos pestañas el correo
+// sale una vez y no dos.
+export async function claimStockAlarm(id: string, qty: number): Promise<boolean> {
+  const { data, error } = await supabase.rpc('claim_stock_alarm', { p_id: id, p_qty: qty });
+  if (error) throw error;
+  return data === true;
+}
+
+// Deja la alarma lista para volver a avisar cuando el stock se repuso por
+// encima del umbral.
+export async function rearmStockAlarm(id: string, qty: number): Promise<void> {
+  const { error } = await supabase.rpc('rearm_stock_alarm', { p_id: id, p_qty: qty });
+  if (error) throw error;
+}
