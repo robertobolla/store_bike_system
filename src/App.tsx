@@ -54,8 +54,10 @@ import { ExpensesView } from './invoicing/ExpensesView';
 import { RentalDocuments } from './invoicing/RentalDocuments';
 import {
   issueRentalInvoice, issueDepositReceipt, generateDocumentPdf, generateDocumentPdfBatch,
-  markOldestPendingRentalInvoicePaid,
+  markOldestPendingRentalInvoicePaid, getDocuments, getDocumentPdfUrl,
 } from './invoicing/api';
+import type { FiscalDocument } from './invoicing/types';
+import { matchInvoicesToPayments } from './invoicing/paymentInvoices';
 import {
   getBusinessExpenses, insertBusinessExpense, deleteBusinessExpense,
   getExpenseCategories as getDbExpenseCategories,
@@ -2671,6 +2673,10 @@ USING (true);`;
   const [bikeAssignments, setBikeAssignments] = useState<RentalBikeAssignment[]>([]);
   const [contractAmendments, setContractAmendments] = useState<RentalContractAmendment[]>([]);
   const [payments,        setPayments]        = useState<RentalPayment[]>([]);
+  // Documentos fiscales emitidos. Se cargan aqui, y no solo en la pantalla
+  // de Facturacion, porque el historial de cada alquiler enlaza sus pagos
+  // con la factura correspondiente.
+  const [documents,       setDocuments]       = useState<FiscalDocument[]>([]);
   const [expenses,        setExpenses]        = useState<MaintenanceExpense[]>([]);
   const [leadCats,        setLeadCats]        = useState<LeadCategory[]>([]);
   const [leads,           setLeads]           = useState<Lead[]>([]);
@@ -2738,6 +2744,25 @@ USING (true);`;
     setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 4500);
   }, []);
 
+  // Factura de cada pago, para poder abrirla desde el historial del
+  // alquiler. El emparejamiento vive en su propio modulo, con pruebas.
+  const invoiceByPaymentId = useMemo(
+    () => matchInvoicesToPayments(documents, payments),
+    [documents, payments],
+  );
+
+  // Abre el PDF de un documento. Si aun no se genero (p.ej. porque fallo el
+  // envio al emitirlo), se genera en el momento y sin mandar email.
+  const openDocumentPdf = useCallback(async (doc: FiscalDocument) => {
+    try {
+      const path = doc.pdf_url ?? (await generateDocumentPdf(doc.id, false)).pdf_url;
+      window.open(await getDocumentPdfUrl(path), '_blank');
+    } catch (e) {
+      console.error('No se pudo abrir el PDF del documento:', e);
+      showToast(language === 'es' ? 'No se pudo abrir la factura.' : 'Could not open the invoice.', 'error');
+    }
+  }, [language, showToast]);
+
   // ----------------------------------------------------------
   // ASYNC DATA LOADER
   // ----------------------------------------------------------
@@ -2750,7 +2775,7 @@ USING (true);`;
         rents, ri, pays, exps, lcs,
         lds, sups, supProds, plats, vehs,
         accs, acNotes, acEarns, evs, recs,
-        pms, qrs, sls, sis, fps, fpays, emts
+        pms, qrs, sls, sis, fps, fpays, emts, docs
       ] = await Promise.all([
         getPrefixes(), getCategories(), getCustomFieldDefinitions(), getProducts(), getCustomers(),
         getRentals(), getRentalItems(), getPayments(), getExpenses(), getLeadCategories(),
@@ -2758,6 +2783,9 @@ USING (true);`;
         getAppAccounts(), getAccountNotes(), getAccountEarnings(), getEvents(), getRecords(),
         getProductModels(), getQuickReplies(),
         getSales(), getSaleItems(), getFinancingPlans(), getFinancingPayments(), getEmailTemplates(),
+        // Si la facturacion aun no esta migrada en este entorno, el resto
+        // de la app tiene que cargar igual: se queda sin documentos.
+        getDocuments().catch(() => [] as FiscalDocument[]),
       ]);
       setPrefixes(pf); setCategories(cats); setCustomFieldDefs(cfd);
       setProducts(prods); setCustomers(custs); setRentals(rents);
@@ -2767,7 +2795,7 @@ USING (true);`;
       setAppAccounts(accs); setAccountNotes(acNotes); setAccountEarnings(acEarns);
       setEvents(evs); setRecords(recs); setProductModels(pms); setQuickReplies(qrs);
       setSales(sls); setSaleItems(sis); setFinancingPlans(fps); setFinancingPaymentsData(fpays);
-      setEmailTemplates(emts);
+      setEmailTemplates(emts); setDocuments(docs);
 
       // Automatically detect and fix duplicate customer codes
       deduplicateCustomerCodes(custs, setCustomers);
@@ -13758,7 +13786,7 @@ USING (true);`;
                             const bike = products.find(p => p.id === r.bike_id);
                             
                             // Chronological events timeline
-                            const rentalEvents: { id: string | null, date: string, text: string, type: string, desc?: string, photos?: string[], regIndex: number }[] = [
+                            const rentalEvents: { id: string | null, date: string, text: string, type: string, desc?: string, photos?: string[], invoice?: FiscalDocument | null, regIndex: number }[] = [
                               { id: null, date: r.start_date, text: language === 'es' ? '🚲 Alquilado (Inicio)' : '🚲 Rented (Start)', type: 'start', regIndex: 0 },
                               { id: null, date: r.start_date, text: (language === 'es' ? `🔒 Depósito: €${fmt2(r.deposit_amount)}` : `🔒 Deposit: €${fmt2(r.deposit_amount)}`) + (r.deposit_received_via ? ` (${r.deposit_received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''), type: 'deposit', regIndex: 1 },
                               ...expenses
@@ -13785,6 +13813,7 @@ USING (true);`;
                                       : (language === 'es' ? `💵 Pago renta: €${fmt2(p.amount)}` : `💵 Rent payment: €${fmt2(p.amount)}`)) + (p.received_via ? ` (${p.received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''),
                                     type: 'payment',
                                     desc: note,
+                                    invoice: invoiceByPaymentId.get(p.id) ?? null,
                                     regIndex: 1000 - idx
                                   };
                                 }),
@@ -13893,6 +13922,25 @@ USING (true);`;
                                           <span style={{ fontStyle: 'italic', fontSize: '10.5px', color: 'var(--text-muted)', marginLeft: '6px' }}>
                                             ({ev.desc})
                                           </span>
+                                        )}
+                                        {ev.type === 'payment' && ev.invoice && (
+                                          <button
+                                            onClick={() => openDocumentPdf(ev.invoice!)}
+                                            title={language === 'es' ? 'Abrir la factura de este pago' : 'Open this payment\'s invoice'}
+                                            style={{
+                                              background: 'none',
+                                              border: 'none',
+                                              padding: '0 4px',
+                                              marginLeft: '6px',
+                                              cursor: 'pointer',
+                                              fontSize: '10.5px',
+                                              fontWeight: 600,
+                                              color: 'var(--color-primary)',
+                                              textDecoration: 'underline',
+                                            }}
+                                          >
+                                            🧾 {ev.invoice.number}
+                                          </button>
                                         )}
                                       </div>
                                       {ev.type === 'payment' && ev.id && (
