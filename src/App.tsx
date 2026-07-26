@@ -462,9 +462,10 @@ async function executeEmailSend(to: string, subject: string, html: string) {
   }
 }
 
-// Aviso de stock bajo. Va en ingles como el resto de los correos que
-// salen del sistema, y lleva el umbral ademas de la cantidad: sin el, el
-// que lo recibe no sabe si 3 unidades es un problema o lo normal.
+// Aviso de stock bajo. Va en español, a diferencia de las facturas: este
+// correo es interno, lo lee el equipo, no el cliente. Lleva el umbral
+// ademas de la cantidad porque sin el no se sabe si 3 unidades es un
+// problema o lo normal para ese articulo.
 async function sendStockAlarmEmail(
   alarm: { product_key: string; label: string; threshold: number; notify_email: string },
   productName: string,
@@ -474,36 +475,36 @@ async function sendStockAlarmEmail(
   const etiqueta = alarm.label ? ` (${alarm.label})` : '';
   const agotado = qty === 0;
   const subject = agotado
-    ? `Out of stock: ${productName}`
-    : `Low stock: ${productName} — ${qty} left`;
+    ? `Sin stock: ${productName}`
+    : `Stock bajo: ${productName} — quedan ${qty}`;
 
   const html = `
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
                 font-size:15px;line-height:1.6;color:#1a1a1a;max-width:560px">
       <p style="font-size:22px;margin:0 0 4px">${agotado ? '🚨' : '⚠️'}</p>
       <h2 style="margin:0 0 12px;font-size:18px">
-        ${agotado ? 'Out of stock' : 'Stock below threshold'}${etiqueta}
+        ${agotado ? 'Sin stock' : 'Stock por debajo del umbral'}${etiqueta}
       </h2>
-      <p><strong>${productName}</strong> has reached the level you configured.</p>
+      <p><strong>${productName}</strong> llegó al nivel que configuraste.</p>
       <table style="width:100%;font-size:14px;border-collapse:collapse;margin:14px 0;">
         <tr>
-          <td style="padding:6px 0;color:#6b7280;">Item code</td>
+          <td style="padding:6px 0;color:#6b7280;">Código del artículo</td>
           <td style="padding:6px 0;text-align:right;font-weight:600;font-family:monospace;">${alarm.product_key}</td>
         </tr>
         <tr>
-          <td style="padding:6px 0;color:#6b7280;">Units left</td>
+          <td style="padding:6px 0;color:#6b7280;">Unidades restantes</td>
           <td style="padding:6px 0;text-align:right;font-weight:700;color:${agotado ? '#dc2626' : '#b45309'};">${qty}</td>
         </tr>
         <tr>
-          <td style="padding:6px 0;color:#6b7280;">Alarm threshold</td>
+          <td style="padding:6px 0;color:#6b7280;">Umbral de la alarma</td>
           <td style="padding:6px 0;text-align:right;font-weight:600;">${alarm.threshold}</td>
         </tr>
       </table>
       <p style="color:#555">${agotado
-        ? 'There are no units left in stock.'
-        : 'Time to reorder before it runs out.'}</p>
+        ? 'No quedan unidades en stock.'
+        : 'Conviene reponer antes de que se agote.'}</p>
       <p style="margin-top:28px;padding-top:14px;border-top:1px solid #e4e4e4;font-size:12px;color:#777">
-        The Fast Sheep — automatic stock alarm
+        The Fast Sheep — alarma de stock automática
       </p>
     </div>`;
 
