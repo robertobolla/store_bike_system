@@ -44,6 +44,7 @@ import {
   getTaskItems, upsertTaskItem, deleteTaskItem,
   getColorTags, upsertColorTag, deleteColorTag,
   getStockAlarms, upsertStockAlarm, deleteStockAlarm, claimStockAlarm, rearmStockAlarm,
+  bulkCreateProducts,
   uploadChecklistSignature, createDeliveryChecklist, getDeliveryChecklist, getDeliveryChecklists, submitDeliveryChecklist,
   createInternalChecklist, updateDeliveryChecklist,
 } from './db';
@@ -61,6 +62,11 @@ import type { FiscalDocument } from './invoicing/types';
 import { matchInvoicesToPayments } from './invoicing/paymentInvoices';
 import { stockBySku, evaluateAlarms } from './stock/alarms';
 import {
+  COLUMNS as IMPORT_COLUMNS, parseProductRows, mapHeaders, parseCsv,
+  buildTemplateAoA, buildInstructionsAoA,
+} from './stock/bulkImport';
+import type { ProductDraft, RowIssue } from './stock/bulkImport';
+import {
   getBusinessExpenses, insertBusinessExpense, deleteBusinessExpense,
   getExpenseCategories as getDbExpenseCategories,
   insertExpenseCategory, updateExpenseCategory, deleteExpenseCategory,
@@ -70,6 +76,10 @@ import { noVat, addVat as addVatHelper } from './invoicing/money';
 
 
 import heic2any from 'heic2any';
+// Estatico y no dinamico a proposito: backup.ts ya importa xlsx de forma
+// estatica, asi que cargarlo bajo demanda aqui no ahorraria nada y el
+// build avisa de que el import dinamico no tiene efecto.
+import * as XLSX from 'xlsx';
 
 // Redondea un importe a dos decimales para guardarlo en base de datos.
 // El EPSILON evita que casos como 1.005 caigan al centimo de abajo por
@@ -2740,6 +2750,14 @@ USING (true);`;
   const [alarmModalSku,   setAlarmModalSku]   = useState<string | null>(null);
   const [alarmDrafts,     setAlarmDrafts]     = useState<StockAlarm[]>([]);
   const [alarmSaving,     setAlarmSaving]     = useState(false);
+  // Carga masiva de productos desde CSV / Excel / Google Sheet.
+  const [bulkOpen,        setBulkOpen]        = useState(false);
+  const [bulkFileName,    setBulkFileName]   = useState('');
+  const [bulkDrafts,      setBulkDrafts]      = useState<ProductDraft[]>([]);
+  const [bulkIssues,      setBulkIssues]      = useState<RowIssue[]>([]);
+  const [bulkSheetUrl,    setBulkSheetUrl]    = useState('');
+  const [bulkBusy,        setBulkBusy]        = useState<'' | 'leyendo' | 'importando'>('');
+  const [bulkResult,      setBulkResult]      = useState<{ created: number; failed: { serial: string; message: string }[] } | null>(null);
   const [expenses,        setExpenses]        = useState<MaintenanceExpense[]>([]);
   const [leadCats,        setLeadCats]        = useState<LeadCategory[]>([]);
   const [leads,           setLeads]           = useState<Lead[]>([]);
@@ -2843,6 +2861,162 @@ USING (true);`;
       last_notified_qty: null,
     }]);
   }, [alarmsBySku]);
+
+  // ----------------------------------------------------------
+  // CARGA MASIVA DE PRODUCTOS
+  // ----------------------------------------------------------
+
+  // Plantilla en Excel: una hoja para completar y otra con la explicacion
+  // de cada columna. Se genera desde las mismas definiciones que usa el
+  // validador, asi que la plantilla y lo que se acepta al subir no pueden
+  // divergir.
+  const downloadImportTemplate = useCallback(async () => {
+    // Los ejemplos y la lista de categorias validas salen de las
+    // categorias reales del proyecto: son editables, asi que una
+    // plantilla con nombres fijos traeria ejemplos que la propia
+    // importacion rechaza.
+    const nombresCategorias = categories.map(c => c.name_es || c.name_en).filter(Boolean);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(buildTemplateAoA(nombresCategorias)), 'Productos');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(buildInstructionsAoA(nombresCategorias)), 'Instrucciones');
+    XLSX.writeFile(wb, 'plantilla-productos-the-fast-sheep.xlsx');
+  }, [categories]);
+
+  // Valida las filas leidas contra el inventario y deja el resultado listo
+  // para la vista previa.
+  const reviewImportRows = useCallback((rows: Record<string, unknown>[]) => {
+    const { drafts, issues } = parseProductRows(rows, {
+      categories: categories.map(c => ({ id: c.id, name_es: c.name_es, name_en: c.name_en })),
+      existingSerials: products.map(p => p.serial_number),
+    });
+
+    // Si el archivo trae filas pero no se reconocio ninguna columna, el
+    // validador las ve todas vacias y no reporta nada: el modal diria "0
+    // listas, 0 problemas" sin explicar por que. Se detecta aqui y se
+    // dice cuales son los encabezados que se esperan.
+    const encabezados = mapHeaders(Object.keys(rows[0] ?? {}));
+    if (rows.length > 0 && encabezados.size === 0) {
+      setBulkDrafts([]);
+      setBulkIssues([{
+        row: 1,
+        serial: '',
+        message: language === 'es'
+          ? `No se reconoció ninguna columna. Los encabezados esperados son: ${IMPORT_COLUMNS.map(c => c.header).join(', ')}. Descargá la plantilla y completala sobre ella.`
+          : `No column was recognised. Expected headers: ${IMPORT_COLUMNS.map(c => c.header).join(', ')}. Download the template and fill it in.`,
+      }]);
+      setBulkResult(null);
+      return;
+    }
+
+    setBulkDrafts(drafts);
+    setBulkIssues(issues);
+    setBulkResult(null);
+  }, [categories, products, language]);
+
+  // Lee un CSV o un Excel del disco. cellDates hace que las fechas lleguen
+  // como Date y no como el numero de serie de Excel, que es lo que rompe
+  // las fechas al importar.
+  const readImportFile = useCallback(async (file: File) => {
+    setBulkBusy('leyendo');
+    try {
+      // Un CSV se lee con nuestro parser y no con xlsx, por dos motivos
+      // que se vieron probando con datos reales: xlsx lee el buffer como
+      // latin1 y rompe los acentos ("Código" -> "CÃ³digo", justo las dos
+      // columnas obligatorias), y tipa las celdas por su cuenta tomando
+      // "650,50" por 65050. Un .xlsx si va por buffer: es un zip con su
+      // propio XML y sus numeros ya vienen tipados sin ambiguedad.
+      const esTexto = /\.(csv|txt|tsv)$/i.test(file.name)
+        || file.type.includes('csv')
+        || file.type.startsWith('text/');
+
+      let rows: Record<string, unknown>[];
+      if (esTexto) {
+        rows = parseCsv(await file.text());
+      } else {
+        const wb = XLSX.read(await file.arrayBuffer(), { cellDates: true });
+        // Se toma la hoja "Productos" si existe (es la de la plantilla),
+        // y si no, la primera.
+        const sheetName = wb.SheetNames.find(n => n.toLowerCase().startsWith('producto')) ?? wb.SheetNames[0];
+        rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(wb.Sheets[sheetName], { defval: '' });
+      }
+      setBulkFileName(file.name);
+      reviewImportRows(rows);
+    } catch (e) {
+      console.error('No se pudo leer el archivo de carga masiva:', e);
+      showToast(language === 'es' ? 'No se pudo leer el archivo.' : 'Could not read the file.', 'error');
+    } finally {
+      setBulkBusy('');
+    }
+  }, [language, showToast, reviewImportRows]);
+
+  // Google Sheets: se descarga la hoja como CSV por su enlace publico. No
+  // hay API key ni OAuth de por medio, asi que la hoja tiene que estar
+  // compartida para lectura ("cualquiera con el enlace"). Si no lo esta,
+  // Google devuelve HTML de login en vez del CSV y se avisa de eso, que es
+  // el error habitual.
+  const readGoogleSheet = useCallback(async (url: string) => {
+    const m = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    if (!m) {
+      showToast(language === 'es' ? 'Ese enlace no parece de Google Sheets.' : 'That does not look like a Google Sheets link.', 'error');
+      return;
+    }
+    const gidMatch = url.match(/[#&?]gid=([0-9]+)/);
+    const exportUrl = `https://docs.google.com/spreadsheets/d/${m[1]}/export?format=csv${gidMatch ? `&gid=${gidMatch[1]}` : ''}`;
+
+    setBulkBusy('leyendo');
+    try {
+      const res = await fetch(exportUrl);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      if (/^\s*</.test(text)) {
+        throw new Error('La hoja no es pública: Google devolvió una página en vez del CSV.');
+      }
+      // Google exporta CSV, asi que va por el mismo parser que un archivo
+      // de texto: sin adivinar tipos ni codificacion.
+      setBulkFileName('Google Sheet');
+      reviewImportRows(parseCsv(text));
+    } catch (e) {
+      console.error('No se pudo leer el Google Sheet:', e);
+      showToast(
+        language === 'es'
+          ? 'No se pudo leer la hoja. Compartila con "cualquiera con el enlace" y probá de nuevo.'
+          : 'Could not read the sheet. Share it with "anyone with the link" and try again.',
+        'error',
+      );
+    } finally {
+      setBulkBusy('');
+    }
+  }, [language, showToast, reviewImportRows]);
+
+  const runImport = useCallback(async () => {
+    if (bulkDrafts.length === 0) return;
+    setBulkBusy('importando');
+    try {
+      const report = await bulkCreateProducts(bulkDrafts);
+      setBulkResult(report);
+      // Las filas ya creadas se sacan de la vista previa para que no se
+      // pueda importar dos veces el mismo archivo de un doble clic.
+      setBulkDrafts([]);
+      triggerReload();
+      showToast(
+        language === 'es'
+          ? `${report.created} artículo(s) creado(s).`
+          : `${report.created} item(s) created.`,
+        report.failed.length > 0 ? 'error' : 'success',
+      );
+    } catch (e) {
+      console.error('Falló la carga masiva:', e);
+      showToast(language === 'es' ? 'Falló la carga masiva.' : 'Bulk import failed.', 'error');
+    } finally {
+      setBulkBusy('');
+    }
+  }, [bulkDrafts, language, showToast, triggerReload]);
+
+  const closeBulkModal = useCallback(() => {
+    setBulkOpen(false);
+    setBulkFileName(''); setBulkDrafts([]); setBulkIssues([]);
+    setBulkSheetUrl(''); setBulkResult(null);
+  }, []);
 
   // Abre el PDF de un documento. Si aun no se genero (p.ej. porque fallo el
   // envio al emitirlo), se genera en el momento y sin mandar email.
@@ -9773,7 +9947,12 @@ USING (true);`;
                   {/* Filter row */}
                   <div className="filter-row" style={{ flexWrap: 'wrap', gap: '12px', alignItems: 'flex-start' }}>
                     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
-                      <button className="btn-primary" onClick={() => openProductModal()}>➕ {t.registerItem}</button>
+                      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                        <button className="btn-primary" onClick={() => openProductModal()}>➕ {t.registerItem}</button>
+                        <button className="btn-secondary" onClick={() => setBulkOpen(true)}>
+                          📥 {language === 'es' ? 'Carga masiva' : 'Bulk import'}
+                        </button>
+                      </div>
                       {searchStock.trim() !== '' && (
                         <span style={{ 
                           fontSize: '13px', 
@@ -10672,7 +10851,12 @@ USING (true);`;
                   {/* Filter row */}
                   <div className="filter-row" style={{ flexWrap: 'wrap', gap: '12px', alignItems: 'flex-start' }}>
                     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
-                      <button className="btn-primary" onClick={() => openProductModal()}>➕ {t.registerItem}</button>
+                      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                        <button className="btn-primary" onClick={() => openProductModal()}>➕ {t.registerItem}</button>
+                        <button className="btn-secondary" onClick={() => setBulkOpen(true)}>
+                          📥 {language === 'es' ? 'Carga masiva' : 'Bulk import'}
+                        </button>
+                      </div>
                       {searchStock.trim() !== '' && (
                         <span style={{ 
                           fontSize: '13px', 
@@ -26206,6 +26390,193 @@ USING (true);`;
       {/* ===== GOOGLE AUTH ACCESS CONTROL WHITELIST MODAL ===== */}
       
       {/* ===== GLOBAL STOCK ACTIONS DROPDOWN ===== */}
+      {/* MODAL: Carga masiva de productos */}
+      {bulkOpen && (() => {
+        const es = language === 'es';
+        const leyendo = bulkBusy === 'leyendo';
+        const importando = bulkBusy === 'importando';
+
+        return (
+          <div className="modal-overlay" style={{ zIndex: 1250 }} onClick={closeBulkModal}>
+            <div className="modal-content" style={{ maxWidth: '760px', maxHeight: '90vh', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
+              <div className="modal-header">
+                <h3 style={{ margin: 0 }}>📥 {es ? 'Carga masiva de productos' : 'Bulk product import'}</h3>
+                <button className="btn-secondary btn-xs" onClick={closeBulkModal}>✕</button>
+              </div>
+              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+
+                {/* Paso 1: plantilla */}
+                <div style={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '12px' }}>
+                  <strong style={{ fontSize: '12px', color: 'var(--text-bright)' }}>
+                    1 · {es ? 'Descargá la plantilla' : 'Download the template'}
+                  </strong>
+                  <p style={{ fontSize: '11.5px', color: 'var(--text-muted)', margin: '6px 0 10px', lineHeight: 1.5 }}>
+                    {es
+                      ? 'Trae los encabezados correctos, dos filas de ejemplo y una hoja con el detalle de cada columna. Completala, borrá los ejemplos y subila.'
+                      : 'It comes with the right headers, two sample rows and a sheet explaining every column. Fill it in, delete the samples and upload it.'}
+                  </p>
+                  <button className="btn-secondary btn-xs" onClick={downloadImportTemplate}>
+                    ⬇️ {es ? 'Descargar plantilla (.xlsx)' : 'Download template (.xlsx)'}
+                  </button>
+                </div>
+
+                {/* Paso 2: origen */}
+                <div style={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '12px' }}>
+                  <strong style={{ fontSize: '12px', color: 'var(--text-bright)' }}>
+                    2 · {es ? 'Subí tus datos' : 'Upload your data'}
+                  </strong>
+
+                  <div className="form-group" style={{ margin: '10px 0 0' }}>
+                    <label className="form-label" style={{ fontSize: '11px' }}>
+                      {es ? 'Archivo CSV o Excel' : 'CSV or Excel file'}
+                    </label>
+                    <input
+                      type="file"
+                      className="form-control"
+                      accept=".csv,.xlsx,.xls,.xlsm,text/csv"
+                      disabled={leyendo || importando}
+                      onChange={e => {
+                        const f = e.target.files?.[0];
+                        if (f) readImportFile(f);
+                        e.target.value = '';
+                      }}
+                    />
+                  </div>
+
+                  <div className="form-group" style={{ margin: '10px 0 0' }}>
+                    <label className="form-label" style={{ fontSize: '11px' }}>
+                      {es ? 'o pegá el enlace de un Google Sheet' : 'or paste a Google Sheet link'}
+                    </label>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <input
+                        type="url"
+                        className="form-control"
+                        placeholder="https://docs.google.com/spreadsheets/d/..."
+                        value={bulkSheetUrl}
+                        onChange={e => setBulkSheetUrl(e.target.value)}
+                      />
+                      <button
+                        className="btn-secondary btn-xs"
+                        style={{ whiteSpace: 'nowrap' }}
+                        disabled={!bulkSheetUrl.trim() || leyendo || importando}
+                        onClick={() => readGoogleSheet(bulkSheetUrl.trim())}
+                      >
+                        {leyendo ? '…' : (es ? 'Leer hoja' : 'Read sheet')}
+                      </button>
+                    </div>
+                    <p style={{ fontSize: '10.5px', color: 'var(--text-muted)', marginTop: '6px' }}>
+                      {es
+                        ? 'La hoja tiene que estar compartida como "cualquiera con el enlace".'
+                        : 'The sheet must be shared as "anyone with the link".'}
+                    </p>
+                  </div>
+                </div>
+
+                {/* Paso 3: vista previa */}
+                {(bulkDrafts.length > 0 || bulkIssues.length > 0) && (
+                  <div style={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '12px' }}>
+                    <strong style={{ fontSize: '12px', color: 'var(--text-bright)' }}>
+                      3 · {es ? 'Revisá antes de importar' : 'Review before importing'}
+                      {bulkFileName ? <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}> · {bulkFileName}</span> : null}
+                    </strong>
+
+                    <div style={{ display: 'flex', gap: '10px', margin: '10px 0' }}>
+                      <span style={{ fontSize: '11px', background: 'rgba(16,185,129,0.15)', color: '#10b981', padding: '3px 8px', borderRadius: '5px', fontWeight: 700 }}>
+                        {bulkDrafts.length} {es ? 'listas' : 'ready'}
+                      </span>
+                      {bulkIssues.length > 0 && (
+                        <span style={{ fontSize: '11px', background: 'rgba(248,113,113,0.15)', color: '#f87171', padding: '3px 8px', borderRadius: '5px', fontWeight: 700 }}>
+                          {bulkIssues.length} {es ? 'con problemas' : 'with problems'}
+                        </span>
+                      )}
+                    </div>
+
+                    {bulkIssues.length > 0 && (
+                      <div style={{ maxHeight: '160px', overflowY: 'auto', background: 'rgba(248,113,113,0.06)', border: '1px solid rgba(248,113,113,0.2)', borderRadius: '6px', padding: '8px', marginBottom: '10px' }}>
+                        <p style={{ fontSize: '11px', color: '#f87171', margin: '0 0 6px', fontWeight: 600 }}>
+                          {es ? 'Estas filas NO se van a importar:' : 'These rows will NOT be imported:'}
+                        </p>
+                        {bulkIssues.map(i => (
+                          <div key={`${i.row}-${i.serial}`} style={{ fontSize: '11px', color: 'var(--text-muted)', lineHeight: 1.6 }}>
+                            <strong style={{ color: 'var(--text-bright)' }}>{es ? 'Fila' : 'Row'} {i.row}</strong>
+                            {i.serial ? ` (${i.serial})` : ''}: {i.message}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {bulkDrafts.length > 0 && (
+                      <div style={{ maxHeight: '220px', overflowY: 'auto' }}>
+                        <table className="custom-table" style={{ fontSize: '11px' }}>
+                          <thead>
+                            <tr>
+                              <th>{es ? 'Código' : 'Code'}</th>
+                              <th>{es ? 'Categoría' : 'Category'}</th>
+                              <th>{es ? 'Marca / Modelo' : 'Brand / Model'}</th>
+                              <th style={{ textAlign: 'right' }}>{es ? 'Cant.' : 'Qty'}</th>
+                              <th style={{ textAlign: 'right' }}>{es ? 'Precio' : 'Price'}</th>
+                              <th>{es ? 'Estado' : 'Status'}</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {bulkDrafts.map(d => (
+                              <tr key={d.serial}>
+                                <td style={{ fontFamily: 'monospace' }}>{d.serial}</td>
+                                <td>{d.categoryName}</td>
+                                <td>{`${d.brand} ${d.model}`.trim() || '—'}</td>
+                                <td style={{ textAlign: 'right' }}>{d.quantity}</td>
+                                <td style={{ textAlign: 'right' }}>€{fmt2(d.price)}</td>
+                                <td>{d.status}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Resultado */}
+                {bulkResult && (
+                  <div style={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '12px' }}>
+                    <strong style={{ fontSize: '12px', color: '#10b981' }}>
+                      ✅ {bulkResult.created} {es ? 'artículo(s) creado(s)' : 'item(s) created'}
+                    </strong>
+                    {bulkResult.failed.length > 0 && (
+                      <div style={{ marginTop: '8px' }}>
+                        <p style={{ fontSize: '11px', color: '#f87171', margin: '0 0 4px', fontWeight: 600 }}>
+                          {es ? 'No se pudieron crear:' : 'Could not be created:'}
+                        </p>
+                        {bulkResult.failed.map(f => (
+                          <div key={f.serial} style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                            <strong style={{ color: 'var(--text-bright)' }}>{f.serial}</strong>: {f.message}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+                  <button className="btn-secondary" onClick={closeBulkModal}>
+                    {bulkResult ? (es ? 'Cerrar' : 'Close') : (es ? 'Cancelar' : 'Cancel')}
+                  </button>
+                  <button
+                    className="btn-primary"
+                    disabled={bulkDrafts.length === 0 || !!bulkBusy}
+                    onClick={runImport}
+                  >
+                    {importando
+                      ? (es ? 'Importando…' : 'Importing…')
+                      : (es ? `Importar ${bulkDrafts.length} artículo(s)` : `Import ${bulkDrafts.length} item(s)`)}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {/* MODAL: Alarmas de stock de un articulo */}
       {alarmModalSku !== null && (() => {
         const sku = alarmModalSku;

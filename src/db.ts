@@ -2677,3 +2677,107 @@ export async function rearmStockAlarm(id: string, qty: number): Promise<void> {
   const { error } = await supabase.rpc('rearm_stock_alarm', { p_id: id, p_qty: qty });
   if (error) throw error;
 }
+
+// ============================================================
+// CARGA MASIVA DE PRODUCTOS
+// Alta de muchos articulos desde un CSV / Excel / Google Sheet.
+// Las filas llegan ya validadas por src/stock/bulkImport.ts.
+// ============================================================
+
+export interface BulkProductDraft {
+  serial: string;
+  categoryId: string;
+  brand: string;
+  model: string;
+  quantity: number;
+  price: number;
+  status: string;
+  odometer: number;
+  color: string;
+  purchaseDate: string | null;
+  arrivalDate: string | null;
+  weeklyRate: number;
+  deposit: number;
+  location: string;
+  notes: string;
+}
+
+export interface BulkImportReport {
+  created: number;
+  failed: { serial: string; message: string }[];
+}
+
+// Inserta los articulos uno por uno, no en un solo insert masivo. Es mas
+// lento, pero una carga de 50 filas donde la 37 choca contra una
+// restriccion no puede tirar abajo las otras 49: el operador necesita
+// saber exactamente que fila fallo y por que, y quedarse con el resto.
+//
+// El modelo (product_models) se resuelve por combinacion de
+// categoria+marca+modelo y se memoiza: un archivo con 30 bicis del mismo
+// modelo crea un solo modelo y no consulta 30 veces.
+export async function bulkCreateProducts(drafts: BulkProductDraft[]): Promise<BulkImportReport> {
+  const report: BulkImportReport = { created: 0, failed: [] };
+  const modelCache = new Map<string, string | null>();
+
+  for (const d of drafts) {
+    try {
+      const cacheKey = `${d.categoryId}|${d.brand}|${d.model}`;
+      let modelId = modelCache.get(cacheKey);
+      if (modelId === undefined) {
+        modelId = await findOrCreateProductModel({
+          category_id: d.categoryId,
+          brand: d.brand || d.serial,
+          model: d.model || '',
+          name: `${d.brand} ${d.model}`.trim() || d.serial,
+          suggested_weekly_rate: d.weeklyRate,
+          suggested_deposit: d.deposit,
+        } as Product);
+        modelCache.set(cacheKey, modelId);
+      }
+
+      // Cantidad > 1 es stock consolidado (accesorios, repuestos): una
+      // sola fila que lleva el reparto por ubicacion, igual que hace el
+      // formulario cuando se marca como generico. Las bicicletas van de a
+      // una por fila, cada una con su codigo.
+      const esConsolidado = d.quantity > 1;
+      const custom: Record<string, unknown> = {
+        condition: 'nuevo',
+        color: d.color || null,
+        location: d.location,
+        location_date: null,
+      };
+      if (esConsolidado) {
+        custom.is_generic = true;
+        custom.location_distribution = { [d.location]: d.quantity };
+      }
+
+      const { error } = await supabase.from('products').insert({
+        id: crypto.randomUUID(),
+        model_id: modelId,
+        serial_number: d.serial,
+        prefix_id: null,
+        price_paid: d.price,
+        price_sold: null,
+        sold_date: null,
+        status: d.status,
+        notes: d.notes,
+        odometer: d.odometer,
+        purchase_date: d.purchaseDate,
+        arrival_date: d.arrivalDate,
+        factory_claim: false,
+        maintenance_status: 'Al día',
+        remind_service_one_week: true,
+        remind_service_one_day: true,
+        remind_service_odometer_threshold: 50,
+        custom_field_values: custom,
+        date_added: new Date().toISOString(),
+      });
+      if (error) throw error;
+      report.created++;
+    } catch (err: any) {
+      report.failed.push({ serial: d.serial, message: err?.message ?? String(err) });
+    }
+  }
+
+  return report;
+}
