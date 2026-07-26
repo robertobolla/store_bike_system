@@ -3,6 +3,7 @@
 // raw ids kept at the end of each row) and triggers a browser download.
 
 import * as XLSX from 'xlsx';
+import { formatDate, formatDateTime } from './utils/date';
 import type {
   Product, ProductModel, Customer, Rental, RentalItem, RentalPayment,
   Sale, SaleItem, FinancingPlan, FinancingPayment, MaintenanceExpense,
@@ -49,6 +50,8 @@ export interface BackupData {
 
 type Row = Record<string, string | number>;
 const s = (v: unknown): string => (v === null || v === undefined ? '' : String(v));
+const fdate = (v: string | null | undefined): string => (v ? formatDate(v) : '');
+const fdatetime = (v: string | null | undefined): string => (v ? formatDateTime(v) : '');
 const yesNo = (v: unknown) => (v ? 'Sí' : 'No');
 
 export function buildBackupWorkbook(d: BackupData): XLSX.WorkBook {
@@ -89,7 +92,7 @@ export function buildBackupWorkbook(d: BackupData): XLSX.WorkBook {
 
   // ---- build rows per sheet ----
   const transactions: Row[] = d.transactions.map(t => ({
-    Fecha: t.date,
+    Fecha: fdate(t.date),
     Categoría: t.category,
     Descripción: t.description,
     Tipo: t.type === 'income' ? 'Ingreso' : 'Egreso',
@@ -106,8 +109,8 @@ export function buildBackupWorkbook(d: BackupData): XLSX.WorkBook {
     'Odómetro (km)': p.odometer ?? 0,
     'Precio compra': p.price_paid ?? 0,
     'Precio venta': p.price_sold ?? '',
-    'Fecha compra': s(p.purchase_date),
-    'Fecha venta': s(p.sold_date),
+    'Fecha compra': fdate(p.purchase_date),
+    'Fecha venta': fdate(p.sold_date),
     Mantenimiento: s(p.maintenance_status),
     Color: s(p.color),
     Notas: s(p.notes),
@@ -135,7 +138,7 @@ export function buildBackupWorkbook(d: BackupData): XLSX.WorkBook {
     Nacionalidad: s(c.nationality),
     Origen: s(c.referral_source),
     Notas: s(c.notes),
-    Alta: s(c.created_at),
+    Alta: fdate(c.created_at),
     id: c.id,
   }));
 
@@ -147,9 +150,9 @@ export function buildBackupWorkbook(d: BackupData): XLSX.WorkBook {
     Depósito: r.deposit_amount ?? 0,
     'Depósito devuelto': r.deposit_refunded ?? '',
     Seguro: yesNo(r.has_insurance),
-    Inicio: s(r.start_date),
-    Fin: s(r.end_date),
-    'Devolución prog.': s(r.scheduled_return_date),
+    Inicio: fdate(r.start_date),
+    Fin: fdate(r.end_date),
+    'Devolución prog.': fdate(r.scheduled_return_date),
     Estado: s(r.status),
     Contrato: s(r.contract_type),
     Kit: yesNo(r.has_kit),
@@ -171,7 +174,7 @@ export function buildBackupWorkbook(d: BackupData): XLSX.WorkBook {
   const pagosAlquiler: Row[] = d.payments.map(p => ({
     Alquiler: rentalLabel(d.rentals.find(r => r.id === p.rental_id)),
     Monto: p.amount ?? 0,
-    Fecha: s(p.payment_date),
+    Fecha: fdate(p.payment_date),
     Método: s(p.payment_method),
     Vía: s(p.received_via),
     rental_id: p.rental_id,
@@ -179,7 +182,7 @@ export function buildBackupWorkbook(d: BackupData): XLSX.WorkBook {
 
   const ventas: Row[] = d.sales.map(sa => ({
     Cliente: custLabel(sa.customer_id),
-    Fecha: s(sa.sale_date),
+    Fecha: fdate(sa.sale_date),
     'Tipo pago': s(sa.payment_type),
     Total: sa.total_amount ?? 0,
     Anticipo: sa.down_payment ?? 0,
@@ -203,7 +206,7 @@ export function buildBackupWorkbook(d: BackupData): XLSX.WorkBook {
     Cuotas: fp.num_installments ?? 0,
     'Monto cuota': fp.installment_amount ?? 0,
     Frecuencia: s(fp.payment_frequency),
-    Inicio: s(fp.start_date),
+    Inicio: fdate(fp.start_date),
     Estado: s(fp.status),
     id: fp.id,
     sale_id: s(fp.sale_id),
@@ -215,9 +218,9 @@ export function buildBackupWorkbook(d: BackupData): XLSX.WorkBook {
       Plan: saleLabel(plan?.sale_id),
       'N° cuota': fc.installment_number ?? 0,
       Monto: fc.amount ?? 0,
-      Vencimiento: s(fc.due_date),
+      Vencimiento: fdate(fc.due_date),
       Pagada: yesNo(fc.paid_date),
-      'Fecha pago': s(fc.paid_date),
+      'Fecha pago': fdate(fc.paid_date),
       Estado: s(fc.status),
       Vía: s(fc.received_via),
       financing_plan_id: fc.financing_plan_id,
@@ -226,7 +229,7 @@ export function buildBackupWorkbook(d: BackupData): XLSX.WorkBook {
 
   const serviceTaller: Row[] = d.records.map(r => ({
     Bici: prodLabel(r.bike_id),
-    Fecha: s(r.service_date),
+    Fecha: fdate(r.service_date),
     Lugar: s(r.location),
     Descripción: s(r.description),
     Costo: r.cost ?? 0,
@@ -237,7 +240,7 @@ export function buildBackupWorkbook(d: BackupData): XLSX.WorkBook {
 
   const modificaciones: Row[] = d.bikeModifications.map(m => ({
     Bici: prodLabel(m.bike_id),
-    Fecha: s(m.modification_date),
+    Fecha: fdate(m.modification_date),
     Descripción: s(m.description),
     id: m.id,
     bike_id: s(m.bike_id),
@@ -250,10 +253,10 @@ export function buildBackupWorkbook(d: BackupData): XLSX.WorkBook {
     Categoría: l.category_id ? (leadCatById.get(l.category_id)?.name_es ?? '') : '',
     Interés: s(l.interested_in),
     Estado: s(l.status),
-    'Seguimiento fecha': s(l.follow_up_date),
+    'Seguimiento fecha': fdate(l.follow_up_date),
     'Seguimiento acción': s(l.follow_up_action),
     Notas: s(l.notes),
-    Alta: s(l.created_at),
+    Alta: fdate(l.created_at),
     id: l.id,
   }));
 
@@ -292,22 +295,22 @@ export function buildBackupWorkbook(d: BackupData): XLSX.WorkBook {
     'Tarifa semanal': a.weekly_rate ?? 0,
     Estado: s(a.status),
     'Renter actual': custLabel(a.current_renter_id),
-    Inicio: s(a.start_date),
-    Fin: s(a.end_date),
+    Inicio: fdate(a.start_date),
+    Fin: fdate(a.end_date),
     id: a.id,
   }));
 
   const cuentasNotas: Row[] = d.accountNotes.map(n => ({
     Cuenta: accountLabel(n.account_id),
     Nota: s(n.note),
-    Fecha: s(n.date),
+    Fecha: fdatetime(n.date),
     account_id: n.account_id,
   }));
 
   const cuentasGanancias: Row[] = d.accountEarnings.map(e => ({
     Cuenta: accountLabel(e.account_id),
     Monto: e.amount ?? 0,
-    Fecha: s(e.date),
+    Fecha: fdate(e.date),
     Notas: s(e.notes),
     account_id: e.account_id,
   }));
@@ -338,10 +341,9 @@ export function buildBackupWorkbook(d: BackupData): XLSX.WorkBook {
   ];
 
   // Cover sheet with per-tab counts
-  const today = new Date().toISOString().split('T')[0];
   const resumen: (string | number)[][] = [
     ['The Fast Sheep — Backup'],
-    ['Fecha', today],
+    ['Fecha', formatDate(new Date())],
     [],
     ['Pestaña', 'Filas'],
     ...sheets.map(sh => [sh.name, sh.rows.length]),

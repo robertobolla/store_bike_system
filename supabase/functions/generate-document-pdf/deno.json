@@ -1,0 +1,12 @@
+{
+  "imports": {
+    "@react-pdf/renderer": "npm:@react-pdf/renderer@4.5.1",
+    "react": "npm:react@19.2.6",
+    "react/jsx-runtime": "npm:react@19.2.6/jsx-runtime",
+    "@supabase/supabase-js": "npm:@supabase/supabase-js@2.106.0"
+  },
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "jsxImportSource": "react"
+  }
+}

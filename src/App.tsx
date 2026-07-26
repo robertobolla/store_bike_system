@@ -48,22 +48,41 @@ import {
 } from './db';
 import type { AllowedEmail, BikeModification, DeliveryChecklist, RentalContractSnapshot, RentalContractAmendment, AmendmentChange } from './db';
 import { downloadBackupXlsx } from './backup';
+import { formatDate as fmtDMY, formatDateTime as fmtDMYTime } from './utils/date';
+import { DocumentsView } from './invoicing/DocumentsView';
+import { ExpensesView } from './invoicing/ExpensesView';
+import { RentalDocuments } from './invoicing/RentalDocuments';
+import {
+  issueRentalInvoice, issueDepositReceipt, generateDocumentPdf, generateDocumentPdfBatch,
+  markOldestPendingRentalInvoicePaid,
+} from './invoicing/api';
+import {
+  getBusinessExpenses, insertBusinessExpense, deleteBusinessExpense,
+  getExpenseCategories as getDbExpenseCategories,
+  insertExpenseCategory, updateExpenseCategory, deleteExpenseCategory,
+} from './invoicing/api';
+import { noVat, addVat as addVatHelper } from './invoicing/money';
 
 
 
 import heic2any from 'heic2any';
 
-// Formatea cualquier importe para mostrarlo con un solo decimal como maximo
-// (los enteros se muestran sin decimales).
-const fmt1 = (value: number | string | null | undefined): string => {
+// Redondea un importe a dos decimales para guardarlo en base de datos.
+// El EPSILON evita que casos como 1.005 caigan al centimo de abajo por
+// como se representan los decimales en coma flotante.
+const round2 = (value: number): number =>
+  Math.round(((Number(value) || 0) + Number.EPSILON) * 100) / 100;
+
+// Formatea cualquier importe con dos decimales fijos. Antes se mostraba
+// un solo decimal y los enteros sin decimales, pero eso perdia centimos:
+// una base imponible de 65.04 salia como 65.0 y el VAT declarado dejaba
+// de dar el 23% exacto. Todos los importes de la app comparten ahora la
+// misma precision que los documentos fiscales.
+const fmt2 = (value: number | string | null | undefined): string => {
   const num = typeof value === 'number' ? value : parseFloat(String(value ?? ''));
   if (!Number.isFinite(num)) return String(value ?? '');
-  const rounded = Math.round(num * 10) / 10;
-  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+  return round2(num).toFixed(2);
 };
-
-// Redondea un importe a un decimal para guardarlo en base de datos.
-const round1 = (value: number): number => Math.round((Number(value) || 0) * 10) / 10;
 
 // Lee el valor de un <input type="number"> sin romper lo que el usuario esta escribiendo.
 // Mientras el texto es intermedio ("1500." o "1500,") el navegador devuelve '' en
@@ -588,7 +607,9 @@ interface InternalChecklistValue {
   signatureDataUrl?: string | null;  // freshly drawn signature to upload on save
 }
 const emptyInternalChecklist = (): InternalChecklistValue => ({
-  battery_level: '', items: {},
+  // Por defecto 100%: la mayoria de las bicis salen con la bateria llena.
+  // Es solo el valor inicial; el campo se puede borrar y escribir otro.
+  battery_level: '100%', items: {},
   notes: { inspected_date: new Date().toISOString().split('T')[0] },
   signatureUrl: null, signatureDataUrl: null,
 });
@@ -816,7 +837,7 @@ function sendDeliveryChecklistCopyEmail(
         <tr><td style="padding:4px 0; color:#6b7280;">E-Bike Model</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.bike_model}</td></tr>
         <tr><td style="padding:4px 0; color:#6b7280;">E-Bike Serial Number</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.bike_serial}</td></tr>
         <tr><td style="padding:4px 0; color:#6b7280;">Unit Reference</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.bike_ref ?? '—'}</td></tr>
-        <tr><td style="padding:4px 0; color:#6b7280;">Date</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.delivery_date}</td></tr>
+        <tr><td style="padding:4px 0; color:#6b7280;">Date</td><td style="padding:4px 0; text-align:right; font-weight:600;">${fmtDMY(checklist.delivery_date)}</td></tr>
         <tr><td style="padding:4px 0; color:#6b7280;">Battery Charge Level</td><td style="padding:4px 0; text-align:right; font-weight:600;">${payload.battery_level || '—'}</td></tr>
         <tr><td style="padding:4px 0; color:#6b7280;">Customer Name</td><td style="padding:4px 0; text-align:right; font-weight:600;">${checklist.customer_name}</td></tr>
       </table>
@@ -824,7 +845,7 @@ function sendDeliveryChecklistCopyEmail(
       <p style="font-size: 12px; line-height: 1.5; margin: 14px 0;">By signing below, the customer confirms acceptance of all the aforementioned conditions and declarations.</p>
       <h3 style="font-size:14px; margin: 18px 0 6px;">Customer Signature</h3>
       <img src="${payload.signature_url}" alt="signature" style="max-width: 320px; border:1px solid #e5e7eb; border-radius: 8px; background:#fff;" />
-      <p style="font-size: 12px; color:#6b7280; margin-top: 8px;">Accepted on ${checklist.delivery_date} by ${checklist.customer_name}.</p>
+      <p style="font-size: 12px; color:#6b7280; margin-top: 8px;">Accepted on ${fmtDMY(checklist.delivery_date)} by ${checklist.customer_name}.</p>
       <hr style="border:none; border-top:1px solid #e5e7eb; margin: 20px 0;">
       <p style="font-size: 11px; color:#9ca3af; text-align:center;">THE FAST SHEEP LIMITED — 802654<br>Explore the world and enjoy cycling<br>www.thefastsheep.com · +353 83 042 9732 · T23 AT2P</p>
     </div>`;
@@ -1052,8 +1073,8 @@ const contractDetailRows = (s: RentalContractSnapshot): [string, string][] => [
   ['Unit Reference', s.bike_ref || '—'],
   ['Rental Start Date', s.start_date || '—'],
   ['Weekly Payment Due Every', s.payment_due_weekday || '—'],
-  [contractRatePeriodLabel(s.rate_type), `€${fmt1(s.rate_amount)}`],
-  ['Security Deposit', `€${fmt1(s.deposit_amount)}`],
+  [contractRatePeriodLabel(s.rate_type), `€${fmt2(s.rate_amount)}`],
+  ['Security Deposit', `€${fmt2(s.deposit_amount)}`],
   ['Number of Batteries Supplied', String(s.battery_count)],
 ];
 
@@ -1262,7 +1283,7 @@ function sendAmendmentInviteEmail(am: RentalContractAmendment, url: string) {
       <p>${t.greeting(am.customer_name)}</p>
       <p>${t.intro}</p>
       ${amendmentChangesHtml(am.changes)}
-      <p style="font-size:12px; color:#6b7280; margin-top:10px;">Effective from ${am.effective_date}.</p>
+      <p style="font-size:12px; color:#6b7280; margin-top:10px;">Effective from ${fmtDMY(am.effective_date)}.</p>
       <div style="text-align:center; margin: 26px 0;">
         <a href="${url}" style="background:#10b981; color:#fff; text-decoration:none; padding: 14px 28px; border-radius: 10px; font-weight: 600; display:inline-block;">
           ${t.button}
@@ -1288,7 +1309,7 @@ function sendAmendmentCopyEmail(am: RentalContractAmendment, signatureUrl: strin
       <p style="font-size:13px;">${t.copyIntro(am.customer_name)}</p>
       <h3 style="font-size:14px; margin:18px 0 4px;">AMENDED TERMS</h3>
       ${amendmentChangesHtml(am.changes)}
-      <p style="font-size:12px; margin-top:10px;">Effective from <strong>${am.effective_date}</strong>.</p>
+      <p style="font-size:12px; margin-top:10px;">Effective from <strong>${fmtDMY(am.effective_date)}</strong>.</p>
       ${am.changes.some(c => /Fee|Rate/i.test(c.label)) ? `<p style="font-size:12px; line-height:1.5;">${AMENDMENT_RATE_CLAUSE}</p>` : ''}
       <p style="font-size:12px; line-height:1.5;">${AMENDMENT_CONTINUITY_CLAUSE}</p>
       <h3 style="font-size:14px; margin:18px 0 4px;">SIGNATURE</h3>
@@ -1319,7 +1340,7 @@ function sendSaleConfirmationEmail(sale: any, items: any[], customer: any, lang:
   if (customTemplate) {
     let body = customTemplate.body_text;
     body = body.replace(/\{\{CLIENT_NAME\}\}/g, `${customer.first_name} ${customer.last_name}`.trim());
-    body = body.replace(/\{\{TOTAL_SALE\}\}/g, `€${fmt1(sale.total_amount)}`);
+    body = body.replace(/\{\{TOTAL_SALE\}\}/g, `€${fmt2(sale.total_amount)}`);
     
     const prodListHtml = `
       <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
@@ -1330,7 +1351,7 @@ function sendSaleConfirmationEmail(sale: any, items: any[], customer: any, lang:
         ${items.map(item => `
           <tr>
             <td style="padding: 8px 0; font-size: 12px; color: #e2e8f0;">${item.name} (${item.serial_number})</td>
-            <td style="padding: 8px 0; text-align: right; font-size: 12px; color: #e2e8f0; font-weight: bold;">€${fmt1(item.price_sold || item.price_paid)}</td>
+            <td style="padding: 8px 0; text-align: right; font-size: 12px; color: #e2e8f0; font-weight: bold;">€${fmt2(item.price_sold || item.price_paid)}</td>
           </tr>
         `).join('')}
       </table>
@@ -1387,10 +1408,10 @@ function sendSaleConfirmationEmail(sale: any, items: any[], customer: any, lang:
         <p>${t.thankYou}</p>
         <hr />
         <ul>
-          ${items.map(item => `<li><strong>${item.serial_number}</strong> - ${item.name}: €${fmt1(item.price_sold || item.price_paid)}</li>`).join('')}
+          ${items.map(item => `<li><strong>${item.serial_number}</strong> - ${item.name}: €${fmt2(item.price_sold || item.price_paid)}</li>`).join('')}
         </ul>
-        <p><strong>${t.date}:</strong> ${sale.sale_date}</p>
-        <p><strong>${t.total}:</strong> €${fmt1(sale.total_amount)}</p>
+        <p><strong>${t.date}:</strong> ${fmtDMY(sale.sale_date)}</p>
+        <p><strong>${t.total}:</strong> €${fmt2(sale.total_amount)}</p>
         <hr />
         <p style="font-size: 12px; color: #777;">${t.footer}</p>
       </div>
@@ -1410,11 +1431,11 @@ function sendFinancingPlanEmail(sale: any, plan: any, payments: any[], items: an
   if (customTemplate) {
     let body = customTemplate.body_text;
     body = body.replace(/\{\{CLIENT_NAME\}\}/g, `${customer.first_name} ${customer.last_name}`.trim());
-    body = body.replace(/\{\{TOTAL_SALE\}\}/g, `€${fmt1(sale.total_amount)}`);
-    body = body.replace(/\{\{DOWN_PAYMENT\}\}/g, `€${fmt1(sale.down_payment)}`);
-    body = body.replace(/\{\{FINANCED_AMOUNT\}\}/g, `€${fmt1(plan.total_financed)}`);
+    body = body.replace(/\{\{TOTAL_SALE\}\}/g, `€${fmt2(sale.total_amount)}`);
+    body = body.replace(/\{\{DOWN_PAYMENT\}\}/g, `€${fmt2(sale.down_payment)}`);
+    body = body.replace(/\{\{FINANCED_AMOUNT\}\}/g, `€${fmt2(plan.total_financed)}`);
     body = body.replace(/\{\{INSTALLMENTS_COUNT\}\}/g, `${plan.num_installments}`);
-    body = body.replace(/\{\{INSTALLMENT_AMOUNT\}\}/g, `€${fmt1(plan.installment_amount)}`);
+    body = body.replace(/\{\{INSTALLMENT_AMOUNT\}\}/g, `€${fmt2(plan.installment_amount)}`);
     body = body.replace(/\{\{PAYMENT_FREQUENCY\}\}/g, plan.payment_frequency === 'semanal' ? (lang === 'es' ? 'semanal' : lang === 'en' ? 'weekly' : 'semanal') : (lang === 'es' ? 'mensual' : lang === 'en' ? 'monthly' : 'mensal'));
     body = body.replace(/\{\{FIRST_DUE_DATE\}\}/g, plan.start_date ? plan.start_date.split('-').reverse().join('/') : '—');
     html = body;
@@ -1491,10 +1512,10 @@ function sendFinancingPlanEmail(sale: any, plan: any, payments: any[], items: an
         <ul>
           ${items.map(item => `<li><strong>${item.serial_number}</strong> - ${item.name}</li>`).join('')}
         </ul>
-        <p><strong>${t.totalSale}:</strong> €${fmt1(sale.total_amount)}</p>
-        <p><strong>${t.downPayment}:</strong> €${fmt1(sale.down_payment)}</p>
-        <p><strong>${t.totalFinanced}:</strong> €${fmt1(plan.total_financed)}</p>
-        <p><strong>${t.installments}:</strong> ${plan.num_installments} x €${fmt1(plan.installment_amount)} (${plan.payment_frequency === 'semanal' ? 'Semanal' : 'Mensual'})</p>
+        <p><strong>${t.totalSale}:</strong> €${fmt2(sale.total_amount)}</p>
+        <p><strong>${t.downPayment}:</strong> €${fmt2(sale.down_payment)}</p>
+        <p><strong>${t.totalFinanced}:</strong> €${fmt2(plan.total_financed)}</p>
+        <p><strong>${t.installments}:</strong> ${plan.num_installments} x €${fmt2(plan.installment_amount)} (${plan.payment_frequency === 'semanal' ? 'Semanal' : 'Mensual'})</p>
         
         <h3>${t.paymentSchedule}:</h3>
         <table border="1" cellpadding="8" style="border-collapse: collapse; width: 100%;">
@@ -1510,8 +1531,8 @@ function sendFinancingPlanEmail(sale: any, plan: any, payments: any[], items: an
             ${payments.map(p => `
               <tr>
                 <td>${p.installment_number}</td>
-                <td>${p.due_date}</td>
-                <td>€${fmt1(p.amount)}</td>
+                <td>${fmtDMY(p.due_date)}</td>
+                <td>€${fmt2(p.amount)}</td>
                 <td>${p.status}</td>
               </tr>
             `).join('')}
@@ -1542,7 +1563,7 @@ function sendRentalConfirmationEmail(rental: any, vehicle: any, customer: any, l
     let body = customTemplate.body_text;
     body = body.replace(/\{\{CLIENT_NAME\}\}/g, `${customer.first_name} ${customer.last_name}`.trim());
     body = body.replace(/\{\{VEHICLE_NAME\}\}/g, vehicleStr);
-    body = body.replace(/\{\{START_DATE\}\}/g, rental.start_date ? rental.start_date.split('-').reverse().join('/') : '—');
+    body = body.replace(/\{\{START_DATE\}\}/g, fmtDMY(rental.start_date));
     
     // Adapt labels and rate dynamically
     const rateType = rental.rate_type || 'mensual';
@@ -1550,7 +1571,7 @@ function sendRentalConfirmationEmail(rental: any, vehicle: any, customer: any, l
       body = body.replace(/Alquiler Mensual:/gi, lang === 'es' ? 'Alquiler Semanal:' : lang === 'en' ? 'Weekly Rent:' : 'Aluguer Semanal:');
       body = body.replace(/Monthly Rent:/gi, 'Weekly Rent:');
       body = body.replace(/Aluguer Mensal:/gi, 'Aluguer Semanal:');
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt1(rental.rental_rate || Math.round(rental.monthly_rate / 4))}`);
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt2(rental.rental_rate || Math.round(rental.monthly_rate / 4))}`);
       
       body = body.replace(/mensualidades/gi, lang === 'es' ? 'cuotas semanales' : lang === 'en' ? 'weekly payments' : 'prestações semanais');
       body = body.replace(/cobrarán el mismo día de cada mes/gi, lang === 'es' ? 'cobrarán cada semana' : lang === 'en' ? 'charged every week' : 'cobrarão a cada semana');
@@ -1558,15 +1579,15 @@ function sendRentalConfirmationEmail(rental: any, vehicle: any, customer: any, l
       body = body.replace(/Alquiler Mensual:/gi, lang === 'es' ? 'Alquiler Diario:' : lang === 'en' ? 'Daily Rent:' : 'Aluguer Diário:');
       body = body.replace(/Monthly Rent:/gi, 'Daily Rent:');
       body = body.replace(/Aluguer Mensal:/gi, 'Aluguer Diário:');
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt1(rental.rental_rate)}`);
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt2(rental.rental_rate)}`);
       
       body = body.replace(/mensualidades/gi, lang === 'es' ? 'cuotas diarias' : lang === 'en' ? 'daily payments' : 'prestações diárias');
       body = body.replace(/cobrarán el mismo día de cada mes/gi, lang === 'es' ? 'cobrarán cada día' : lang === 'en' ? 'charged every day' : 'cobrarão a cada dia');
     } else {
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt1(rental.monthly_rate)}`);
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt2(rental.monthly_rate)}`);
     }
     
-    body = body.replace(/\{\{DEPOSIT_AMOUNT\}\}/g, `€${fmt1(rental.deposit_amount || 0)}`);
+    body = body.replace(/\{\{DEPOSIT_AMOUNT\}\}/g, `€${fmt2(rental.deposit_amount || 0)}`);
     html = body;
   } else {
     const rateType = rental.rate_type || 'mensual';
@@ -1634,9 +1655,9 @@ function sendRentalConfirmationEmail(rental: any, vehicle: any, customer: any, l
         <hr />
         <ul>
           <li><strong>${t.vehicle}:</strong> ${vehicleStr}</li>
-          <li><strong>${t.startDate}:</strong> ${rental.start_date}</li>
-          <li><strong>${t.monthlyRate}:</strong> €${fmt1(rateVal)}</li>
-          <li><strong>${t.deposit}:</strong> €${fmt1(rental.deposit_amount || 0)}</li>
+          <li><strong>${t.startDate}:</strong> ${fmtDMY(rental.start_date)}</li>
+          <li><strong>${t.monthlyRate}:</strong> €${fmt2(rateVal)}</li>
+          <li><strong>${t.deposit}:</strong> €${fmt2(rental.deposit_amount || 0)}</li>
         </ul>
         <hr />
         <p style="font-size: 12px; color: #777;">${t.footer}</p>
@@ -1670,7 +1691,7 @@ function sendRentalReminderEmail(rental: any, vehicle: any, customer: any, dueDa
       body = body.replace(/Monto de Mensualidad:/gi, lang === 'es' ? 'Monto Semanal:' : lang === 'en' ? 'Weekly Rate:' : 'Valor Semanal:');
       body = body.replace(/Monthly Rate:/gi, 'Weekly Rate:');
       body = body.replace(/Mensalidade de Aluguer:/gi, 'Aluguer Semanal:');
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt1(rental.rental_rate || Math.round(rental.monthly_rate / 4))}`);
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt2(rental.rental_rate || Math.round(rental.monthly_rate / 4))}`);
       
       body = body.replace(/mensualidad/gi, lang === 'es' ? 'cuota semanal' : lang === 'en' ? 'weekly rate' : 'mensualidade');
       body = body.replace(/cobro mensual/gi, lang === 'es' ? 'cobro semanal' : lang === 'en' ? 'weekly payment' : 'cobro semanal');
@@ -1678,12 +1699,12 @@ function sendRentalReminderEmail(rental: any, vehicle: any, customer: any, dueDa
       body = body.replace(/Monto de Mensualidad:/gi, lang === 'es' ? 'Monto Diario:' : lang === 'en' ? 'Daily Rate:' : 'Valor Diário:');
       body = body.replace(/Monthly Rate:/gi, 'Daily Rate:');
       body = body.replace(/Mensalidade de Aluguer:/gi, 'Aluguer Diário:');
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt1(rental.rental_rate)}`);
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt2(rental.rental_rate)}`);
       
       body = body.replace(/mensualidad/gi, lang === 'es' ? 'cuota diaria' : lang === 'en' ? 'daily rate' : 'mensualidade');
       body = body.replace(/cobro mensual/gi, lang === 'es' ? 'cobro diario' : lang === 'en' ? 'daily payment' : 'cobro diário');
     } else {
-      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt1(rental.monthly_rate)}`);
+      body = body.replace(/\{\{MONTHLY_RATE\}\}/g, `€${fmt2(rental.monthly_rate)}`);
     }
     
     body = body.replace(/\{\{DUE_DATE\}\}/g, dueDate.split('-').reverse().join('/'));
@@ -1750,7 +1771,7 @@ function sendRentalReminderEmail(rental: any, vehicle: any, customer: any, dueDa
         <hr />
         <ul>
           <li><strong>${t.vehicle}:</strong> ${vehicleStr}</li>
-          <li><strong>${t.amount}:</strong> €${fmt1(rateVal)}</li>
+          <li><strong>${t.amount}:</strong> €${fmt2(rateVal)}</li>
           <li><strong>${t.dueDate}:</strong> ${dueDate}</li>
         </ul>
         <hr />
@@ -1772,7 +1793,7 @@ function sendRentalPaymentReceivedEmail(customer: any, amount: number, date: str
   if (customTemplate) {
     let body = customTemplate.body_text;
     body = body.replace(/\{\{CLIENT_NAME\}\}/g, `${customer.first_name} ${customer.last_name}`.trim());
-    body = body.replace(/\{\{PAYMENT_AMOUNT\}\}/g, `€${fmt1(amount)}`);
+    body = body.replace(/\{\{PAYMENT_AMOUNT\}\}/g, `€${fmt2(amount)}`);
     body = body.replace(/\{\{PAYMENT_DATE\}\}/g, date.split('-').reverse().join('/'));
     body = body.replace(/\{\{PAYMENT_METHOD\}\}/g, method);
     html = body;
@@ -1784,7 +1805,7 @@ function sendRentalPaymentReceivedEmail(customer: any, amount: number, date: str
         <p>Te confirmamos que hemos recibido tu pago correctamente:</p>
         <hr />
         <ul>
-          <li><strong>Monto:</strong> €${fmt1(amount)}</li>
+          <li><strong>Monto:</strong> €${fmt2(amount)}</li>
           <li><strong>Fecha:</strong> ${date}</li>
           <li><strong>Detalle:</strong> ${method}</li>
         </ul>
@@ -1848,7 +1869,7 @@ function sendRentalReturnedEmail(rental: any, vehicle: any, customer: any, lang:
     body = body.replace(/\{\{CLIENT_NAME\}\}/g, `${customer.first_name} ${customer.last_name}`.trim());
     body = body.replace(/\{\{VEHICLE_NAME\}\}/g, vehicleStr);
     body = body.replace(/\{\{ODOMETER_END\}\}/g, String(rental.odometer_end || 0));
-    body = body.replace(/\{\{DEPOSIT_REFUNDED\}\}/g, rental.deposit_refunded !== null ? `€${fmt1(rental.deposit_refunded)}` : '—');
+    body = body.replace(/\{\{DEPOSIT_REFUNDED\}\}/g, rental.deposit_refunded !== null ? `€${fmt2(rental.deposit_refunded)}` : '—');
     body = body.replace(/\{\{DAMAGE_REPORT\}\}/g, rental.damage_report || 'Sin Daños / Correcto');
     html = body;
   } else {
@@ -1861,7 +1882,7 @@ function sendRentalReturnedEmail(rental: any, vehicle: any, customer: any, lang:
         <ul>
           <li><strong>E-Bike:</strong> ${vehicleStr}</li>
           <li><strong>KM Final:</strong> ${rental.odometer_end || 0}</li>
-          <li><strong>Depósito Devuelto:</strong> ${rental.deposit_refunded !== null ? `€${fmt1(rental.deposit_refunded)}` : '—'}</li>
+          <li><strong>Depósito Devuelto:</strong> ${rental.deposit_refunded !== null ? `€${fmt2(rental.deposit_refunded)}` : '—'}</li>
           <li><strong>Reporte Daños:</strong> ${rental.damage_report || 'Sin Daños / Correcto'}</li>
         </ul>
         <hr />
@@ -2618,6 +2639,27 @@ USING (true);`;
   const [products,        setProducts]        = useState<Product[]>([]);
   const [customers,       setCustomers]       = useState<Customer[]>([]);
   const [rentals,         setRentals]         = useState<Rental[]>([]);
+  // Codigo visible del alquiler (RNT-2026-0001) por id. Lo usa la vista de
+  // Facturacion para mostrar de que alquiler viene cada documento.
+  const rentalCodeById = useMemo(() => {
+    const m = new Map<string, string>();
+    rentals.forEach(r => { if (r.rental_code) m.set(r.id, r.rental_code); });
+    return m;
+  }, [rentals]);
+
+  // Ubicaciones conocidas (texto libre): se recolectan de las distribuciones
+  // y del campo location de todos los productos. Sirven para los selectores
+  // de ubicacion, p.ej. al devolver una bici.
+  const knownLocations = useMemo(() => {
+    const set = new Set<string>(['Almacén Central']);
+    products.forEach(p => {
+      const dist = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
+      if (dist) Object.keys(dist).forEach(l => l && set.add(l));
+      const loc = p.custom_field_values?.location as string | undefined;
+      if (loc) set.add(loc);
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [products]);
   const [deliveryChecklists, setDeliveryChecklists] = useState<DeliveryChecklist[]>([]);
   const [viewChecklist,   setViewChecklist]   = useState<DeliveryChecklist | null>(null);
   const [ledgerDetail,    setLedgerDetail]    = useState<{ date: string; description: string; amount: number; type: 'cost' | 'sale' | 'payment' | 'deposit' | 'expense' } | null>(null);
@@ -2729,6 +2771,45 @@ USING (true);`;
 
       // Automatically detect and fix duplicate customer codes
       deduplicateCustomerCodes(custs, setCustomers);
+
+      // Gastos generales desde la base. Migracion unica: si aun quedan
+      // "Otros Gastos" en localStorage de la version vieja, se suben a la
+      // tabla y se borra el localStorage para que no vuelvan a entrar.
+      try {
+        const legacy = localStorage.getItem('other_expenses');
+        if (legacy) {
+          const parsed: Array<{ name: string; amount: number; categoryId: string; date: string }> = JSON.parse(legacy);
+          const legacyCats = JSON.parse(localStorage.getItem('expense_categories') || '[]') as Array<{ id: string; name: string; color: string }>;
+          const dbCats = await getDbExpenseCategories();
+          const catNameById = new Map(legacyCats.map(c => [c.id, c.name]));
+          for (const exp of parsed) {
+            // Empareja la categoria vieja (por nombre) con la de la base, o
+            // la deja sin categoria si no existe.
+            const catName = catNameById.get(exp.categoryId);
+            const dbCat = catName ? dbCats.find(c => c.name === catName) : undefined;
+            const b = noVat(Number(exp.amount ?? 0));
+            await insertBusinessExpense({
+              expense_date: exp.date || new Date().toISOString().slice(0, 10),
+              category_id: dbCat?.id ?? null,
+              supplier_id: null,
+              description: exp.name || '',
+              quantity: 1,
+              amount: b.amount, vat_rate: 0, vat_amount: 0, net_amount: b.net_amount,
+              payment_method: '', supplier_invoice_ref: null, invoice_file_url: null,
+              source: 'manual', source_id: null, product_id: null, created_by: null,
+            } as Parameters<typeof insertBusinessExpense>[0]);
+          }
+          localStorage.removeItem('other_expenses');
+          localStorage.removeItem('expense_categories');
+        }
+      } catch (err) {
+        console.warn('[FastSheep] no se pudieron migrar los gastos de localStorage:', err);
+      }
+      try {
+        await reloadBusinessExpenses();
+      } catch (err) {
+        console.warn('[FastSheep] tabla expenses no disponible aun:', err);
+      }
 
       // Delivery checklists (separate fetch so a missing table doesn't block the app)
       try {
@@ -3087,8 +3168,8 @@ USING (true);`;
           id: `fin-overdue-${pay.id}`,
           type: 'financing',
           message: language === 'es'
-            ? `⚠️ ¡VENCIDA hace ${Math.abs(diffDays)} días!: Cuota ${pay.installment_number}/${plan?.num_installments || 1} de ${custName} (${pay.due_date})`
-            : `⚠️ OVERDUE by ${Math.abs(diffDays)} days!: Installment ${pay.installment_number}/${plan?.num_installments || 1} for ${custName} (${pay.due_date})`,
+            ? `⚠️ ¡VENCIDA hace ${Math.abs(diffDays)} días!: Cuota ${pay.installment_number}/${plan?.num_installments || 1} de ${custName} (${fmtDMY(pay.due_date)})`
+            : `⚠️ OVERDUE by ${Math.abs(diffDays)} days!: Installment ${pay.installment_number}/${plan?.num_installments || 1} for ${custName} (${fmtDMY(pay.due_date)})`,
           priority: 'high', date: pay.due_date
         });
       } else if (diffDays > 0 && diffDays <= 7) {
@@ -3096,8 +3177,8 @@ USING (true);`;
           id: `fin-soon-${pay.id}`,
           type: 'financing',
           message: language === 'es'
-            ? `Cuota ${pay.installment_number}/${plan?.num_installments || 1} de ${custName} vence en ${diffDays} días (${pay.due_date})`
-            : `Installment ${pay.installment_number}/${plan?.num_installments || 1} for ${custName} is due in ${diffDays} days (${pay.due_date})`,
+            ? `Cuota ${pay.installment_number}/${plan?.num_installments || 1} de ${custName} vence en ${diffDays} días (${fmtDMY(pay.due_date)})`
+            : `Installment ${pay.installment_number}/${plan?.num_installments || 1} for ${custName} is due in ${diffDays} days (${fmtDMY(pay.due_date)})`,
           priority: 'normal', date: pay.due_date
         });
       }
@@ -3160,23 +3241,14 @@ USING (true);`;
   const [balanceCategoryFilter, setBalanceCategoryFilter] = useState<string>('all');
   const [balanceProductFilter, setBalanceProductFilter] = useState<string>('all');
 
-  // Custom other expenses & categories
-  const [expenseCategories, setExpenseCategories] = useState<{ id: string; name: string; color: string }[]>(() => {
-    const saved = localStorage.getItem('expense_categories');
-    if (saved) return JSON.parse(saved);
-    return [
-      { id: 'cat-servicios', name: 'Servicios', color: '#3b82f6' },
-      { id: 'cat-alquiler', name: 'Alquiler de Local', color: '#10b981' },
-      { id: 'cat-marketing', name: 'Marketing', color: '#ec4899' },
-      { id: 'cat-sueldos', name: 'Sueldos', color: '#f59e0b' },
-      { id: 'cat-impuestos', name: 'Impuestos', color: '#ef4444' }
-    ];
-  });
-
-  const [otherExpenses, setOtherExpenses] = useState<{ id: string; name: string; amount: number; categoryId: string; date: string }[]>(() => {
-    const saved = localStorage.getItem('other_expenses');
-    return saved ? JSON.parse(saved) : [];
-  });
+  // Gastos generales y sus categorias. Antes vivian en localStorage; ahora
+  // son la tabla expenses de la base (fuente unica, la misma que ve la
+  // pestaña Compras y Gastos). Se conserva la forma de datos de antes para
+  // no reescribir la UI del Balance: 'otherExpenses' son solo los gastos de
+  // origen 'manual' (los de stock y mantenimiento el Balance ya los cuenta
+  // por su lado, no deben duplicarse aqui).
+  const [expenseCategories, setExpenseCategories] = useState<{ id: string; name: string; color: string }[]>([]);
+  const [otherExpenses, setOtherExpenses] = useState<{ id: string; name: string; amount: number; categoryId: string; date: string }[]>([]);
 
   // Modal control states
   const [isAddExpenseModalOpen, setIsAddExpenseModalOpen] = useState(false);
@@ -3193,14 +3265,86 @@ USING (true);`;
   const [categoryFormColor, setCategoryFormColor] = useState('#3b82f6');
   const [editingCategoryId, setEditingCategoryId] = useState<string | null>(null);
 
-  // Synchronize localStorage
-  useEffect(() => {
-    localStorage.setItem('expense_categories', JSON.stringify(expenseCategories));
-  }, [expenseCategories]);
+  // Lista unificada para la pantalla Compras y Gastos. Replica las cuatro
+  // fuentes de egresos del Balance (stock via price_paid, mantenimiento en
+  // sus dos tablas, y gastos manuales) para que los totales de las dos
+  // pantallas coincidan por construccion. NO suma de la tabla expenses las
+  // filas de stock/mantenimiento: esas se cuentan aqui desde su origen, y
+  // sumarlas ademas seria doble conteo.
+  const unifiedExpenses = useMemo((): import('./invoicing/types').UnifiedExpenseRow[] => {
+    const rows: import('./invoicing/types').UnifiedExpenseRow[] = [];
+    // 1. Compra de stock (products.price_paid).
+    products.forEach(p => {
+      if ((p.price_paid || 0) > 0) {
+        rows.push({
+          id: `stock-${p.id}`,
+          date: p.purchase_date || (p.date_added ? p.date_added.slice(0, 10) : ''),
+          description: `${language === 'es' ? 'Compra' : 'Purchase'}: ${[p.serial_number, p.name].filter(Boolean).join(' ')}`,
+          categoryName: language === 'es' ? 'Compra de Stock' : 'Stock purchase',
+          amount: p.price_paid || 0,
+          origin: 'stock',
+        });
+      }
+    });
+    // 2. Mantenimiento (maintenance_records).
+    records.forEach(r => {
+      if (r.cost > 0) {
+        const p = products.find(prod => prod.id === r.bike_id);
+        rows.push({
+          id: `rec-${r.id}`,
+          date: (r as { created_at?: string }).created_at?.split('T')[0] || r.service_date,
+          description: `${language === 'es' ? 'Taller' : 'Service'}: ${r.description}${p ? ` (${p.serial_number})` : ''}`,
+          categoryName: language === 'es' ? 'Mantenimiento' : 'Maintenance',
+          amount: r.cost,
+          origin: 'maintenance',
+        });
+      }
+    });
+    // 3. Mantenimiento (maintenance_expenses, el estado 'expenses').
+    expenses.forEach(e => {
+      if (e.cost > 0) {
+        rows.push({
+          id: `mexp-${e.id}`,
+          date: e.date,
+          description: `${language === 'es' ? 'Gasto' : 'Expense'}: ${e.description}`,
+          categoryName: language === 'es' ? 'Mantenimiento' : 'Maintenance',
+          amount: e.cost,
+          origin: 'maintenance',
+        });
+      }
+    });
+    // 4. Gastos manuales (tabla expenses, source manual -> otherExpenses).
+    otherExpenses.forEach(exp => {
+      const cat = expenseCategories.find(c => c.id === exp.categoryId);
+      rows.push({
+        id: exp.id,
+        date: exp.date,
+        description: exp.name,
+        categoryName: cat ? cat.name : (language === 'es' ? 'Otros Gastos' : 'Other expenses'),
+        amount: exp.amount,
+        origin: 'manual',
+      });
+    });
+    return rows.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+  }, [products, records, expenses, otherExpenses, expenseCategories, language]);
 
-  useEffect(() => {
-    localStorage.setItem('other_expenses', JSON.stringify(otherExpenses));
-  }, [otherExpenses]);
+  // Recarga los gastos generales y categorias desde la base. Se llama tras
+  // cada alta/baja/edicion para reflejar el cambio sin recargar todo.
+  const reloadBusinessExpenses = useCallback(async () => {
+    const [exps, cats] = await Promise.all([getBusinessExpenses(), getDbExpenseCategories()]);
+    setExpenseCategories(cats.map(c => ({ id: c.id, name: c.name, color: c.color })));
+    setOtherExpenses(
+      exps
+        .filter(e => e.source === 'manual')
+        .map(e => ({
+          id: e.id,
+          name: e.description,
+          amount: Number(e.amount ?? 0),
+          categoryId: e.category_id ?? '',
+          date: e.expense_date,
+        })),
+    );
+  }, []);
 
   // Get all unique product names based on Brand and Model
   const uniqueProductList = useMemo(() => {
@@ -4134,6 +4278,8 @@ USING (true);`;
   const [soldCustomerLastName, setSoldCustomerLastName] = useState('');
   const [soldCustomerEmail, setSoldCustomerEmail] = useState('');
   const [soldCustomerPhone, setSoldCustomerPhone] = useState('');
+  const [soldCustomerNationality, setSoldCustomerNationality] = useState('');
+  const [soldCustomerAddress, setSoldCustomerAddress] = useState('');
   const [soldCustomerSearch, setSoldCustomerSearch] = useState('');
   const [soldEmailLang, setSoldEmailLang] = useState<'es' | 'en' | 'pt'>('es');
   const [soldProducts, setSoldProducts] = useState<{ tempId: string; product: Product }[]>([]);
@@ -4153,7 +4299,7 @@ USING (true);`;
           setSoldMixedCash(targetAmount);
           setSoldMixedTransfer(0);
         } else {
-          setSoldMixedTransfer(round1(targetAmount - soldMixedCash));
+          setSoldMixedTransfer(round2(targetAmount - soldMixedCash));
         }
       }
     }
@@ -4166,6 +4312,8 @@ USING (true);`;
   const [returnPhotos,       setReturnPhotos]       = useState<File[]>([]);
   const [returnPhotoPreviews, setReturnPhotoPreviews] = useState<string[]>([]);
   const [isUploadingReturnPhotos, setIsUploadingReturnPhotos] = useState(false);
+  // Ubicacion elegida al devolver, por producto (baterias, candado, kit).
+  const [returnItemLocations, setReturnItemLocations] = useState<Record<string, string>>({});
   const [maintPhotos,        setMaintPhotos]        = useState<File[]>([]);
   const [maintPhotoPreviews, setMaintPhotoPreviews] = useState<string[]>([]);
   const [isUploadingMaintPhotos, setIsUploadingMaintPhotos] = useState(false);
@@ -4175,6 +4323,10 @@ USING (true);`;
   const [payFormRentalId, setPayFormRentalId] = useState<string | null>(null);
   const [payFormType, setPayFormType] = useState<'rent' | 'other'>('rent');
   const [payFormReceivedVia, setPayFormReceivedVia] = useState<'efectivo' | 'transferencia'>('efectivo');
+  // Emitir la factura de este cobro (apartado 5). Por defecto si, salvo que
+  // el alquiler ya facture solo por el cron semanal, donde se apaga para no
+  // duplicar (la logica de abajo lo decide al abrir el modal).
+  const [payFormEmitInvoice, setPayFormEmitInvoice] = useState<boolean>(true);
 
   const [payInstallmentProduct, setPayInstallmentProduct] = useState<Product | null>(null);
   const [payInstallmentReceivedVia, setPayInstallmentReceivedVia] = useState<'efectivo' | 'transferencia'>('efectivo');
@@ -4776,6 +4928,8 @@ USING (true);`;
     setSoldCustomerLastName('');
     setSoldCustomerEmail('');
     setSoldCustomerPhone('');
+    setSoldCustomerNationality('');
+    setSoldCustomerAddress('');
     setSoldCustomerSearch('');
     setSoldEmailLang('es');
     const linkedLock = products.find(p => p.category_id === catLockId && p.custom_field_values?.associated_bike_id === prod.id);
@@ -4808,6 +4962,118 @@ USING (true);`;
     setSoldReceivedVia('efectivo');
     setSelectedProductId(prod.id); setModalType('sold');
   }, [products, language, catLockId, catBikeId]);
+
+  // Todas las filas del mismo grupo (mismo serial). Un producto generico se
+  // guarda como varias filas / distribucion por ubicacion; uno individual
+  // es una sola fila.
+  const groupRowsOf = useCallback((prod: Product) =>
+    products.filter(p => p.serial_number === prod.serial_number), [products]);
+
+  // Unidades disponibles del grupo: suma de las distribuciones mas las
+  // filas individuales en estado Disponible.
+  const availableInGroup = useCallback((prod: Product): number => {
+    return groupRowsOf(prod).reduce((sum, p) => {
+      const dist = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
+      if (dist) return sum + Object.values(dist).reduce((a, b) => a + b, 0);
+      return sum + (p.status === 'Disponible' ? 1 : 0);
+    }, 0);
+  }, [groupRowsOf]);
+
+  // Consume N unidades del grupo para uso interno (mantenimiento). NO es una
+  // venta: no genera factura ni ingreso, y el costo ya estaba contado desde
+  // la compra (price_paid), asi que tampoco suma un gasto nuevo. Solo
+  // descuenta del stock y deja constancia.
+  const handleConsumeStock = async () => {
+    const prod = products.find(p => p.id === consumeProductId);
+    if (!prod) return;
+    const qty = Math.max(1, Math.floor(consumeQty));
+    const available = availableInGroup(prod);
+    if (qty > available) {
+      showToast(language === 'es' ? `Solo hay ${available} disponibles.` : `Only ${available} available.`, 'error');
+      return;
+    }
+    try {
+      setConsumeSubmitting(true);
+      let remaining = qty;
+      const rows = groupRowsOf(prod);
+      // Estado final de cada fila que se modifica, por id. Se acumula aqui
+      // y se escribe UNA sola vez por fila al final: si se escribiera el
+      // descuento y luego, por separado, el log de consumo tomando la fila
+      // original, el segundo write pisaria el descuento del primero.
+      const updates = new Map<string, Product>();
+
+      // 1. Primero se drena de las filas con distribucion por ubicacion.
+      for (const row of rows) {
+        if (remaining <= 0) break;
+        const dist = row.custom_field_values?.location_distribution as Record<string, number> | undefined;
+        if (!dist) continue;
+        const updated = { ...dist };
+        for (const [loc] of Object.entries(updated).sort((a, b) => b[1] - a[1])) {
+          if (remaining <= 0) break;
+          const take = Math.min(updated[loc], remaining);
+          updated[loc] -= take;
+          remaining -= take;
+          if (updated[loc] <= 0) delete updated[loc];
+        }
+        updates.set(row.id, { ...row, custom_field_values: { ...row.custom_field_values, location_distribution: updated } });
+      }
+
+      // 2. Si aun falta, se marcan filas individuales Disponibles como uso interno.
+      if (remaining > 0) {
+        for (const row of rows) {
+          if (remaining <= 0) break;
+          const dist = row.custom_field_values?.location_distribution as Record<string, number> | undefined;
+          if (dist) continue;
+          if (row.status === 'Disponible') {
+            updates.set(row.id, { ...(updates.get(row.id) ?? row), status: 'Uso Interno' });
+            remaining -= 1;
+          }
+        }
+      }
+
+      // 3. Log de consumo sobre la fila maestra, partiendo de su estado YA
+      //    actualizado (si se toco en el paso 1/2), no del original.
+      const partLabel = [prod.serial_number, prod.name].filter(Boolean).join(' ');
+      const noteText = consumeNote.trim();
+      const master = updates.get(rows[0].id) ?? rows[0];
+      const log = (master.custom_field_values?.consumptions as Array<Record<string, unknown>>) || [];
+      updates.set(rows[0].id, {
+        ...master,
+        custom_field_values: {
+          ...master.custom_field_values,
+          consumptions: [...log, { date: new Date().toISOString().split('T')[0], qty, note: noteText, bike_id: consumeBikeId || null }],
+        },
+      });
+
+      // Escritura unica por fila.
+      for (const row of updates.values()) {
+        await upsertProduct(row);
+      }
+
+      // Si se eligio bici, va al historial de esa bici con costo 0 (el gasto
+      // ya se conto al comprar el repuesto: contarlo aqui seria doble).
+      if (consumeBikeId) {
+        await upsertRecord({
+          id: crypto.randomUUID(),
+          bike_id: consumeBikeId,
+          service_date: new Date().toISOString().split('T')[0],
+          location: 'Uso interno',
+          description: `${language === 'es' ? 'Uso interno' : 'Internal use'}: ${qty}× ${partLabel}${noteText ? ` — ${noteText}` : ''}`,
+          cost: 0,
+          performed_by: 'Taller',
+        });
+      }
+
+      triggerReload();
+      setModalType(null);
+      setConsumeProductId(null);
+      showToast(language === 'es' ? `${qty}× ${partLabel} consumido(s) para uso interno.` : `${qty}× ${partLabel} used internally.`, 'success');
+    } catch {
+      showToast(language === 'es' ? 'Error al consumir el stock.' : 'Error consuming stock.', 'error');
+    } finally {
+      setConsumeSubmitting(false);
+    }
+  };
 
   const handlePayInstallment = useCallback(async (prod: Product, receivedVia?: 'efectivo' | 'transferencia') => {
     try {
@@ -4901,7 +5167,7 @@ USING (true);`;
           const reminderEvent = {
             id: crypto.randomUUID(),
             title: `💳 Cuota ${nextNext.installment_number}/${plan.num_installments}: ${custName}`,
-            description: `Vencimiento de la cuota ${nextNext.installment_number} del financiamiento por la compra de: ${bikeSerials}. Monto: €${fmt1(nextNext.amount)}.`,
+            description: `Vencimiento de la cuota ${nextNext.installment_number} del financiamiento por la compra de: ${bikeSerials}. Monto: €${fmt2(nextNext.amount)}.`,
             event_date: nextNext.due_date,
             remind_one_week: true,
             remind_one_day: true,
@@ -4925,8 +5191,19 @@ USING (true);`;
     setReturnFormDamage(''); setReturnFormDeposit(rental.deposit_amount);
     setReturnPhotos([]); setReturnPhotoPreviews([]);
     setIsUploadingReturnPhotos(false);
+    // Precarga la ubicacion de cada elemento del alquiler con su ubicacion
+    // de origen (o Almacén Central), para que el operador la ajuste al
+    // devolver.
+    const locs: Record<string, string> = {};
+    rentalItems.filter(it => it.rental_id === rental.id).forEach(it => {
+      const prod = products.find(p => p.id === it.product_id);
+      if (!prod || prod.status !== 'Rentada') return;
+      const home = (prod.custom_field_values?.location as string) || 'Almacén Central';
+      locs[it.product_id] = home;
+    });
+    setReturnItemLocations(locs);
     setModalType('return');
-  }, []);
+  }, [rentalItems, products]);
 
   const openSupplierModal = useCallback((sup?: Supplier) => {
     if (sup) {
@@ -5027,6 +5304,15 @@ USING (true);`;
   const [workshopPickerSearch, setWorkshopPickerSearch] = useState('');
   const [finishServiceBikeId, setFinishServiceBikeId] = useState<string | null>(null);
   const [finishServiceCost, setFinishServiceCost] = useState(0);
+  // Descripcion del trabajo hecho en el taller: queda en el historial de
+  // la bici junto con el costo.
+  const [finishServiceNotes, setFinishServiceNotes] = useState('');
+  // Consumo de stock para uso interno (mantenimiento), sin contar como venta.
+  const [consumeProductId, setConsumeProductId] = useState<string | null>(null);
+  const [consumeQty, setConsumeQty] = useState(1);
+  const [consumeNote, setConsumeNote] = useState('');
+  const [consumeBikeId, setConsumeBikeId] = useState('');
+  const [consumeSubmitting, setConsumeSubmitting] = useState(false);
   const [genStockLocation, setGenStockLocation] = useState('Almacén Central');
   const [genStockCost, setGenStockCost] = useState(0);
   const [menuCoords, setMenuCoords] = useState<{ top: number; left: number; width: number; height: number } | null>(null);
@@ -5746,10 +6032,10 @@ USING (true);`;
         changes.push({ label: 'Batteries', before: listOf(prevBatteryIds), after: listOf(swapBatteryIds) });
       }
       if (swapRate !== rental.rental_rate) {
-        changes.push({ label: contractRatePeriodLabel(rental.rate_type), before: `€${fmt1(rental.rental_rate)}`, after: `€${fmt1(swapRate)}` });
+        changes.push({ label: contractRatePeriodLabel(rental.rate_type), before: `€${fmt2(rental.rental_rate)}`, after: `€${fmt2(swapRate)}` });
       }
       if (swapDeposit !== rental.deposit_amount) {
-        changes.push({ label: 'Security Deposit', before: `€${fmt1(rental.deposit_amount)}`, after: `€${fmt1(swapDeposit)}` });
+        changes.push({ label: 'Security Deposit', before: `€${fmt2(rental.deposit_amount)}`, after: `€${fmt2(swapDeposit)}` });
       }
 
       let avisoAnexo = '';
@@ -5933,8 +6219,60 @@ USING (true);`;
           : wizKitDetails,
         deposit_refunded: null, damage_report: null, created_at: new Date().toISOString(),
         deposit_received_via: wizDepositPaymentMethod,
+        // Facturacion automatica: los alquileres semanales entran al cron.
+        // Sin next_invoice_date el cron los ignora, asi que se fija el
+        // primer cobro una semana despues del inicio.
+        auto_invoice: wizRateType === 'semanal',
+        next_invoice_date: wizRateType === 'semanal'
+          ? (() => {
+              const [yy, mm, dd] = wizStartDate.split('-').map(Number);
+              const d = new Date(yy, mm - 1, dd + 7);
+              return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+            })()
+          : null,
       };
       await upsertRental(newRental);
+
+      // Documentos de alta: recibo del deposito (si hay) y factura de la
+      // primera semana/periodo de alquiler (si hay importe). La bici se
+      // entrega al cobrar, asi que ambas nacen ya pagadas. Van en el
+      // MISMO email para no mandar dos correos por la misma alta. Un
+      // fallo aqui no tumba la creacion del alquiler: se avisa aparte.
+      const firstDocIds: string[] = [];
+      if (wizDeposit > 0) {
+        try {
+          const dep = await issueDepositReceipt({
+            rentalId: newRentId,
+            amount: wizDeposit,
+            paymentMethod: wizDepositPaymentMethod,
+            paymentDate: wizStartDate,
+          });
+          firstDocIds.push(dep.id);
+        } catch (depErr) {
+          console.error('[FastSheep] no se pudo emitir el recibo de deposito:', depErr);
+        }
+      }
+      if (wizRate > 0) {
+        try {
+          const firstInvoice = await issueRentalInvoice({
+            rentalId: newRentId,
+            amount: wizRate,
+            paymentMethod: wizRatePaymentMethod,
+            paymentDate: wizStartDate,
+            description: language === 'es' ? 'Alquiler de e-bike' : 'E-bike rental',
+          });
+          firstDocIds.push(firstInvoice.id);
+        } catch (invErr) {
+          console.error('[FastSheep] no se pudo emitir la factura de la primera semana:', invErr);
+        }
+      }
+      if (firstDocIds.length > 0) {
+        try {
+          await generateDocumentPdfBatch(firstDocIds, true);
+        } catch (pdfErr) {
+          console.error('[FastSheep] no se pudieron generar/enviar los documentos de alta:', pdfErr);
+        }
+      }
 
       // Primer tramo del historial de asignacion de bici.
       try {
@@ -5958,7 +6296,7 @@ USING (true);`;
         const rentalReminderEvent = {
           id: crypto.randomUUID(),
           title: `🚲 Pago Alquiler: ${rider.first_name} ${rider.last_name}`,
-          description: `Mensualidad del alquiler de la bicicleta: ${bikeProduct?.name || 'E-Bike'} (${bikeProduct?.serial_number || 'S/N'}). Monto: €${fmt1(wizRateType === 'mensual' ? wizRate : Math.round(wizRate * 4))}.`,
+          description: `Mensualidad del alquiler de la bicicleta: ${bikeProduct?.name || 'E-Bike'} (${bikeProduct?.serial_number || 'S/N'}). Monto: €${fmt2(wizRateType === 'mensual' ? wizRate : Math.round(wizRate * 4))}.`,
           event_date: formattedFirstInstallmentDate,
           remind_one_week: true,
           remind_one_day: true,
@@ -6378,7 +6716,7 @@ USING (true);`;
       }).eq('id', signRentalData.rental.id);
       sendRentalContractCopyEmail(
         signContractSnapshot,
-        { signature_url: signatureUrl, signed_at: new Date(signedAt).toLocaleString('en-IE'), image_consent: signImageConsent },
+        { signature_url: signatureUrl, signed_at: fmtDMYTime(signedAt), image_consent: signImageConsent },
         signContractSnapshot.email_lang,
       );
       setSignSuccess(true);
@@ -6642,7 +6980,7 @@ USING (true);`;
     try {
       const url = await uploadSignatureImage(`amendment-${amendmentData.id}`, canvas.toDataURL('image/png'));
       await signContractAmendment(amendmentData.id, url);
-      sendAmendmentCopyEmail(amendmentData, url, new Date().toLocaleString('en-IE'));
+      sendAmendmentCopyEmail(amendmentData, url, fmtDMYTime(new Date()));
       setAmendmentSuccess(true);
     } catch (err) {
       console.error('No se pudo guardar la firma del anexo:', err);
@@ -6687,7 +7025,7 @@ USING (true);`;
                 <p style={{ fontWeight: 700, marginTop: 0 }}>BACKGROUND</p>
                 <p>
                   The parties entered into an Electric Bicycle Rental Agreement (the "Agreement"). By this
-                  Amendment they agree to modify the terms listed below, with effect from <strong>{am.effective_date}</strong>.
+                  Amendment they agree to modify the terms listed below, with effect from <strong>{fmtDMY(am.effective_date)}</strong>.
                 </p>
               </div>
 
@@ -7188,6 +7526,8 @@ USING (true);`;
           {[
             { key: 'analytics',     icon: '📊', label: t.dashboard },
             { key: 'balance',       icon: '💰', label: t.balance },
+            { key: 'invoicing',     icon: '🧾', label: language === 'es' ? 'Facturación' : 'Invoicing' },
+            { key: 'expenses',      icon: '🛒', label: language === 'es' ? 'Compras y Gastos' : 'Purchases' },
             { key: 'stock',         icon: '📦', label: t.stock },
             { key: 'rental_wizard', icon: '⚡', label: t.wizard },
             { key: 'accounts',      icon: '🛵', label: t.accounts },
@@ -7249,7 +7589,11 @@ USING (true);`;
           >
             ☰
           </button>
-          <h1 className="topbar-title">{t[currentTab as keyof typeof t] || currentTab}</h1>
+          <h1 className="topbar-title">{
+            currentTab === 'invoicing' ? (language === 'es' ? 'Facturación' : 'Invoicing')
+            : currentTab === 'expenses' ? (language === 'es' ? 'Compras y Gastos' : 'Purchases & Expenses')
+            : (t[currentTab as keyof typeof t] || currentTab)
+          }</h1>
           <div className="topbar-actions">
             <select className="lang-selector" value={language} onChange={e => setLanguage(e.target.value as 'es' | 'en')}>
               <option value="es">ES 🇪🇸</option>
@@ -7732,7 +8076,7 @@ USING (true);`;
                 {balanceTxFilter !== 'maintenance_only' && (
                   <div className="glass-card kpi-card">
                     <div className="kpi-header"><span className="kpi-title">{t.income}</span><span className="kpi-icon">📈</span></div>
-                    <div className="kpi-value" style={{ color: '#10b981' }}>€{fmt1(balanceData.totalIncome)}</div>
+                    <div className="kpi-value" style={{ color: '#10b981' }}>€{fmt2(balanceData.totalIncome)}</div>
                     <div className="kpi-trend trend-up">
                       {balanceTxFilter === 'purchase_sale' 
                         ? (language === 'es' ? 'Ventas' : 'Sales') 
@@ -7742,8 +8086,8 @@ USING (true);`;
                     </div>
                     {/* Payment method breakdown */}
                     <div style={{ fontSize: '11.5px', color: 'var(--text-muted)', marginTop: '6px', display: 'flex', gap: '12px', borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '6px' }}>
-                      <span>💵 {language === 'es' ? 'Efectivo:' : 'Cash:'} €{fmt1(balanceData.totalIncomeCash)}</span>
-                      <span>🏦 {language === 'es' ? 'Transf.:' : 'Transfer:'} €{fmt1(balanceData.totalIncomeTransfer)}</span>
+                      <span>💵 {language === 'es' ? 'Efectivo:' : 'Cash:'} €{fmt2(balanceData.totalIncomeCash)}</span>
+                      <span>🏦 {language === 'es' ? 'Transf.:' : 'Transfer:'} €{fmt2(balanceData.totalIncomeTransfer)}</span>
                     </div>
                   </div>
                 )}
@@ -7751,17 +8095,17 @@ USING (true);`;
                   <>
                     <div className="glass-card kpi-card">
                        <div className="kpi-header"><span className="kpi-title">{language === 'es' ? 'Depósitos' : 'Deposits'}</span><span className="kpi-icon">🔒</span></div>
-                       <div className="kpi-value" style={{ color: '#f59e0b' }}>€{fmt1(balanceData.activeDeposits)}</div>
+                       <div className="kpi-value" style={{ color: '#f59e0b' }}>€{fmt2(balanceData.activeDeposits)}</div>
                        <div className="kpi-trend trend-neutral">{language === 'es' ? 'Garantía Retenida' : 'Held Guarantee'}</div>
                        {/* Deposit method breakdown */}
                        <div style={{ fontSize: '11.5px', color: 'var(--text-muted)', marginTop: '6px', display: 'flex', gap: '12px', borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '6px' }}>
-                         <span>💵 {language === 'es' ? 'Efectivo:' : 'Cash:'} €{fmt1(balanceData.activeDepositsCash)}</span>
-                         <span>🏦 {language === 'es' ? 'Transf.:' : 'Transfer:'} €{fmt1(balanceData.activeDepositsTransfer)}</span>
+                         <span>💵 {language === 'es' ? 'Efectivo:' : 'Cash:'} €{fmt2(balanceData.activeDepositsCash)}</span>
+                         <span>🏦 {language === 'es' ? 'Transf.:' : 'Transfer:'} €{fmt2(balanceData.activeDepositsTransfer)}</span>
                        </div>
                     </div>
                     <div className="glass-card kpi-card">
                        <div className="kpi-header"><span className="kpi-title">{language === 'es' ? 'Total Alquiler' : 'Total Rental'}</span><span className="kpi-icon">💶</span></div>
-                       <div className="kpi-value" style={{ color: '#10b981' }}>€{fmt1((balanceData.totalIncome + balanceData.activeDeposits))}</div>
+                       <div className="kpi-value" style={{ color: '#10b981' }}>€{fmt2((balanceData.totalIncome + balanceData.activeDeposits))}</div>
                        <div className="kpi-trend trend-up">{language === 'es' ? 'Ingresos + Depósitos' : 'Income + Deposits'}</div>
                     </div>
                   </>
@@ -7769,7 +8113,7 @@ USING (true);`;
                 {balanceTxFilter !== 'rental_only' && (
                   <div className="glass-card kpi-card">
                     <div className="kpi-header"><span className="kpi-title">{t.expenses}</span><span className="kpi-icon">📉</span></div>
-                    <div className="kpi-value" style={{ color: '#ef4444' }}>€{fmt1(balanceData.totalExpense)}</div>
+                    <div className="kpi-value" style={{ color: '#ef4444' }}>€{fmt2(balanceData.totalExpense)}</div>
                     <div className="kpi-trend trend-down">
                       {balanceTxFilter === 'purchase_sale' 
                         ? (language === 'es' ? 'Compras' : 'Purchases') 
@@ -7783,7 +8127,7 @@ USING (true);`;
                   <div className="glass-card kpi-card">
                     <div className="kpi-header"><span className="kpi-title">{t.netFlow}</span><span className="kpi-icon">💶</span></div>
                     <div className="kpi-value" style={{ color: balanceData.totalIncome - balanceData.totalExpense >= 0 ? '#10b981' : '#ef4444' }}>
-                      €{fmt1((balanceData.totalIncome - balanceData.totalExpense))}
+                      €{fmt2((balanceData.totalIncome - balanceData.totalExpense))}
                     </div>
                     <div className="kpi-trend trend-neutral">Beneficio Operativo</div>
                   </div>
@@ -7791,7 +8135,7 @@ USING (true);`;
                 {balanceTxFilter === 'all' && (
                   <div className="glass-card kpi-card">
                     <div className="kpi-header"><span className="kpi-title">Depósitos Activos</span><span className="kpi-icon">🔒</span></div>
-                    <div className="kpi-value" style={{ color: '#f59e0b' }}>€{fmt1(balanceData.activeDeposits)}</div>
+                    <div className="kpi-value" style={{ color: '#f59e0b' }}>€{fmt2(balanceData.activeDeposits)}</div>
                     <div className="kpi-trend trend-neutral">Garantía Retenida</div>
                   </div>
                 )}
@@ -7820,18 +8164,6 @@ USING (true);`;
                         <tr><td colSpan={5} style={{ textAlign: 'center', padding: '20px', color: 'var(--text-muted)' }}>{balanceSearch.trim() ? (language === 'es' ? 'No hay transacciones que coincidan.' : 'No matching transactions.') : 'No hay transacciones registradas.'}</td></tr>
                       ) : (
                         filteredTxs.map((tx) => {
-                          const formatDateToDDMMYY = (dateStr: string) => {
-                            if (!dateStr) return '';
-                            const cleanStr = dateStr.split('T')[0];
-                            const parts = cleanStr.split('-');
-                            if (parts.length === 3) {
-                              const [y, m, d] = parts;
-                              if (y.length === 4) {
-                                return `${d}/${m}/${y.slice(-2)}`;
-                              }
-                            }
-                            return dateStr;
-                          };
                           const isCustomExpense = tx.id.startsWith('other-');
                           let customColor = undefined;
                           if (isCustomExpense) {
@@ -7845,7 +8177,7 @@ USING (true);`;
 
                           return (
                             <tr key={tx.id}>
-                              <td>{formatDateToDDMMYY(tx.date)}</td>
+                              <td>{fmtDMY(tx.date)}</td>
                               <td>
                                 <span 
                                   className={`badge ${
@@ -7865,8 +8197,10 @@ USING (true);`;
                                   {tx.category}
                                 </span>
                               </td>
-                              <td>
-                                {tx.description}
+                              <td title={tx.description}>
+                                {tx.description && tx.description.length > 60
+                                  ? tx.description.slice(0, 60) + '…'
+                                  : tx.description}
                               </td>
                               <td>
                                 {tx.received_via ? (
@@ -7884,7 +8218,7 @@ USING (true);`;
                                 )}
                               </td>
                               <td style={{ textAlign: 'right', fontWeight: 'bold', color: tx.type === 'income' ? '#10b981' : '#ef4444' }}>
-                                {tx.type === 'income' ? '+' : '-'}€{fmt1(tx.amount)}
+                                {tx.type === 'income' ? '+' : '-'}€{fmt2(tx.amount)}
                                 <button
                                   onClick={async () => {
                                     if (await asyncConfirm(language === 'es' ? '¿Seguro que deseas eliminar esta transacción? Esta acción revertirá los efectos originales de la misma en la base de datos.' : 'Are you sure you want to delete this transaction? This will revert its original effects in the database.')) {
@@ -7892,7 +8226,8 @@ USING (true);`;
                                         const rawId = tx.id;
                                         if (rawId.startsWith('other-')) {
                                           const expId = rawId.replace('other-', '');
-                                          setOtherExpenses(prev => prev.filter(e => e.id !== expId));
+                                          await deleteBusinessExpense(expId);
+                                          await reloadBusinessExpenses();
                                         } else if (rawId.startsWith('pay-')) {
                                           await deletePayment(rawId.replace('pay-', ''));
                                         } else if (rawId.startsWith('ear-')) {
@@ -8039,7 +8374,7 @@ USING (true);`;
                               </td>
                               <td style={{ verticalAlign: 'middle' }}><strong>{bike.serial_number}</strong></td>
                               <td style={{ verticalAlign: 'middle' }}>{bike.name}</td>
-                              <td style={{ verticalAlign: 'middle' }}><span style={{ color: 'var(--color-primary)', fontWeight: 600 }}>€{fmt1(bike.suggested_weekly_rate)}/wk</span></td>
+                              <td style={{ verticalAlign: 'middle' }}><span style={{ color: 'var(--color-primary)', fontWeight: 600 }}>€{fmt2(bike.suggested_weekly_rate)}/wk</span></td>
                               <td style={{ verticalAlign: 'middle' }}>{bike.odometer} km</td>
                             </tr>
                           );
@@ -9115,8 +9450,8 @@ USING (true);`;
                       ['📧 Email', wizEmail],
                       ['📱 Phone', wizPhone],
                       ['📅 Fecha Inicio / Start Date', wizStartDate],
-                      ['💶 Rate', `€${fmt1(wizRate)}/${wizRateType} (${wizRatePaymentMethod === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})`],
-                      ['🏦 Deposit', `€${fmt1(wizDeposit)} (${wizDepositPaymentMethod === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})`],
+                      ['💶 Rate', `€${fmt2(wizRate)}/${wizRateType} (${wizRatePaymentMethod === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})`],
+                      ['🏦 Deposit', `€${fmt2(wizDeposit)} (${wizDepositPaymentMethod === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})`],
                       ['📱 App Account', wizGigAccountId ? (appAccounts.find(a => a.id === wizGigAccountId)?.platform_account_number || 'Linked') : '—'],
                       ['📸 Fotos', `${wizConditionFiles.length} ${language === 'es' ? 'foto(s)' : 'photo(s)'}`],
                       ['📸 Fotos Instagram', `${wizInstagramFiles.length} ${language === 'es' ? 'foto(s)' : 'photo(s)'}`],
@@ -9159,6 +9494,56 @@ USING (true);`;
                 </div>
               )}
             </div>
+          )}
+
+          {/* ================================================
+              TAB: FACTURACION (documentos) y COMPRAS (gastos)
+              Vistas propias que cargan sus datos; ver src/invoicing.
+              ================================================ */}
+          {currentTab === 'invoicing' && (
+            <DocumentsView
+              language={language}
+              showToast={showToast}
+              rentalCodeById={rentalCodeById}
+              customers={customers.map(c => ({ id: c.id, name: `${c.first_name} ${c.last_name}`.trim() }))}
+            />
+          )}
+
+          {currentTab === 'expenses' && (
+            <ExpensesView
+              language={language}
+              showToast={showToast}
+              expenses={unifiedExpenses}
+              categories={expenseCategories}
+              onAddExpense={async (data) => {
+                try {
+                  const b = data.hasVat ? addVatHelper(data.amount) : noVat(data.amount);
+                  await insertBusinessExpense({
+                    expense_date: data.date,
+                    category_id: data.categoryId || null,
+                    supplier_id: null,
+                    description: data.description,
+                    quantity: 1,
+                    amount: b.amount, vat_rate: b.vat_rate, vat_amount: b.vat_amount, net_amount: b.net_amount,
+                    payment_method: '', supplier_invoice_ref: data.invoiceRef || null, invoice_file_url: null,
+                    source: 'manual', source_id: null, product_id: null, created_by: null,
+                  } as Parameters<typeof insertBusinessExpense>[0]);
+                  await reloadBusinessExpenses();
+                  showToast(language === 'es' ? 'Gasto registrado.' : 'Expense saved.', 'success');
+                } catch {
+                  showToast(language === 'es' ? 'No se pudo guardar el gasto.' : 'Could not save the expense.', 'error');
+                }
+              }}
+              onDeleteExpense={async (id) => {
+                try {
+                  await deleteBusinessExpense(id);
+                  await reloadBusinessExpenses();
+                  showToast(language === 'es' ? 'Gasto eliminado.' : 'Expense deleted.', 'success');
+                } catch {
+                  showToast(language === 'es' ? 'No se pudo eliminar.' : 'Could not delete.', 'error');
+                }
+              }}
+            />
           )}
 
           {/* ================================================
@@ -9370,11 +9755,19 @@ USING (true);`;
                               const isConsolidated = group.some(p => p.custom_field_values?.location_distribution);
                               
                               const consolidatedLocDist: Record<string, number> = {};
+                              // physicalLocDist: lo que hay REALMENTE en cada ubicacion. A
+                              // diferencia de consolidatedLocDist (que suma tambien las unidades
+                              // rentadas/en taller para poder derivar "Disp"), este excluye lo que
+                              // no esta fisicamente en el sitio: una unidad rentada la tiene el
+                              // rider, no esta en ninguna ubicacion. Es el que se muestra en el
+                              // badge de Ubicacion.
+                              const physicalLocDist: Record<string, number> = {};
                               group.filter(p => p.status !== 'Vendida' && p.status !== 'Financiada' && p.status !== 'Robada' && p.status !== 'Perdida' && p.status !== 'Perdida/Garda').forEach(p => {
                                 const dist = (p.custom_field_values?.location_distribution as Record<string, number>) || {};
                                 Object.entries(dist).forEach(([loc, qty]) => {
                                   if (qty > 0) {
                                     consolidatedLocDist[loc] = (consolidatedLocDist[loc] || 0) + qty;
+                                    physicalLocDist[loc] = (physicalLocDist[loc] || 0) + qty;
                                   }
                                 });
                                 // Only count a row as 1 implicit unit when it has NO location_distribution field at all
@@ -9384,6 +9777,10 @@ USING (true);`;
                                 if (!hasDistField && p.custom_field_values?.location) {
                                   const singleLoc = p.custom_field_values.location as string;
                                   consolidatedLocDist[singleLoc] = (consolidatedLocDist[singleLoc] || 0) + 1;
+                                  // Solo cuenta en el badge fisico si esta disponible en el sitio.
+                                  if (p.status === 'Disponible') {
+                                    physicalLocDist[singleLoc] = (physicalLocDist[singleLoc] || 0) + 1;
+                                  }
                                 }
                               });
 
@@ -9434,7 +9831,9 @@ USING (true);`;
                                       <span style={{ color: 'var(--text-muted)' }}>—</span>
                                     ) : isConsolidated ? (
                                       <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                                        {Object.entries(consolidatedLocDist)
+                                        {Object.entries(physicalLocDist).filter(([_, qty]) => qty > 0).length === 0 ? (
+                                          <span style={{ color: 'var(--text-muted)', fontSize: '11px' }}>—</span>
+                                        ) : Object.entries(physicalLocDist)
                                           .filter(([_, qty]) => qty > 0)
                                           .map(([locName, qty]) => (
                                             <div key={locName} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -9448,11 +9847,7 @@ USING (true);`;
                                         <strong>📍 {activeProd.custom_field_values.location as string}</strong>
                                         {!!activeProd.custom_field_values.location_date && (
                                           <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: '2px' }}>
-                                            {(() => {
-                                              const dStr = activeProd.custom_field_values.location_date as string;
-                                              const parts = dStr.split('-');
-                                              return parts.length === 3 ? `${parts[2]}/${parts[1]}/${parts[0].slice(-2)}` : dStr;
-                                            })()}
+                                            {fmtDMY(activeProd.custom_field_values.location_date as string)}
                                           </div>
                                         )}
                                       </div>
@@ -9462,10 +9857,10 @@ USING (true);`;
                                   </td>
                                   )}
 {stockVisibleCols.price !== false && (
-                                  <td>{prod.price_sold ? <strong>€{fmt1(prod.price_sold)}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td>{prod.price_sold ? <strong>€{fmt2(prod.price_sold)}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
                                   {stockVisibleCols.cost && (
-                                  <td>{prod.price_paid ? <strong>€{fmt1(prod.price_paid)}{isConsolidated ? <span style={{ fontWeight: 400, color: 'var(--text-muted)', fontSize: '11px' }}> /u</span> : null}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td>{prod.price_paid ? <strong>€{fmt2(prod.price_paid)}{isConsolidated ? <span style={{ fontWeight: 400, color: 'var(--text-muted)', fontSize: '11px' }}> /u</span> : null}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
 {stockVisibleCols.condition !== false && (
                                   <td>
@@ -9539,6 +9934,9 @@ USING (true);`;
                                             if (displayStatus === 'Recién Revisada') {
                                               return language === 'es' ? 'Recién Revisada' : 'Recently Serviced';
                                             }
+                                            if (displayStatus === 'Uso Interno') {
+                                              return language === 'es' ? 'Uso Interno' : 'Internal Use';
+                                            }
                                             return displayStatus;
                                           })()}
                                         </span>
@@ -9585,13 +9983,13 @@ USING (true);`;
                                   <td>{prod.odometer > 0 ? <span>{prod.odometer} km</span> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
                                   {stockVisibleCols.purchase_date && (
-                                  <td style={{ fontSize: '12px' }}>{prod.purchase_date ? (() => { const p = prod.purchase_date!.split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0].slice(-2)}` : prod.purchase_date; })() : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td style={{ fontSize: '12px' }}>{prod.purchase_date ? fmtDMY(prod.purchase_date) : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
                                   {stockVisibleCols.arrival_date && (
-                                  <td style={{ fontSize: '12px' }}>{prod.arrival_date ? (() => { const p = prod.arrival_date!.split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0].slice(-2)}` : prod.arrival_date; })() : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td style={{ fontSize: '12px' }}>{prod.arrival_date ? fmtDMY(prod.arrival_date) : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
                                   {stockVisibleCols.assembly_date && (
-                                  <td style={{ fontSize: '12px' }}>{prod.custom_field_values?.assembly_date ? (() => { const p = (prod.custom_field_values.assembly_date as string).split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0].slice(-2)}` : prod.custom_field_values.assembly_date as string; })() : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td style={{ fontSize: '12px' }}>{prod.custom_field_values?.assembly_date ? fmtDMY(prod.custom_field_values.assembly_date as string) : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
                                   {stockVisibleCols.modifications && (
                                   <td>
@@ -10257,11 +10655,19 @@ USING (true);`;
                               const isConsolidated = group.some(p => p.custom_field_values?.location_distribution);
                               
                               const consolidatedLocDist: Record<string, number> = {};
+                              // physicalLocDist: lo que hay REALMENTE en cada ubicacion. A
+                              // diferencia de consolidatedLocDist (que suma tambien las unidades
+                              // rentadas/en taller para poder derivar "Disp"), este excluye lo que
+                              // no esta fisicamente en el sitio: una unidad rentada la tiene el
+                              // rider, no esta en ninguna ubicacion. Es el que se muestra en el
+                              // badge de Ubicacion.
+                              const physicalLocDist: Record<string, number> = {};
                               group.filter(p => p.status !== 'Vendida' && p.status !== 'Financiada' && p.status !== 'Robada' && p.status !== 'Perdida' && p.status !== 'Perdida/Garda').forEach(p => {
                                 const dist = (p.custom_field_values?.location_distribution as Record<string, number>) || {};
                                 Object.entries(dist).forEach(([loc, qty]) => {
                                   if (qty > 0) {
                                     consolidatedLocDist[loc] = (consolidatedLocDist[loc] || 0) + qty;
+                                    physicalLocDist[loc] = (physicalLocDist[loc] || 0) + qty;
                                   }
                                 });
                                 // Only count a row as 1 implicit unit when it has NO location_distribution field at all
@@ -10271,6 +10677,10 @@ USING (true);`;
                                 if (!hasDistField && p.custom_field_values?.location) {
                                   const singleLoc = p.custom_field_values.location as string;
                                   consolidatedLocDist[singleLoc] = (consolidatedLocDist[singleLoc] || 0) + 1;
+                                  // Solo cuenta en el badge fisico si esta disponible en el sitio.
+                                  if (p.status === 'Disponible') {
+                                    physicalLocDist[singleLoc] = (physicalLocDist[singleLoc] || 0) + 1;
+                                  }
                                 }
                               });
 
@@ -10310,7 +10720,9 @@ USING (true);`;
                                       <span style={{ color: 'var(--text-muted)' }}>—</span>
                                     ) : isConsolidated ? (
                                       <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                                        {Object.entries(consolidatedLocDist)
+                                        {Object.entries(physicalLocDist).filter(([_, qty]) => qty > 0).length === 0 ? (
+                                          <span style={{ color: 'var(--text-muted)', fontSize: '11px' }}>—</span>
+                                        ) : Object.entries(physicalLocDist)
                                           .filter(([_, qty]) => qty > 0)
                                           .map(([locName, qty]) => (
                                             <div key={locName} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -10324,11 +10736,7 @@ USING (true);`;
                                         <strong>📍 {activeProd.custom_field_values.location as string}</strong>
                                         {!!activeProd.custom_field_values.location_date && (
                                           <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: '2px' }}>
-                                            {(() => {
-                                              const dStr = activeProd.custom_field_values.location_date as string;
-                                              const parts = dStr.split('-');
-                                              return parts.length === 3 ? `${parts[2]}/${parts[1]}/${parts[0].slice(-2)}` : dStr;
-                                            })()}
+                                            {fmtDMY(activeProd.custom_field_values.location_date as string)}
                                           </div>
                                         )}
                                       </div>
@@ -10338,10 +10746,10 @@ USING (true);`;
                                   </td>
                                   )}
 {stockVisibleCols.price !== false && (
-                                  <td>{prod.price_sold ? <strong>€{fmt1(prod.price_sold)}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td>{prod.price_sold ? <strong>€{fmt2(prod.price_sold)}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
                                   {stockVisibleCols.cost && (
-                                  <td>{prod.price_paid ? <strong>€{fmt1(prod.price_paid)}{isConsolidated ? <span style={{ fontWeight: 400, color: 'var(--text-muted)', fontSize: '11px' }}> /u</span> : null}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td>{prod.price_paid ? <strong>€{fmt2(prod.price_paid)}{isConsolidated ? <span style={{ fontWeight: 400, color: 'var(--text-muted)', fontSize: '11px' }}> /u</span> : null}</strong> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
 {stockVisibleCols.condition !== false && (
                                   <td>
@@ -10414,6 +10822,9 @@ USING (true);`;
                                             if (displayStatus === 'Recién Revisada') {
                                               return language === 'es' ? 'Recién Revisada' : 'Recently Serviced';
                                             }
+                                            if (displayStatus === 'Uso Interno') {
+                                              return language === 'es' ? 'Uso Interno' : 'Internal Use';
+                                            }
                                             return displayStatus;
                                           })()}
                                         </span>
@@ -10454,13 +10865,13 @@ USING (true);`;
                                   <td>{prod.odometer > 0 ? <span>{prod.odometer} km</span> : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
                                   {stockVisibleCols.purchase_date && (
-                                  <td style={{ fontSize: '12px' }}>{prod.purchase_date ? (() => { const p = prod.purchase_date!.split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0].slice(-2)}` : prod.purchase_date; })() : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td style={{ fontSize: '12px' }}>{prod.purchase_date ? fmtDMY(prod.purchase_date) : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
                                   {stockVisibleCols.arrival_date && (
-                                  <td style={{ fontSize: '12px' }}>{prod.arrival_date ? (() => { const p = prod.arrival_date!.split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0].slice(-2)}` : prod.arrival_date; })() : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td style={{ fontSize: '12px' }}>{prod.arrival_date ? fmtDMY(prod.arrival_date) : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
                                   {stockVisibleCols.assembly_date && (
-                                  <td style={{ fontSize: '12px' }}>{prod.custom_field_values?.assembly_date ? (() => { const p = (prod.custom_field_values.assembly_date as string).split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0].slice(-2)}` : prod.custom_field_values.assembly_date as string; })() : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
+                                  <td style={{ fontSize: '12px' }}>{prod.custom_field_values?.assembly_date ? fmtDMY(prod.custom_field_values.assembly_date as string) : <span style={{ color: 'var(--text-muted)' }}>-</span>}</td>
                                   )}
                                   {stockVisibleCols.modifications && (
                                   <td>
@@ -11143,16 +11554,16 @@ USING (true);`;
                           </div>
                           <div className="glass-card stat-card" style={{ padding: '16px' }}>
                             <div className="stat-label">{language === 'es' ? 'Ingresos de Venta' : 'Sales Revenue'}</div>
-                            <div className="stat-value" style={{ color: 'var(--text-bright)' }}>€{fmt1(totalRevenue)}</div>
+                            <div className="stat-value" style={{ color: 'var(--text-bright)' }}>€{fmt2(totalRevenue)}</div>
                           </div>
                           <div className="glass-card stat-card" style={{ padding: '16px' }}>
                             <div className="stat-label">{language === 'es' ? 'Costo de Adquisición' : 'Acquisition Cost'}</div>
-                            <div className="stat-value" style={{ color: 'var(--text-muted)' }}>€{fmt1(totalCost)}</div>
+                            <div className="stat-value" style={{ color: 'var(--text-muted)' }}>€{fmt2(totalCost)}</div>
                           </div>
                           <div className="glass-card stat-card" style={{ padding: '16px' }}>
                             <div className="stat-label">{language === 'es' ? 'Ganancia Neta' : 'Net Profit'}</div>
                             <div className="stat-value" style={{ color: totalProfit >= 0 ? '#34d399' : '#f87171' }}>
-                              {totalProfit >= 0 ? `+€${fmt1(totalProfit)}` : `-€${fmt1(Math.abs(totalProfit))}`}
+                              {totalProfit >= 0 ? `+€${fmt2(totalProfit)}` : `-€${fmt2(Math.abs(totalProfit))}`}
                             </div>
                           </div>
                         </div>
@@ -11203,16 +11614,16 @@ USING (true);`;
 
                                     return (
                                       <tr key={s.id}>
-                                        {soldVisibleCols.sale_date    && <td>{s.sold_date}</td>}
+                                        {soldVisibleCols.sale_date    && <td>{fmtDMY(s.sold_date)}</td>}
                                         <td><span style={{ fontFamily: 'monospace', fontSize: '11px', background: 'rgba(255,255,255,0.06)', padding: '2px 6px', borderRadius: '4px', color: 'var(--text-bright)' }}>{serialDisplay}</span></td>
                                         <td>{s.name}</td>
                                         {soldVisibleCols.category     && <td style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{categoryName}</td>}
-                                        {soldVisibleCols.cost         && <td><strong>€{fmt1(s.price_paid || 0)}</strong></td>}
-                                        {soldVisibleCols.price_sold   && <td><strong>€{fmt1(s.price_sold || 0)}</strong></td>}
+                                        {soldVisibleCols.cost         && <td><strong>€{fmt2(s.price_paid || 0)}</strong></td>}
+                                        {soldVisibleCols.price_sold   && <td><strong>€{fmt2(s.price_sold || 0)}</strong></td>}
                                         {soldVisibleCols.profit       && (
                                           <td>
                                             <span style={{ fontWeight: 'bold', color: gain >= 0 ? '#34d399' : '#f87171' }}>
-                                              {gain >= 0 ? `+€${fmt1(gain)}` : `-€${fmt1(Math.abs(gain))}`}
+                                              {gain >= 0 ? `+€${fmt2(gain)}` : `-€${fmt2(Math.abs(gain))}`}
                                             </span>
                                           </td>
                                         )}
@@ -11491,8 +11902,8 @@ USING (true);`;
                                     <td>
                                       {pm.category_id === catBikeId ? (
                                         <div style={{ display: 'flex', gap: '12px', fontSize: '12px' }}>
-                                          <span>💰 €{fmt1(pm.suggested_weekly_rate || 0)}/{language === 'es' ? 'sem' : 'wk'}</span>
-                                          <span>🛡️ €{fmt1(pm.suggested_deposit || 0)}</span>
+                                          <span>💰 €{fmt2(pm.suggested_weekly_rate || 0)}/{language === 'es' ? 'sem' : 'wk'}</span>
+                                          <span>🛡️ €{fmt2(pm.suggested_deposit || 0)}</span>
                                         </div>
                                       ) : (
                                         <span style={{ color: 'var(--text-muted)' }}>-</span>
@@ -11769,7 +12180,7 @@ USING (true);`;
                                   {rentalVisibleCols.earnings && (
                                     <td>
                                       <strong style={{ color: '#10b981', fontSize: '14px' }}>
-                                        €{fmt1(stats.totalPaid)}
+                                        €{fmt2(stats.totalPaid)}
                                       </strong>
                                     </td>
                                   )}
@@ -12025,10 +12436,7 @@ USING (true);`;
               }
               
               if (latestDateObj) {
-                const yyyy = latestDateObj.getFullYear();
-                const mm = String(latestDateObj.getMonth() + 1).padStart(2, '0');
-                const dd = String(latestDateObj.getDate()).padStart(2, '0');
-                nextPaymentDateStr = `${dd}/${mm}/${String(yyyy).slice(-2)}`;
+                nextPaymentDateStr = fmtDMY(latestDateObj);
               }
             }
 
@@ -12835,7 +13243,7 @@ USING (true);`;
                                 <div key={a.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '10px' }}>
                                   <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>
                                     📎 {language === 'es' ? `Anexo Nº ${a.number}` : `Amendment No. ${a.number}`}
-                                    <span style={{ fontSize: '11px', opacity: 0.7 }}> · {a.effective_date}</span>
+                                    <span style={{ fontSize: '11px', opacity: 0.7 }}> · {fmtDMY(a.effective_date)}</span>
                                   </span>
                                   <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                                     <span style={{
@@ -13063,10 +13471,10 @@ USING (true);`;
                     <h3 style={{ marginBottom: '16px' }}>💶 {t.financialSummary}</h3>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                       {[
-                        [language === 'es' ? 'Depósito' : 'Deposit', `€${fmt1(totalDeposit)}`],
-                        [language === 'es' ? 'Pagado por Alquiler' : 'Paid for Rental', `€${fmt1(totalPaidForRental)}`],
-                        [language === 'es' ? 'Mantenimiento' : 'Maintenance', `-€${fmt1(totalMaintenance)}`],
-                        [language === 'es' ? 'Total' : 'Total', `€${fmt1(totalPaid)}`],
+                        [language === 'es' ? 'Depósito' : 'Deposit', `€${fmt2(totalDeposit)}`],
+                        [language === 'es' ? 'Pagado por Alquiler' : 'Paid for Rental', `€${fmt2(totalPaidForRental)}`],
+                        [language === 'es' ? 'Mantenimiento' : 'Maintenance', `-€${fmt2(totalMaintenance)}`],
+                        [language === 'es' ? 'Total' : 'Total', `€${fmt2(totalPaid)}`],
                         [
                           latestRental
                             ? (latestRental.rate_type === 'diario'
@@ -13178,10 +13586,10 @@ USING (true);`;
                                 </div>
                               </div>
                               <p style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
-                                Desde: {r.start_date}
+                                Desde: {fmtDMY(r.start_date)}
                               </p>
                               <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
-                                €{fmt1(r.rental_rate)}/{r.rate_type} · Depósito: €{fmt1(r.deposit_amount)}
+                                €{fmt2(r.rental_rate)}/{r.rate_type} · Depósito: €{fmt2(r.deposit_amount)}
                               </p>
                               <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
                                 Kilometraje Inicial: {r.odometer_start} km
@@ -13216,6 +13624,10 @@ USING (true);`;
                                     setPayFormNotes('');
                                     setPayFormType('rent');
                                     setPayFormReceivedVia('efectivo');
+                                    // Si el alquiler ya factura solo por el cron semanal, se
+                                    // deja el checkbox apagado para no emitir dos facturas del
+                                    // mismo cobro. Si no, encendido.
+                                    setPayFormEmitInvoice(!(r.auto_invoice && r.rate_type === 'semanal'));
                                     setModalType('rentalPayment');
                                   }}>💶 {t.logPayment}</button>
 
@@ -13237,8 +13649,46 @@ USING (true);`;
                                         const isCurrentlyNotice = r.status === 'Devolución en Proceso';
                                         const nextStatus = isCurrentlyNotice ? 'Activo' : 'Devolución en Proceso';
                                         try {
-                                          await upsertRental({ ...r, status: nextStatus });
-                                          
+                                          // El aviso es tambien el interruptor de la facturacion
+                                          // automatica: el cron solo mira los alquileres 'Activo'.
+                                          //
+                                          // Al REANUDAR hay que empujar la fecha de cobro al proximo
+                                          // vencimiento futuro. Si se dejara la vieja, el cron se
+                                          // pondria al dia y emitiria de golpe una factura por cada
+                                          // semana que el alquiler estuvo parado.
+                                          // Proximo vencimiento semanal contando desde el inicio
+                                          // del alquiler. Lo usan las dos ramas.
+                                          const fmtDate = (d: Date) =>
+                                            `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+                                          const proximoVencimiento = () => {
+                                            const [sy, sm, sd] = r.start_date.split('-').map(Number);
+                                            const d = new Date(sy, sm - 1, sd);
+                                            const hoy = new Date();
+                                            hoy.setHours(0, 0, 0, 0);
+                                            while (d < hoy) d.setDate(d.getDate() + 7);
+                                            return d;
+                                          };
+                                          // La devolucion se pacta una semana despues del proximo cobro.
+                                          const returnDateObj = proximoVencimiento();
+                                          returnDateObj.setDate(returnDateObj.getDate() + 7);
+                                          const returnDateStr = fmtDate(returnDateObj);
+
+                                          const patch: Partial<Rental> = { status: nextStatus };
+                                          if (isCurrentlyNotice) {
+                                            // Al REANUDAR hay que empujar la fecha de cobro al proximo
+                                            // vencimiento futuro. Si se dejara la vieja, el cron se
+                                            // pondria al dia y emitiria de golpe una factura por cada
+                                            // semana que el alquiler estuvo parado.
+                                            patch.return_notice_date = null;
+                                            patch.next_invoice_date = fmtDate(proximoVencimiento());
+                                          } else {
+                                            // La columna existia sin usarse: el motor de facturacion
+                                            // la necesita, y sacar la fecha del titulo del evento de
+                                            // calendario se rompe si alguien lo edita o lo borra.
+                                            patch.return_notice_date = returnDateStr;
+                                          }
+                                          await upsertRental({ ...r, ...patch });
+
                                           if (isCurrentlyNotice) {
                                             const evToDelete = events.find(e => e.description.includes(`Rental ID: ${r.id}`) && e.title.startsWith('[Devolución]'));
                                             if (evToDelete) {
@@ -13247,21 +13697,6 @@ USING (true);`;
                                             triggerReload();
                                             showToast(language === 'es' ? 'Aviso de devolución cancelado.' : 'Return notice cancelled.', 'success');
                                           } else {
-                                            const [ry, rm, rd] = r.start_date.split('-').map(Number);
-                                            let futureN = new Date(ry, rm - 1, rd);
-                                            const today = new Date();
-                                            today.setHours(0,0,0,0);
-                                            while (futureN < today) {
-                                              futureN.setDate(futureN.getDate() + 7);
-                                            }
-                                            const returnDateObj = new Date(futureN);
-                                            returnDateObj.setDate(returnDateObj.getDate() + 7);
-                                            
-                                            const yyyy = returnDateObj.getFullYear();
-                                            const mm = String(returnDateObj.getMonth() + 1).padStart(2, '0');
-                                            const dd = String(returnDateObj.getDate()).padStart(2, '0');
-                                            const returnDateStr = `${yyyy}-${mm}-${dd}`;
-                                            
                                             await upsertEvent({
                                               id: crypto.randomUUID(),
                                               title: `[Devolución] ${bike?.serial_number || ''} - ${cust.first_name} ${cust.last_name}`,
@@ -13292,6 +13727,18 @@ USING (true);`;
                                   </button>
                                 </div>
                               )}
+
+                              {/* Documentos de este alquiler (punto 3): factura,
+                                  deposito, devolucion y notas de credito juntos. */}
+                              <details style={{ marginTop: '12px' }}>
+                                <summary style={{ cursor: 'pointer', fontSize: '13px', fontWeight: 600, color: 'var(--text-muted)' }}>
+                                  🧾 {language === 'es' ? 'Documentos' : 'Documents'}
+                                  {r.rental_code ? ` · ${r.rental_code}` : ''}
+                                </summary>
+                                <div style={{ marginTop: '10px' }}>
+                                  <RentalDocuments rentalId={r.id} language={language} showToast={showToast} />
+                                </div>
+                              </details>
                             </div>
                           );
                         }))
@@ -13313,13 +13760,13 @@ USING (true);`;
                             // Chronological events timeline
                             const rentalEvents: { id: string | null, date: string, text: string, type: string, desc?: string, photos?: string[], regIndex: number }[] = [
                               { id: null, date: r.start_date, text: language === 'es' ? '🚲 Alquilado (Inicio)' : '🚲 Rented (Start)', type: 'start', regIndex: 0 },
-                              { id: null, date: r.start_date, text: (language === 'es' ? `🔒 Depósito: €${fmt1(r.deposit_amount)}` : `🔒 Deposit: €${fmt1(r.deposit_amount)}`) + (r.deposit_received_via ? ` (${r.deposit_received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''), type: 'deposit', regIndex: 1 },
+                              { id: null, date: r.start_date, text: (language === 'es' ? `🔒 Depósito: €${fmt2(r.deposit_amount)}` : `🔒 Deposit: €${fmt2(r.deposit_amount)}`) + (r.deposit_received_via ? ` (${r.deposit_received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''), type: 'deposit', regIndex: 1 },
                               ...expenses
                                 .filter(e => e.rental_id === r.id)
                                 .map((e, idx) => ({
                                   id: e.id,
                                   date: e.date,
-                                  text: language === 'es' ? `🛠️ Mantenimiento: -€${fmt1(e.cost)}` : `🛠️ Maintenance: -€${fmt1(e.cost)}`,
+                                  text: language === 'es' ? `🛠️ Mantenimiento: -€${fmt2(e.cost)}` : `🛠️ Maintenance: -€${fmt2(e.cost)}`,
                                   type: 'maintenance',
                                   desc: e.description,
                                   photos: e.photos || [],
@@ -13334,8 +13781,8 @@ USING (true);`;
                                     id: p.id,
                                     date: p.payment_date,
                                     text: (isOther
-                                      ? (language === 'es' ? `💵 Otro pago: €${fmt1(p.amount)}` : `💵 Other payment: €${fmt1(p.amount)}`)
-                                      : (language === 'es' ? `💵 Pago renta: €${fmt1(p.amount)}` : `💵 Rent payment: €${fmt1(p.amount)}`)) + (p.received_via ? ` (${p.received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''),
+                                      ? (language === 'es' ? `💵 Otro pago: €${fmt2(p.amount)}` : `💵 Other payment: €${fmt2(p.amount)}`)
+                                      : (language === 'es' ? `💵 Pago renta: €${fmt2(p.amount)}` : `💵 Rent payment: €${fmt2(p.amount)}`)) + (p.received_via ? ` (${p.received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''),
                                     type: 'payment',
                                     desc: note,
                                     regIndex: 1000 - idx
@@ -13351,7 +13798,7 @@ USING (true);`;
                               ...(r.deposit_refunded !== null && r.deposit_refunded > 0 ? [{
                                 id: null,
                                 date: r.end_date || r.start_date,
-                                text: language === 'es' ? `🔓 Depósito Devuelto: €${fmt1(r.deposit_refunded)}` : `🔓 Deposit Refunded: €${fmt1(r.deposit_refunded)}`,
+                                text: language === 'es' ? `🔓 Depósito Devuelto: €${fmt2(r.deposit_refunded)}` : `🔓 Deposit Refunded: €${fmt2(r.deposit_refunded)}`,
                                 type: 'deposit_refund',
                                 regIndex: 9998
                               }] : [])
@@ -13484,7 +13931,7 @@ USING (true);`;
                                 </div>
 
                                 {r.damage_report && <p style={{ fontSize: '11px', color: '#f87171', marginTop: '6px' }}>⚠️ {r.damage_report}</p>}
-                                {r.deposit_refunded !== null && <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>Depósito devuelto: €{fmt1(r.deposit_refunded)}</p>}
+                                {r.deposit_refunded !== null && <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>Depósito devuelto: €{fmt2(r.deposit_refunded)}</p>}
                               </div>
                             );
                           })
@@ -13859,8 +14306,8 @@ USING (true);`;
                               )}
                             </td>
                             <td>
-                              <div style={{ fontSize: '13px' }}>{language === 'es' ? 'Semanal: ' : 'Weekly: '}<strong>€{fmt1(acc.weekly_rate)}</strong></div>
-                              <div style={{ fontSize: '12px', color: 'var(--color-primary)', marginTop: '2px' }}>Total: <strong>€{fmt1(totalEarned)}</strong></div>
+                              <div style={{ fontSize: '13px' }}>{language === 'es' ? 'Semanal: ' : 'Weekly: '}<strong>€{fmt2(acc.weekly_rate)}</strong></div>
+                              <div style={{ fontSize: '12px', color: 'var(--color-primary)', marginTop: '2px' }}>Total: <strong>€{fmt2(totalEarned)}</strong></div>
                             </td>
                             <td>
                               {acc.current_renter_id && acc.start_date ? (() => {
@@ -13877,7 +14324,7 @@ USING (true);`;
                                 const today = new Date();
                                 const todayStr = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
                                 const formattedNextDate = `${nextDate.getFullYear()}-${String(nextDate.getMonth()+1).padStart(2,'0')}-${String(nextDate.getDate()).padStart(2,'0')}`;
-                                const displayNextDate = `${String(nextDate.getDate()).padStart(2,'0')}/${String(nextDate.getMonth()+1).padStart(2,'0')}/${String(nextDate.getFullYear()).slice(-2)}`;
+                                const displayNextDate = fmtDMY(nextDate);
                                 const isOverdue = formattedNextDate < todayStr;
                                 
                                 return (
@@ -14021,7 +14468,7 @@ USING (true);`;
                                   {earns.map(ae => (
                                     <tr key={ae.id}>
                                       <td>{ae.date}</td>
-                                      <td><strong>€{fmt1(ae.amount)}</strong></td>
+                                      <td><strong>€{fmt2(ae.amount)}</strong></td>
                                       <td>{ae.notes}</td>
                                       <td>
                                         <button
@@ -14382,13 +14829,7 @@ USING (true);`;
                           return (
                             <tr key={ev.id}>
                               <td><strong>{ev.title}{bikeInfo}</strong><br /><span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{ev.description}</span></td>
-                              <td>{(() => {
-                                const parts = ev.event_date.split('-');
-                                if (parts.length === 3) {
-                                  return `${parts[2]}/${parts[1]}/${parts[0].substring(2)}`;
-                                }
-                                return ev.event_date;
-                              })()}</td>
+                              <td>{fmtDMY(ev.event_date)}</td>
                             <td>
                               {(() => {
                                 const dynStatus = getDynamicEventStatus(ev);
@@ -14563,6 +15004,7 @@ USING (true);`;
                                    <button className="btn-primary btn-xs" onClick={() => {
                                      setFinishServiceBikeId(bike.id);
                                      setFinishServiceCost(0);
+                                     setFinishServiceNotes('');
                                      setModalType('finishService');
                                    }}>✓ {language === 'es' ? 'Finalizar Service' : 'Finish Service'}</button>
                                    <button className="btn-secondary btn-xs" onClick={async () => {
@@ -14852,12 +15294,12 @@ USING (true);`;
                           <tbody>
                             {group.items.map(rec => (
                               <tr key={rec.id}>
-                                <td>{rec.service_date}</td>
+                                <td>{fmtDMY(rec.service_date)}</td>
                                 <td><strong>{products.find(p => p.id === rec.bike_id)?.serial_number}</strong></td>
                                 <td>{rec.location}</td>
                                 <td>{rec.performed_by}</td>
                                 <td>{rec.description}</td>
-                                <td><strong style={{ color: '#ef4444' }}>€{fmt1(rec.cost)}</strong></td>
+                                <td><strong style={{ color: '#ef4444' }}>€{fmt2(rec.cost)}</strong></td>
                                 <td>
                                   <button
                                     className="btn-danger btn-xs"
@@ -15021,7 +15463,7 @@ USING (true);`;
                               </td>
                               <td>{sup?.name}</td>
                               <td>
-                                <strong style={{ fontSize: '15px' }}>€{fmt1(sprod.cost)}</strong>
+                                <strong style={{ fontSize: '15px' }}>€{fmt2(sprod.cost)}</strong>
                                 {isCheapest && <span className="badge status-available btn-xs" style={{ marginLeft: '8px', fontSize: '10px' }}>🏆 {t.cheapest}</span>}
                               </td>
                               <td>
@@ -15165,7 +15607,7 @@ USING (true);`;
                                 <span className="badge" style={{ background: 'rgba(255,255,255,0.05)', fontSize: '10px', marginTop: '4px' }}>{sprod.category}</span>
                               </td>
                               <td>{sup?.name ?? '-'}</td>
-                              <td><strong>€{fmt1(sprod.cost)}</strong></td>
+                              <td><strong>€{fmt2(sprod.cost)}</strong></td>
                               <td>{sprod.delivery_time_days} days</td>
                               <td>{sprod.moq}</td>
                               <td>
@@ -15372,7 +15814,7 @@ USING (true);`;
                                   {badgeInfo.text}
                                 </span>
                                 <span className="qr-item-date" style={{ marginLeft: 'auto' }}>
-                                  {new Date(qr.created_at).toLocaleDateString(language === 'es' ? 'es-ES' : 'en-GB', { day: '2-digit', month: 'short', year: 'numeric' })}
+                                  {fmtDMY(qr.created_at)}
                                 </span>
                               </div>
                               <p className="qr-item-content" title={qr.content}>{qr.content}</p>
@@ -15765,7 +16207,7 @@ USING (true);`;
               TAB: USUARIOS (view of customers with notes)
               ================================================ */}
           {currentTab === 'users' && (() => {
-            const fmt = (d?: string) => { if (!d) return ''; const p = d.split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0].slice(-2)}` : d; };
+            const fmt = (d?: string) => d ? fmtDMY(d) : '';
 
             const filteredUsers = customers.filter(c => {
               const q = usersSearch.toLowerCase();
@@ -17235,24 +17677,24 @@ USING (true);`;
                     {(prodFormAddVat || prodFormIsGeneric) && (() => {
                       const base = prodFormPricePaid || 0;
                       const qty = prodFormQuantity > 0 ? prodFormQuantity : 1;
-                      const vat = prodFormAddVat ? round1(base * 0.23) : 0;
+                      const vat = prodFormAddVat ? round2(base * 0.23) : 0;
                       const unitCost = base + vat;
                       const purchaseTotal = unitCost * qty;
                       return (
                         <div style={{ marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '2px', fontSize: '12px', color: 'var(--text-muted)', background: 'rgba(16, 185, 129, 0.05)', padding: '8px 10px', borderRadius: '6px', border: '1px solid rgba(16, 185, 129, 0.1)' }}>
                           {prodFormAddVat && (
                             <>
-                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>{language === 'es' ? 'Coste por unidad' : 'Unit cost'}</span><span>€{fmt1(base)}</span></div>
-                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>VAT (23%)</span><span>€{fmt1(vat)}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>{language === 'es' ? 'Coste por unidad' : 'Unit cost'}</span><span>€{fmt2(base)}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>VAT (23%)</span><span>€{fmt2(vat)}</span></div>
                               <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '3px', marginTop: '2px', color: 'var(--text-bright)', fontWeight: 700 }}>
-                                <span>{prodFormIsGeneric ? (language === 'es' ? 'Total por unidad' : 'Unit total') : 'Total'}</span><span>€{fmt1(unitCost)}</span>
+                                <span>{prodFormIsGeneric ? (language === 'es' ? 'Total por unidad' : 'Unit total') : 'Total'}</span><span>€{fmt2(unitCost)}</span>
                               </div>
                             </>
                           )}
                           {prodFormIsGeneric && (
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: prodFormAddVat ? '1px solid rgba(255,255,255,0.08)' : 'none', paddingTop: prodFormAddVat ? '4px' : '0', marginTop: prodFormAddVat ? '2px' : '0' }}>
-                              <span>{language === 'es' ? 'Total de la compra' : 'Total purchase'} ({qty} {language === 'es' ? 'uds' : 'units'} × €{fmt1(unitCost)})</span>
-                              <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{fmt1(purchaseTotal)}</strong>
+                              <span>{language === 'es' ? 'Total de la compra' : 'Total purchase'} ({qty} {language === 'es' ? 'uds' : 'units'} × €{fmt2(unitCost)})</span>
+                              <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{fmt2(purchaseTotal)}</strong>
                             </div>
                           )}
                         </div>
@@ -17519,7 +17961,7 @@ USING (true);`;
                     }
 
                     // BAT (23% tax): the input holds the base cost; the stored price_paid includes the tax.
-                    const vatAmount = prodFormAddVat ? round1(prodFormPricePaid * 0.23) : 0;
+                    const vatAmount = prodFormAddVat ? round2(prodFormPricePaid * 0.23) : 0;
                     const effectiveCost = prodFormPricePaid + vatAmount;
                     const newProdBase = {
                       model_id: prodFormModelId || prod?.model_id || null,
@@ -17679,7 +18121,7 @@ USING (true);`;
 
         // Financed plan summary calculations
         const totalFinanced = Math.max(0, soldFormPrice - soldDownPayment);
-        const installmentAmount = soldInstallments > 0 ? round1(totalFinanced / soldInstallments) : 0;
+        const installmentAmount = soldInstallments > 0 ? round2(totalFinanced / soldInstallments) : 0;
         
         // Calculate next payment due date (1 week or 1 month after soldFormDate)
         let firstInstallmentDate = '';
@@ -17718,7 +18160,7 @@ USING (true);`;
                           <div>
                             <strong style={{ color: 'var(--color-primary)' }}>{p.serial_number}</strong> - {p.name}
                             <span style={{ marginLeft: '8px', color: 'var(--text-muted)', fontSize: '12px' }}>
-                              (Coste: €{fmt1(p.price_paid)})
+                              (Coste: €{fmt2(p.price_paid)})
                             </span>
                             {(() => {
                               const isGeneric = isProductGeneric(p);
@@ -17855,7 +18297,7 @@ USING (true);`;
                             }}
                           >
                             <span><strong>{p.serial_number}</strong> - {p.name}</span>
-                            <span style={{ color: 'var(--color-primary)', fontWeight: 600 }}>€{fmt1((p.price_sold ?? 0))}</span>
+                            <span style={{ color: 'var(--color-primary)', fontWeight: 600 }}>€{fmt2((p.price_sold ?? 0))}</span>
                           </div>
                         ))}
                       </div>
@@ -17993,7 +18435,7 @@ USING (true);`;
                             const targetAmount = soldPaymentType === 'financiado' ? soldDownPayment : soldFormPrice;
                             const cash = Math.max(0, Math.min(targetAmount, v ?? 0));
                             setSoldMixedCash(cash);
-                            setSoldMixedTransfer(round1(targetAmount - cash));
+                            setSoldMixedTransfer(round2(targetAmount - cash));
                           }}
                         />
                       </div>
@@ -18008,7 +18450,7 @@ USING (true);`;
                             const targetAmount = soldPaymentType === 'financiado' ? soldDownPayment : soldFormPrice;
                             const transfer = Math.max(0, Math.min(targetAmount, v ?? 0));
                             setSoldMixedTransfer(transfer);
-                            setSoldMixedCash(round1(targetAmount - transfer));
+                            setSoldMixedCash(round2(targetAmount - transfer));
                           }}
                         />
                       </div>
@@ -18043,6 +18485,8 @@ USING (true);`;
                           setSoldCustomerLastName('');
                           setSoldCustomerEmail('');
                           setSoldCustomerPhone('');
+                          setSoldCustomerNationality('');
+                          setSoldCustomerAddress('');
                           setSoldCustomerSearch('');
                         }}>
                           {language === 'es' ? 'Nuevo' : 'New'}
@@ -18061,6 +18505,8 @@ USING (true);`;
                               setSoldCustomerLastName(c.last_name);
                               setSoldCustomerEmail(c.email);
                               setSoldCustomerPhone(c.phone);
+                              setSoldCustomerNationality(c.nationality || '');
+                              setSoldCustomerAddress(c.address || '');
                               setSoldCustomerSearch(`${c.first_name} ${c.last_name}`);
                             }}
                           >
@@ -18089,6 +18535,23 @@ USING (true);`;
                     <div className="form-group">
                       <label className="form-label">{language === 'es' ? 'Teléfono' : 'Phone'}</label>
                       <input type="text" className="form-control" value={soldCustomerPhone} onChange={e => setSoldCustomerPhone(e.target.value)} disabled={!!soldCustomerId} />
+                    </div>
+                    <div className="form-group">
+                      <label className="form-label">{language === 'es' ? 'Nacionalidad (opcional)' : 'Nationality (optional)'}</label>
+                      <select className="form-control" value={soldCustomerNationality} onChange={e => setSoldCustomerNationality(e.target.value)} disabled={!!soldCustomerId} style={{ height: '42px' }}>
+                        <option value="">{language === 'es' ? '— Sin especificar —' : '— Not specified —'}</option>
+                        {soldCustomerNationality && !NATIONALITIES.some(n => n.value === soldCustomerNationality) && (
+                          <option value={soldCustomerNationality}>{soldCustomerNationality}</option>
+                        )}
+                        {NATIONALITIES.map(n => (
+                          <option key={n.value} value={n.value}>{language === 'es' ? n.labelEs : n.labelEn}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+                      <label className="form-label">{language === 'es' ? 'Dirección (opcional)' : 'Address (optional)'}</label>
+                      <input type="text" className="form-control" value={soldCustomerAddress} onChange={e => setSoldCustomerAddress(e.target.value)} disabled={!!soldCustomerId}
+                        placeholder={language === 'es' ? 'Ej: 12 Parnell Street, Dublin 1' : 'E.g. 12 Parnell Street, Dublin 1'} />
                     </div>
                   </div>
 
@@ -18129,10 +18592,10 @@ USING (true);`;
                       {/* PLAN SUMMARY */}
                       <div style={{ background: 'rgba(139, 92, 246, 0.1)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(139, 92, 246, 0.2)', fontSize: '13px', lineHeight: '1.5' }}>
                         <strong style={{ color: '#a78bfa', display: 'block', marginBottom: '4px' }}>📊 {language === 'es' ? 'Resumen del Financiamiento' : 'Financing Plan Summary'}</strong>
-                        <div>• {language === 'es' ? 'Total Venta' : 'Total Sale'}: <strong>€{fmt1(soldFormPrice)}</strong></div>
-                        <div>• {language === 'es' ? 'Entrada (Hoy)' : 'Down Payment (Today)'}: <strong>€{fmt1(soldDownPayment)}</strong></div>
-                        <div>• {language === 'es' ? 'Monto a Financiar' : 'Financed Balance'}: <strong>€{fmt1(totalFinanced)}</strong></div>
-                        <div>• {language === 'es' ? 'Cuotas' : 'Installments'}: <strong>{soldInstallments} cuotas de €{fmt1(installmentAmount)}</strong> ({soldFrequency === 'semanal' ? 'semanal' : 'mensual'} sin interés)</div>
+                        <div>• {language === 'es' ? 'Total Venta' : 'Total Sale'}: <strong>€{fmt2(soldFormPrice)}</strong></div>
+                        <div>• {language === 'es' ? 'Entrada (Hoy)' : 'Down Payment (Today)'}: <strong>€{fmt2(soldDownPayment)}</strong></div>
+                        <div>• {language === 'es' ? 'Monto a Financiar' : 'Financed Balance'}: <strong>€{fmt2(totalFinanced)}</strong></div>
+                        <div>• {language === 'es' ? 'Cuotas' : 'Installments'}: <strong>{soldInstallments} cuotas de €{fmt2(installmentAmount)}</strong> ({soldFrequency === 'semanal' ? 'semanal' : 'mensual'} sin interés)</div>
                         {firstInstallmentDate && (
                           <div>• {language === 'es' ? 'Primer Vencimiento' : 'First Due Date'}: <strong style={{ color: '#f59e0b' }}>{firstInstallmentDate}</strong></div>
                         )}
@@ -18170,10 +18633,11 @@ USING (true);`;
                             last_name: soldCustomerLastName.trim(),
                             phone: soldCustomerPhone.trim(),
                             email: soldCustomerEmail.trim(),
-                            nationality: 'Brasil', // Default
+                            address: soldCustomerAddress.trim(),
+                            nationality: soldCustomerNationality.trim() || 'Brasil',
                             referral_source: soldPaymentType === 'financiado' ? 'Financiamiento Modal' : 'Venta de Contado',
                             id_document_url: '',
-                            notes: soldPaymentType === 'financiado' 
+                            notes: soldPaymentType === 'financiado'
                               ? 'Cliente registrado automáticamente durante venta financiada.'
                               : 'Cliente registrado automáticamente durante venta de contado.',
                             created_at: new Date().toISOString()
@@ -18198,7 +18662,7 @@ USING (true);`;
                         email_language: soldEmailLang,
                         notes: (soldPaymentType === 'financiado' 
                           ? `Venta financiada en ${soldInstallments} cuotas ${soldFrequency}.` 
-                          : 'Venta de contado.') + (soldReceivedVia === 'mixto' ? ` [Pago Mixto] Efectivo: €${fmt1(soldMixedCash)} | Transferencia: €${fmt1(soldMixedTransfer)}` : ''),
+                          : 'Venta de contado.') + (soldReceivedVia === 'mixto' ? ` [Pago Mixto] Efectivo: €${fmt2(soldMixedCash)} | Transferencia: €${fmt2(soldMixedTransfer)}` : ''),
                         status: soldPaymentType === 'financiado' ? 'Financiada' : 'Completada',
                         created_at: new Date().toISOString(),
                         received_via: soldReceivedVia,
@@ -18454,7 +18918,7 @@ USING (true);`;
                           const reminderEvent = {
                             id: crypto.randomUUID(),
                             title: `💳 Cuota 1/${soldInstallments}: ${soldCustomerFirstName} ${soldCustomerLastName}`,
-                            description: `Vencimiento de la primera cuota del financiamiento por la compra de: ${bikeSerials}. Monto: €${fmt1(installmentAmount)}.`,
+                            description: `Vencimiento de la primera cuota del financiamiento por la compra de: ${bikeSerials}. Monto: €${fmt2(installmentAmount)}.`,
                             event_date: firstInstallmentDate,
                             remind_one_week: true,
                             remind_one_day: true,
@@ -18534,7 +18998,7 @@ USING (true);`;
                     <h4 style={{ margin: '0 0 8px 0', color: '#a78bfa' }}>📦 {language === 'es' ? 'Producto' : 'Product'}</h4>
                     <div><strong>{prod.serial_number}</strong> - {prod.name}</div>
                     <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
-                      {language === 'es' ? 'Coste' : 'Acq. Cost'}: €{fmt1(prod.price_paid)} | {language === 'es' ? 'Precio venta' : 'Sale Price'}: €{fmt1(prod.price_sold)}
+                      {language === 'es' ? 'Coste' : 'Acq. Cost'}: €{fmt2(prod.price_paid)} | {language === 'es' ? 'Precio venta' : 'Sale Price'}: €{fmt2(prod.price_sold)}
                     </div>
                   </div>
                   <div>
@@ -18563,10 +19027,10 @@ USING (true);`;
                     </div>
                     
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 16px', fontSize: '13px' }}>
-                      <div>• {language === 'es' ? 'Total Venta' : 'Total Sale'}: <strong>€{fmt1(sale?.total_amount)}</strong></div>
-                      <div>• {language === 'es' ? 'Monto Financiado' : 'Financed Amount'}: <strong>€{fmt1(plan.total_financed)}</strong></div>
-                      <div>• {language === 'es' ? 'Entrada Pagada' : 'Down Payment Paid'}: <strong>€{fmt1(sale?.down_payment)}</strong></div>
-                      <div>• {language === 'es' ? 'Monto de Cuota' : 'Installment Amount'}: <strong>€{fmt1(plan.installment_amount)} ({plan.payment_frequency === 'semanal' ? 'Semanal' : 'Mensual'})</strong></div>
+                      <div>• {language === 'es' ? 'Total Venta' : 'Total Sale'}: <strong>€{fmt2(sale?.total_amount)}</strong></div>
+                      <div>• {language === 'es' ? 'Monto Financiado' : 'Financed Amount'}: <strong>€{fmt2(plan.total_financed)}</strong></div>
+                      <div>• {language === 'es' ? 'Entrada Pagada' : 'Down Payment Paid'}: <strong>€{fmt2(sale?.down_payment)}</strong></div>
+                      <div>• {language === 'es' ? 'Monto de Cuota' : 'Installment Amount'}: <strong>€{fmt2(plan.installment_amount)} ({plan.payment_frequency === 'semanal' ? 'Semanal' : 'Mensual'})</strong></div>
                     </div>
                   </div>
                 )}
@@ -18610,13 +19074,13 @@ USING (true);`;
                                 {language === 'es' ? 'Cuota' : 'Installment'} {p.installment_number}
                               </span>
                               <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
-                                📅 {language === 'es' ? 'Vencimiento' : 'Due'}: {p.due_date}
-                                {p.paid_date && ` | ✅ ${language === 'es' ? 'Pagado el' : 'Paid on'}: ${p.paid_date}${p.received_via ? ` (${p.received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''}`}
+                                📅 {language === 'es' ? 'Vencimiento' : 'Due'}: {fmtDMY(p.due_date)}
+                                {p.paid_date && ` | ✅ ${language === 'es' ? 'Pagado el' : 'Paid on'}: ${fmtDMY(p.paid_date)}${p.received_via ? ` (${p.received_via === 'efectivo' ? (language === 'es' ? 'efectivo' : 'cash') : (language === 'es' ? 'transferencia' : 'transfer')})` : ''}`}
                               </span>
                             </div>
                             
                             <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                              <span style={{ fontWeight: 'bold', fontSize: '14px', marginRight: '4px' }}>€{fmt1(p.amount)}</span>
+                              <span style={{ fontWeight: 'bold', fontSize: '14px', marginRight: '4px' }}>€{fmt2(p.amount)}</span>
                               <span className={`badge ${p.status === 'Pagada' ? 'status-available' : isOverdue ? 'status-lost' : 'status-maintenance'}`} style={{ fontSize: '11px' }}>
                                 {p.status === 'Pagada' 
                                   ? (language === 'es' ? 'Pagada' : 'Paid') 
@@ -18646,8 +19110,8 @@ USING (true);`;
                       style={{ background: '#8b5cf6', borderColor: '#a78bfa', display: 'flex', alignItems: 'center', gap: '8px', width: '100%', justifyContent: 'center', padding: '12px' }}
                     >
                       🪙 {language === 'es' 
-                        ? `Cobrar Cuota ${nextPending.installment_number} (€${fmt1(nextPending.amount)})` 
-                        : `Collect Installment ${nextPending.installment_number} (€${fmt1(nextPending.amount)})`}
+                        ? `Cobrar Cuota ${nextPending.installment_number} (€${fmt2(nextPending.amount)})` 
+                        : `Collect Installment ${nextPending.installment_number} (€${fmt2(nextPending.amount)})`}
                     </button>
                   </div>
                 )}
@@ -18691,7 +19155,7 @@ USING (true);`;
                       <strong>{language === 'es' ? 'Cuota:' : 'Installment:'}</strong> {nextPending.installment_number} / {plan?.num_installments}
                     </div>
                     <div>
-                      <strong>{language === 'es' ? 'Monto:' : 'Amount:'}</strong> €{fmt1(nextPending.amount)}
+                      <strong>{language === 'es' ? 'Monto:' : 'Amount:'}</strong> €{fmt2(nextPending.amount)}
                     </div>
                   </div>
                 </div>
@@ -18825,8 +19289,40 @@ USING (true);`;
                   )}
                 </div>
 
-                <button 
-                  className="btn-primary" 
+                {/* Ubicacion de cada elemento devuelto (baterias, candado, kit). */}
+                {(() => {
+                  const returnItems = rentalItems
+                    .filter(it => it.rental_id === rental.id)
+                    .map(it => ({ it, prod: products.find(p => p.id === it.product_id) }))
+                    .filter(x => x.prod && x.prod.status === 'Rentada');
+                  if (returnItems.length === 0) return null;
+                  return (
+                    <div className="form-group">
+                      <label className="form-label">📍 {language === 'es' ? '¿Dónde se guarda cada elemento?' : 'Where does each item go?'}</label>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                        {returnItems.map(({ it, prod }) => (
+                          <div key={it.product_id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px' }}>
+                            <span style={{ fontSize: '13px' }}>
+                              {it.item_type === 'battery' ? '🔋' : prod!.category_id === catLockId ? '🔒' : '🎒'}{' '}
+                              {[prod!.serial_number, prod!.name].filter(Boolean).join(' ')}
+                            </span>
+                            <select
+                              className="form-control"
+                              style={{ width: 'auto', minWidth: '150px', height: '38px' }}
+                              value={returnItemLocations[it.product_id] || 'Almacén Central'}
+                              onChange={e => setReturnItemLocations(prev => ({ ...prev, [it.product_id]: e.target.value }))}
+                            >
+                              {knownLocations.map(loc => <option key={loc} value={loc}>{loc}</option>)}
+                            </select>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                <button
+                  className="btn-primary"
                   disabled={isUploadingReturnPhotos}
                   onClick={async () => {
                     try {
@@ -18879,6 +19375,8 @@ USING (true);`;
                       for (const item of rItems) {
                         const prod = products.find(p => p.id === item.product_id);
                         if (!prod || prod.status !== 'Rentada') continue;
+                        // Ubicacion elegida en el modal para este elemento (o su origen).
+                        const chosenLoc = returnItemLocations[prod.id] || (prod.custom_field_values?.location as string) || 'Almacén Central';
                         if (prod.category_id === catLockId) {
                           const keep = prod.custom_field_values?.keep_associated;
                           itemUpdates.push(upsertProduct({
@@ -18886,6 +19384,7 @@ USING (true);`;
                             status: 'Disponible',
                             custom_field_values: {
                               ...prod.custom_field_values,
+                              location: chosenLoc,
                               associated_bike_id: keep ? prod.custom_field_values?.associated_bike_id : undefined,
                               keep_associated: keep ? true : undefined
                             }
@@ -18897,7 +19396,7 @@ USING (true);`;
                         if (isGenericSplit) {
                           // Merge the returned unit back into the group's master distribution
                           // (avoids leaving an orphan single-unit row that can't be managed later).
-                          const loc = (prod.custom_field_values?.location as string) || 'Almacén Central';
+                          const loc = chosenLoc;
                           const master = products.find(p =>
                             p.serial_number === prod.serial_number && p.id !== prod.id &&
                             p.status === 'Disponible' && p.custom_field_values?.location_distribution != null);
@@ -18919,7 +19418,13 @@ USING (true);`;
                             }));
                           }
                         } else {
-                          itemUpdates.push(upsertProduct({ ...prod, status: 'Disponible' }));
+                          // Unidad individual (p.ej. bateria con serie): vuelve a stock
+                          // en la ubicacion elegida.
+                          itemUpdates.push(upsertProduct({
+                            ...prod,
+                            status: 'Disponible',
+                            custom_field_values: { ...prod.custom_field_values, location: chosenLoc },
+                          }));
                         }
                       }
                       Object.values(masterMerges).forEach(({ product, dist }) => {
@@ -18965,6 +19470,10 @@ USING (true);`;
           : rental.rate_type === 'mensual'
             ? (language === 'es' ? 'Pago de renta mensual' : 'Monthly rent payment')
             : (language === 'es' ? 'Pago de renta semanal' : 'Weekly rent payment');
+        // Solo estos alquileres tienen ya una factura emitida por el cron
+        // esperando cobro. En el resto, desmarcar "Emitir factura"
+        // significa literalmente no emitir nada.
+        const isAutoInvoiced = !!rental.auto_invoice && rental.rate_type === 'semanal';
 
         return (
           <div className="modal-overlay">
@@ -18988,7 +19497,7 @@ USING (true);`;
                       }} 
                       style={{ width: '16px', height: '16px', accentColor: 'var(--color-primary)', cursor: 'pointer' }}
                     />
-                    {rentLabel} (€{fmt1(rental.rental_rate)})
+                    {rentLabel} (€{fmt2(rental.rental_rate)})
                   </label>
                   <label className="form-checkbox" style={{ margin: 0, fontWeight: payFormType === 'other' ? 'bold' : 'normal', display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
                     <input 
@@ -19053,9 +19562,27 @@ USING (true);`;
                   </div>
                 </div>
 
+                {/* Emitir factura de este cobro (apartado 5). */}
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: !payFormEmitInvoice && payFormType === 'rent' && isAutoInvoiced ? '4px' : '16px', cursor: 'pointer', fontSize: '13px' }}>
+                  <input
+                    type="checkbox"
+                    checked={payFormEmitInvoice}
+                    onChange={e => setPayFormEmitInvoice(e.target.checked)}
+                    style={{ width: '16px', height: '16px' }}
+                  />
+                  🧾 {language === 'es' ? 'Emitir factura y enviarla al cliente' : 'Issue invoice and send it to the customer'}
+                </label>
+                {!payFormEmitInvoice && payFormType === 'rent' && isAutoInvoiced && (
+                  <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '-8px', marginBottom: '16px' }}>
+                    {language === 'es'
+                      ? 'La factura de esta semana ya fue emitida automáticamente; al confirmar se marcará como pagada y se reenviará por email.'
+                      : 'This week\'s invoice was already issued automatically; confirming will mark it as paid and resend it by email.'}
+                  </p>
+                )}
+
                 <button className="btn-primary" onClick={async () => {
                   try {
-                    const finalNotes = payFormType === 'other' 
+                    const finalNotes = payFormType === 'other'
                       ? ('Otro: ' + (payFormNotes.trim() || (language === 'es' ? 'Pago extra' : 'Extra payment')))
                       : 'Renta';
 
@@ -19068,8 +19595,52 @@ USING (true);`;
                       received_via: payFormReceivedVia,
                     });
 
-                    // Trigger rental payment email
-                    if (payFormRentalId) {
+                    // Emitir/actualizar la factura del cobro y (si tiene email)
+                    // enviarla. El fallo al facturar no debe tumbar el registro
+                    // del pago, que ya quedo guardado: se avisa aparte.
+                    let invoiceEmailSent = false;
+                    if (payFormEmitInvoice && payFormRentalId && payFormAmount > 0) {
+                      try {
+                        const desc = payFormType === 'other'
+                          ? (payFormNotes.trim() || (language === 'es' ? 'Cobro adicional' : 'Additional charge'))
+                          : (language === 'es' ? 'Alquiler de e-bike' : 'E-bike rental');
+                        const doc = await issueRentalInvoice({
+                          rentalId: payFormRentalId,
+                          amount: payFormAmount,
+                          paymentMethod: payFormReceivedVia,
+                          paymentDate: payFormDate,
+                          description: desc,
+                        });
+                        const res = await generateDocumentPdf(doc.id, true);
+                        invoiceEmailSent = res.emailed;
+                      } catch (invErr) {
+                        console.error('[FastSheep] no se pudo emitir la factura del pago:', invErr);
+                        showToast(language === 'es' ? 'Pago guardado, pero la factura no se pudo emitir.' : 'Payment saved, but the invoice could not be issued.', 'error');
+                      }
+                    } else if (!payFormEmitInvoice && payFormType === 'rent' && isAutoInvoiced && payFormRentalId && payFormAmount > 0) {
+                      // Alquiler semanal auto-facturado: la factura de esta semana
+                      // ya la emitio el cron en 'pending'. Solo hay que marcarla
+                      // pagada y reenviarla actualizada por email (apartado 8).
+                      try {
+                        const doc = await markOldestPendingRentalInvoicePaid({
+                          rentalId: payFormRentalId,
+                          paymentMethod: payFormReceivedVia,
+                          paymentDate: payFormDate,
+                          fallbackAmount: payFormAmount,
+                          fallbackDescription: language === 'es' ? 'Alquiler de e-bike' : 'E-bike rental',
+                        });
+                        const res = await generateDocumentPdf(doc.id, true);
+                        invoiceEmailSent = res.emailed;
+                      } catch (invErr) {
+                        console.error('[FastSheep] no se pudo actualizar la factura del pago:', invErr);
+                        showToast(language === 'es' ? 'Pago guardado, pero no se pudo actualizar la factura.' : 'Payment saved, but the invoice could not be updated.', 'error');
+                      }
+                    }
+
+                    // Aviso generico de pago recibido: solo si no se acaba de
+                    // mandar ya una factura/actualizacion por este mismo cobro,
+                    // para no duplicar el correo al cliente.
+                    if (payFormRentalId && !invoiceEmailSent) {
                       const rentObj = rentals.find(r => r.id === payFormRentalId);
                       const rider = rentObj ? customers.find(c => c.id === rentObj.customer_id) : null;
                       if (rider) {
@@ -19182,7 +19753,7 @@ USING (true);`;
                   type="button" 
                   className="btn-primary" 
                   style={{ flex: 1 }} 
-                  onClick={() => {
+                  onClick={async () => {
                     if (!expenseFormName.trim()) {
                       showToast(language === 'es' ? 'Escribe un nombre para el gasto.' : 'Enter expense description.', 'error');
                       return;
@@ -19197,17 +19768,24 @@ USING (true);`;
                       return;
                     }
 
-                    const newExp = {
-                      id: 'exp-' + Date.now(),
-                      name: expenseFormName.trim(),
-                      amount: amt,
-                      categoryId: expenseFormCategoryId,
-                      date: expenseFormDate || new Date().toISOString().split('T')[0]
-                    };
-
-                    setOtherExpenses(prev => [...prev, newExp]);
-                    setIsAddExpenseModalOpen(false);
-                    showToast(language === 'es' ? 'Gasto agregado con éxito.' : 'Expense added successfully.', 'success');
+                    try {
+                      const b = noVat(amt);
+                      await insertBusinessExpense({
+                        expense_date: expenseFormDate || new Date().toISOString().split('T')[0],
+                        category_id: expenseFormCategoryId,
+                        supplier_id: null,
+                        description: expenseFormName.trim(),
+                        quantity: 1,
+                        amount: b.amount, vat_rate: 0, vat_amount: 0, net_amount: b.net_amount,
+                        payment_method: '', supplier_invoice_ref: null, invoice_file_url: null,
+                        source: 'manual', source_id: null, product_id: null, created_by: null,
+                      } as Parameters<typeof insertBusinessExpense>[0]);
+                      await reloadBusinessExpenses();
+                      setIsAddExpenseModalOpen(false);
+                      showToast(language === 'es' ? 'Gasto agregado con éxito.' : 'Expense added successfully.', 'success');
+                    } catch {
+                      showToast(language === 'es' ? 'No se pudo guardar el gasto.' : 'Could not save the expense.', 'error');
+                    }
                   }}
                 >
                   {language === 'es' ? 'Agregar Gasto' : 'Add Expense'}
@@ -19263,33 +19841,27 @@ USING (true);`;
                       type="button" 
                       className="btn-primary btn-sm" 
                       style={{ flex: 1 }}
-                      onClick={() => {
+                      onClick={async () => {
                         if (!categoryFormName.trim()) {
                           showToast(language === 'es' ? 'Escribe un nombre para la categoría.' : 'Enter category name.', 'error');
                           return;
                         }
-                        
-                        if (editingCategoryId) {
-                          // Update category
-                          setExpenseCategories(prev => prev.map(c => 
-                            c.id === editingCategoryId 
-                              ? { ...c, name: categoryFormName.trim(), color: categoryFormColor }
-                              : c
-                          ));
-                          setEditingCategoryId(null);
-                          showToast(language === 'es' ? 'Categoría actualizada.' : 'Category updated.', 'success');
-                        } else {
-                          // Add category
-                          const newCat = {
-                            id: 'cat-' + Date.now(),
-                            name: categoryFormName.trim(),
-                            color: categoryFormColor
-                          };
-                          setExpenseCategories(prev => [...prev, newCat]);
-                          setExpenseFormCategoryId(newCat.id);
-                          showToast(language === 'es' ? 'Categoría creada.' : 'Category created.', 'success');
+                        try {
+                          if (editingCategoryId) {
+                            await updateExpenseCategory(editingCategoryId, categoryFormName.trim(), categoryFormColor);
+                            await reloadBusinessExpenses();
+                            setEditingCategoryId(null);
+                            showToast(language === 'es' ? 'Categoría actualizada.' : 'Category updated.', 'success');
+                          } else {
+                            const created = await insertExpenseCategory(categoryFormName.trim(), categoryFormColor);
+                            await reloadBusinessExpenses();
+                            setExpenseFormCategoryId(created.id);
+                            showToast(language === 'es' ? 'Categoría creada.' : 'Category created.', 'success');
+                          }
+                          setCategoryFormName('');
+                        } catch {
+                          showToast(language === 'es' ? 'No se pudo guardar la categoría.' : 'Could not save the category.', 'error');
                         }
-                        setCategoryFormName('');
                       }}
                     >
                       {editingCategoryId 
@@ -19345,8 +19917,13 @@ USING (true);`;
                               return;
                             }
                             if (await asyncConfirm(language === 'es' ? `¿Seguro que deseas eliminar la categoría "${cat.name}"?` : `Are you sure you want to delete category "${cat.name}"?`)) {
-                              setExpenseCategories(prev => prev.filter(c => c.id !== cat.id));
-                              showToast(language === 'es' ? 'Categoría eliminada.' : 'Category deleted.', 'success');
+                              try {
+                                await deleteExpenseCategory(cat.id);
+                                await reloadBusinessExpenses();
+                                showToast(language === 'es' ? 'Categoría eliminada.' : 'Category deleted.', 'success');
+                              } catch {
+                                showToast(language === 'es' ? 'No se pudo eliminar la categoría.' : 'Could not delete the category.', 'error');
+                              }
                             }
                           }}
                           style={{ background: 'none', border: 'none', color: '#ff4d4d', cursor: 'pointer', fontSize: '13px' }}
@@ -19510,8 +20087,8 @@ USING (true);`;
                     <strong style={{ color: 'var(--color-primary)' }}>{language === 'es' ? 'Se registrará:' : 'Will be recorded:'}</strong>
                     <div style={{ marginTop: '4px' }}>
                       {oldBike?.serial_number} → {newBike?.serial_number}
-                      {swapRate !== rental.rental_rate && <> · {language === 'es' ? 'tarifa' : 'rate'} €{fmt1(rental.rental_rate)} → €{fmt1(swapRate)}</>}
-                      {swapDeposit !== rental.deposit_amount && <> · {language === 'es' ? 'depósito' : 'deposit'} €{fmt1(rental.deposit_amount)} → €{fmt1(swapDeposit)}</>}
+                      {swapRate !== rental.rental_rate && <> · {language === 'es' ? 'tarifa' : 'rate'} €{fmt2(rental.rental_rate)} → €{fmt2(swapRate)}</>}
+                      {swapDeposit !== rental.deposit_amount && <> · {language === 'es' ? 'depósito' : 'deposit'} €{fmt2(rental.deposit_amount)} → €{fmt2(swapDeposit)}</>}
                     </div>
                   </div>
                 )}
@@ -19947,12 +20524,7 @@ USING (true);`;
 
         const formatDateDMYY = (dateStr?: string) => {
           if (!dateStr || dateStr === '-') return dateStr || '-';
-          const parts = dateStr.split('-');
-          if (parts.length !== 3) return dateStr;
-          const year = parts[0].slice(-2);
-          const month = parts[1];
-          const day = parts[2];
-          return `${day}/${month}/${year}`;
+          return fmtDMY(dateStr);
         };
 
         return (
@@ -19984,7 +20556,7 @@ USING (true);`;
                   <div style={{ background: 'rgba(255, 255, 255, 0.03)', border: '1px solid rgba(255, 255, 255, 0.06)', padding: '12px', borderRadius: '10px', textAlign: 'center' }}>
                     <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px 0' }}>{t.totalInvested}</p>
                     <p style={{ fontSize: '16px', fontWeight: 'bold', color: netProfit >= 0 ? '#10b981' : '#ef4444', margin: 0 }}>
-                      {netProfit >= 0 ? '+' : '-'}€{fmt1(Math.abs(netProfit))}
+                      {netProfit >= 0 ? '+' : '-'}€{fmt2(Math.abs(netProfit))}
                     </p>
                   </div>
                   <div style={{ background: 'rgba(255, 255, 255, 0.03)', border: '1px solid rgba(255, 255, 255, 0.06)', padding: '12px', borderRadius: '10px', textAlign: 'center' }}>
@@ -20199,7 +20771,7 @@ USING (true);`;
                               </span>
                             </div>
                             {item.cost !== undefined && (
-                              <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{fmt1(item.cost)}</strong>
+                              <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{fmt2(item.cost)}</strong>
                             )}
                           </div>
 
@@ -21279,7 +21851,7 @@ USING (true);`;
                               </tr>
                             ) : (
                               bikeModifications.map(row => {
-                                const fmtDate = row.modification_date ? row.modification_date.split('-').reverse().join('/') : '—';
+                                const fmtDate = fmtDMY(row.modification_date);
                                 return (
                                   <tr key={row.id}>
                                     <td style={{ fontSize: '12px', fontWeight: 600, color: '#f59e0b', whiteSpace: 'nowrap' }}>
@@ -21329,22 +21901,76 @@ USING (true);`;
 
 
       {/* MODAL: Service Record */}
+      {modalType === 'consumeStock' && consumeProductId && (() => {
+        const prod = products.find(p => p.id === consumeProductId);
+        if (!prod) return null;
+        const available = availableInGroup(prod);
+        const bikes = products
+          .filter(p => p.category_id === catBikeId)
+          .sort((a, b) => (a.serial_number || '').localeCompare(b.serial_number || ''));
+        return (
+          <div className="modal-overlay" style={{ zIndex: 1300 }} onClick={() => { setModalType(null); setConsumeProductId(null); }}>
+            <div className="modal-content" style={{ maxWidth: '440px', padding: '24px' }} onClick={e => e.stopPropagation()}>
+              <div className="modal-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                <h3>🔧 {language === 'es' ? 'Consumir para uso interno' : 'Use internally'}</h3>
+                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setConsumeProductId(null); }}>✕</button>
+              </div>
+              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                <p style={{ fontSize: '13px', color: 'var(--text-muted)', margin: 0 }}>
+                  <strong>{[prod.serial_number, prod.name].filter(Boolean).join(' ')}</strong> — {available} {language === 'es' ? 'disponibles' : 'available'}.
+                  <br />
+                  {language === 'es'
+                    ? 'Descuenta del stock sin registrarlo como venta. No genera factura.'
+                    : 'Discounts from stock without recording a sale. No invoice.'}
+                </p>
+                <div className="form-group">
+                  <label className="form-label">{language === 'es' ? 'Cantidad a consumir' : 'Quantity to use'}</label>
+                  <input type="number" className="form-control" min={1} max={available} value={consumeQty}
+                    onChange={e => setConsumeQty(Math.max(1, Math.min(available, parseInt(e.target.value) || 1)))} />
+                </div>
+                <div className="form-group">
+                  <label className="form-label">{language === 'es' ? 'Nota (opcional)' : 'Note (optional)'}</label>
+                  <textarea className="form-control" rows={2} value={consumeNote}
+                    onChange={e => setConsumeNote(e.target.value)}
+                    placeholder={language === 'es' ? 'Ej: cambio de rueda trasera' : 'E.g. rear wheel replacement'} />
+                </div>
+                <div className="form-group">
+                  <label className="form-label">{language === 'es' ? '¿En qué bici? (opcional)' : 'On which bike? (optional)'}</label>
+                  <select className="form-control" value={consumeBikeId} onChange={e => setConsumeBikeId(e.target.value)} style={{ height: '42px' }}>
+                    <option value="">{language === 'es' ? '— Sin bici / uso general —' : '— No bike / general use —'}</option>
+                    {bikes.map(b => <option key={b.id} value={b.id}>{[b.serial_number, b.name].filter(Boolean).join(' ')}</option>)}
+                  </select>
+                </div>
+              </div>
+              <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
+                <button className="btn-secondary" onClick={() => { setModalType(null); setConsumeProductId(null); }}>{t.cancel}</button>
+                <button className="btn-primary" disabled={consumeSubmitting} onClick={handleConsumeStock}>
+                  {consumeSubmitting ? (language === 'es' ? 'Procesando...' : 'Processing...') : (language === 'es' ? 'Confirmar consumo' : 'Confirm')}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {modalType === 'finishService' && finishServiceBikeId && (() => {
         const bike = products.find(p => p.id === finishServiceBikeId);
         if (!bike) return null;
         const handleFinish = async () => {
           try {
             const todayStr = new Date().toISOString().split('T')[0];
+            const workDesc = finishServiceNotes.trim()
+              || (language === 'es' ? 'Mantenimiento finalizado / Puesta a punto' : 'Maintenance finished / Fine-tuning');
             const record = records.find(r => r.bike_id === bike.id && r.service_date === bike.last_service_date);
             if (record) {
-              await upsertRecord({ ...record, cost: finishServiceCost });
+              await upsertRecord({ ...record, cost: finishServiceCost, description: workDesc });
             } else {
               await upsertRecord({
                 id: crypto.randomUUID(),
                 bike_id: bike.id,
                 service_date: todayStr,
                 location: 'Dublin Central Garage',
-                description: language === 'es' ? 'Mantenimiento finalizado / Puesta a punto' : 'Maintenance finished / Fine-tuning',
+                description: workDesc,
                 cost: finishServiceCost,
                 performed_by: 'Mechanic Sean'
               });
@@ -21366,14 +21992,24 @@ USING (true);`;
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
                 <p style={{ fontSize: '13px', color: 'var(--text-muted)', margin: 0 }}>
                   {language === 'es'
-                    ? `${bike.serial_number} — ${bike.name}. Ingresá el costo gastado en el taller para finalizar.`
-                    : `${bike.serial_number} — ${bike.name}. Enter the cost spent at the workshop to finish.`}
+                    ? `${bike.serial_number} — ${bike.name}. Anotá qué se le hizo y el costo. Queda en el historial de la bici.`
+                    : `${bike.serial_number} — ${bike.name}. Note what was done and the cost. It stays in the bike's history.`}
                 </p>
+                <div className="form-group">
+                  <label className="form-label">{language === 'es' ? '¿Qué se le hizo a la bici?' : 'What was done to the bike?'}</label>
+                  <textarea
+                    className="form-control"
+                    autoFocus
+                    rows={3}
+                    value={finishServiceNotes}
+                    onChange={e => setFinishServiceNotes(e.target.value)}
+                    placeholder={language === 'es' ? 'Ej: cambio de pastillas de freno y ajuste de cambios' : 'E.g. brake pad replacement and gear tuning'}
+                  />
+                </div>
                 <div className="form-group">
                   <label className="form-label">{language === 'es' ? 'Costo de reparación (€)' : 'Repair cost (€)'}</label>
                   <NumberField
                     className="form-control"
-                    autoFocus
                     value={finishServiceCost}
                     onValueChange={v => setFinishServiceCost(Math.max(0, v ?? 0))}
                   />
@@ -22064,7 +22700,7 @@ USING (true);`;
                           <div key={n.id || idx} style={{ background: 'rgba(255,255,255,0.03)', padding: '10px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.05)' }}>
                             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--text-muted)', marginBottom: '4px' }}>
                               <span>👤 {language === 'es' ? 'Comentario' : 'Comment'}</span>
-                              <span>{new Date(n.date).toLocaleString()}</span>
+                              <span>{fmtDMYTime(n.date)}</span>
                             </div>
                             <div style={{ fontSize: '13px', whiteSpace: 'pre-wrap' }}>{n.content}</div>
                           </div>
@@ -22090,7 +22726,7 @@ USING (true);`;
                             <div key={e.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: e.status === 'Realizado' ? 'rgba(255,255,255,0.01)' : 'rgba(16, 185, 129, 0.05)', padding: '10px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.05)' }}>
                               <div>
                                 <div style={{ fontWeight: 'bold', color: e.status === 'Realizado' ? 'var(--text-muted)' : '#a7f3d0', fontSize: '13px' }}>
-                                  📅 {e.event_date} {e.status === 'Realizado' && `(✓ ${language === 'es' ? 'Realizado' : 'Done'})`}
+                                  📅 {fmtDMY(e.event_date)} {e.status === 'Realizado' && `(✓ ${language === 'es' ? 'Realizado' : 'Done'})`}
                                 </div>
                                 <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '2px' }}>
                                   {e.description ? e.description.split('\n')[0] : ''}
@@ -22745,15 +23381,12 @@ USING (true);`;
                 <div style={{ background: 'rgba(255,255,255,0.04)', padding: '12px', borderRadius: '8px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <span style={{ color: 'var(--text-muted)', fontSize: '13px' }}>{language === 'es' ? 'Monto semanal:' : 'Weekly amount:'}</span>
-                    <strong style={{ color: 'var(--color-primary)', fontSize: '15px' }}>€{fmt1(earnFormAmount)}</strong>
+                    <strong style={{ color: 'var(--color-primary)', fontSize: '15px' }}>€{fmt2(earnFormAmount)}</strong>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <span style={{ color: 'var(--text-muted)', fontSize: '13px' }}>{language === 'es' ? 'Fecha de pago:' : 'Payment date:'}</span>
                     <span style={{ color: 'var(--text-bright)', fontWeight: 500, fontSize: '13px' }}>
-                      {(() => {
-                        const [y, m, d] = earnFormDate.split('-');
-                        return y && m && d ? `${d}/${m}/${y.slice(-2)}` : earnFormDate;
-                      })()}
+                      {fmtDMY(earnFormDate)}
                     </span>
                   </div>
                 </div>
@@ -22882,16 +23515,6 @@ USING (true);`;
         // Sort by date descending (latest first) so they see the newest transactions on top
         ledgerItems.sort((a, b) => b.date.localeCompare(a.date));
 
-        // Format dates as DD/MM/YY
-        const formatDate = (dateStr: string) => {
-          const parts = dateStr.split('-');
-          if (parts.length === 3) {
-            const [y, m, d] = parts;
-            return `${d}/${m}/${y.slice(-2)}`;
-          }
-          return dateStr;
-        };
-
         const totalRevenues = stats.totalPaid + (prod.status === 'Vendida' ? (prod.price_sold || 0) : 0);
         const totalExpenses = stats.cost + stats.totalExp;
         const netProfit = totalRevenues - totalExpenses;
@@ -22923,20 +23546,20 @@ USING (true);`;
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '12px' }}>
                   <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.04)' }}>
                     <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Inversión Inicial' : 'Initial Investment'}</span>
-                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#f87171' }}>-€{fmt1(stats.cost)}</h5>
+                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#f87171' }}>-€{fmt2(stats.cost)}</h5>
                   </div>
                   <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.04)' }}>
                     <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Ingresos Totales' : 'Total Revenues'}</span>
-                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#34d399' }}>+€{fmt1(totalRevenues)}</h5>
+                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#34d399' }}>+€{fmt2(totalRevenues)}</h5>
                   </div>
                   <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.04)' }}>
                     <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Gastos Taller/Otros' : 'Garage/Other Exp.'}</span>
-                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#fb923c' }}>-€{fmt1(stats.totalExp)}</h5>
+                    <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: '#fb923c' }}>-€{fmt2(stats.totalExp)}</h5>
                   </div>
                   <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.04)' }}>
                     <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Retorno Neto' : 'Net Returns'}</span>
                     <h5 style={{ margin: '4px 0 0 0', fontSize: '15px', color: netProfit >= 0 ? '#34d399' : '#f87171' }}>
-                      {netProfit >= 0 ? '+' : ''}€{fmt1(netProfit)}
+                      {netProfit >= 0 ? '+' : ''}€{fmt2(netProfit)}
                     </h5>
                   </div>
                 </div>
@@ -22959,10 +23582,10 @@ USING (true);`;
                           <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(0,0,0,0.12)', padding: '10px 14px', borderRadius: '8px', fontSize: '13px', borderLeft: `3px solid ${amtColor}` }}>
                             <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
                               <span style={{ color: 'var(--text-bright)', fontWeight: 500 }}>{item.description}</span>
-                              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>📅 {formatDate(item.date)}</span>
+                              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>📅 {fmtDMY(item.date)}</span>
                             </div>
                             <strong style={{ color: amtColor, fontSize: '14px', whiteSpace: 'nowrap', marginLeft: '12px' }}>
-                              {isPositive ? '+' : ''}€{fmt1(item.amount)}
+                              {isPositive ? '+' : ''}€{fmt2(item.amount)}
                             </strong>
                           </div>
                         );
@@ -22988,7 +23611,7 @@ USING (true);`;
       {/* MODAL: E-Bike Rental History */}
       {modalType === 'bikeHistory' && selectedProductId && (() => {
         const bike = products.find(p => p.id === selectedProductId);
-        const fmtD = (d?: string) => { if (!d) return ''; const p = d.split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0].slice(-2)}` : d; };
+        const fmtD = (d?: string) => d ? fmtDMY(d) : '';
         if (!bike) return null;
         
         const bikeRentals = rentals
@@ -23550,7 +24173,7 @@ USING (true);`;
                       : [];
                     const totalEarnedForRider = activeEarns.reduce((sum, e) => sum + e.amount, 0);
 
-                    const noteText = `Finalizacion de vinculo con el Rider ${riderName} (Total: €${fmt1(totalEarnedForRider)})`;
+                    const noteText = `Finalizacion de vinculo con el Rider ${riderName} (Total: €${fmt2(totalEarnedForRider)})`;
                     
                     await insertAccountNote({
                       id: crypto.randomUUID(),
@@ -23889,7 +24512,7 @@ USING (true);`;
                           : [];
                         const totalEarnedForRider = activeEarns.reduce((sum, e) => sum + e.amount, 0);
 
-                        const noteText = `Finalizacion de vinculo con el Rider ${oldRiderName} (Total: €${fmt1(totalEarnedForRider)})`;
+                        const noteText = `Finalizacion de vinculo con el Rider ${oldRiderName} (Total: €${fmt2(totalEarnedForRider)})`;
                         
                         await insertAccountNote({
                           id: crypto.randomUUID(),
@@ -24203,7 +24826,7 @@ USING (true);`;
                       <strong style={{ color: 'var(--text-bright)' }}>{batchModel.brand} {batchModel.model_name}</strong>
                       <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
                         {pfStr && <span>Prefix: {pfStr} | </span>}
-                        €{fmt1(batchModel.suggested_weekly_rate)}/{language === 'es' ? 'sem' : 'wk'}
+                        €{fmt2(batchModel.suggested_weekly_rate)}/{language === 'es' ? 'sem' : 'wk'}
                       </div>
                     </div>
                   </div>
@@ -24509,7 +25132,7 @@ USING (true);`;
         const viaLabel = txDetail.received_via
           ? (txDetail.received_via === 'efectivo' ? (language === 'es' ? '💵 Efectivo' : '💵 Cash') : (language === 'es' ? '🏦 Transferencia' : '🏦 Transfer'))
           : '—';
-        const dFmt = (() => { const p = txDetail.date.split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0].slice(-2)}` : txDetail.date; })();
+        const dFmt = fmtDMY(txDetail.date);
         return (
           <div className="modal-overlay" onClick={() => setTxDetail(null)} style={{ zIndex: 9999 }}>
             <div className="modal-content" style={{ maxWidth: '540px' }} onClick={(e) => e.stopPropagation()}>
@@ -24520,7 +25143,7 @@ USING (true);`;
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderLeft: `4px solid ${amtColor}`, paddingLeft: '12px' }}>
                   <span className="badge">{txDetail.category}</span>
-                  <strong style={{ color: amtColor, fontSize: '20px' }}>{isPositive ? '+' : '-'}€{fmt1(txDetail.amount)}</strong>
+                  <strong style={{ color: amtColor, fontSize: '20px' }}>{isPositive ? '+' : '-'}€{fmt2(txDetail.amount)}</strong>
                 </div>
                 <div>
                   <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{language === 'es' ? 'Descripción' : 'Description'}</p>
@@ -24564,7 +25187,7 @@ USING (true);`;
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderLeft: `4px solid ${amtColor}`, paddingLeft: '12px' }}>
                   <span style={{ fontSize: '12px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{typeLabel}</span>
-                  <strong style={{ color: amtColor, fontSize: '20px' }}>{isPositive ? '+' : ''}€{fmt1(ledgerDetail.amount)}</strong>
+                  <strong style={{ color: amtColor, fontSize: '20px' }}>{isPositive ? '+' : ''}€{fmt2(ledgerDetail.amount)}</strong>
                 </div>
                 <div>
                   <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{language === 'es' ? 'Descripción' : 'Description'}</p>
@@ -24572,7 +25195,7 @@ USING (true);`;
                 </div>
                 <div>
                   <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{language === 'es' ? 'Fecha' : 'Date'}</p>
-                  <p style={{ fontSize: '14px', color: 'var(--text-bright)', margin: 0 }}>📅 {(() => { const p = ledgerDetail.date.split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0].slice(-2)}` : ledgerDetail.date; })()}</p>
+                  <p style={{ fontSize: '14px', color: 'var(--text-bright)', margin: 0 }}>📅 {fmtDMY(ledgerDetail.date)}</p>
                 </div>
               </div>
             </div>
@@ -24784,7 +25407,7 @@ USING (true);`;
             )}
             {viewChecklist.completed_at && (
               <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '8px' }}>
-                {language === 'es' ? 'Aceptada el' : 'Accepted on'} {new Date(viewChecklist.completed_at).toLocaleString()} {language === 'es' ? 'por' : 'by'} {viewChecklist.customer_name}.
+                {language === 'es' ? 'Aceptada el' : 'Accepted on'} {fmtDMYTime(viewChecklist.completed_at)} {language === 'es' ? 'por' : 'by'} {viewChecklist.customer_name}.
               </p>
             )}
           </div>
@@ -25141,8 +25764,8 @@ USING (true);`;
                     const total = (genStockCost || 0) * qty;
                     return (
                       <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '6px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(16, 185, 129, 0.05)', padding: '6px 10px', borderRadius: '6px', border: '1px solid rgba(16, 185, 129, 0.1)' }}>
-                        <span>{language === 'es' ? 'Total de la compra' : 'Total purchase'} ({qty} {language === 'es' ? 'uds' : 'units'} × €{fmt1(genStockCost || 0)})</span>
-                        <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{fmt1(total)}</strong>
+                        <span>{language === 'es' ? 'Total de la compra' : 'Total purchase'} ({qty} {language === 'es' ? 'uds' : 'units'} × €{fmt2(genStockCost || 0)})</span>
+                        <strong style={{ color: 'var(--text-bright)', fontSize: '14px' }}>€{fmt2(total)}</strong>
                       </div>
                     );
                   })()}
@@ -25449,6 +26072,31 @@ USING (true);`;
               >
                 ✏️ {t.edit}
               </button>
+
+              {/* Consumir para uso interno: descuenta stock sin venta. */}
+              {hasAvailableStock && (
+                <button
+                  className="dropdown-item"
+                  style={{
+                    width: '100%', textAlign: 'left', background: 'transparent', border: 'none',
+                    borderRadius: '6px', padding: '8px 12px', fontSize: '12px', color: 'var(--text-muted)',
+                    cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px', transition: 'all 0.2s ease'
+                  }}
+                  onClick={() => {
+                    setActiveStockMenuId(null);
+                    setMenuCoords(null);
+                    setConsumeProductId(prod.id);
+                    setConsumeQty(1);
+                    setConsumeNote('');
+                    setConsumeBikeId('');
+                    setModalType('consumeStock');
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)'; e.currentTarget.style.color = 'var(--text-bright)'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}
+                >
+                  🔧 {language === 'es' ? 'Consumir (uso interno)' : 'Use internally'}
+                </button>
+              )}
 
               {/* View full chronological history (works for any bike, incl. sold/lost/stolen) */}
               {prod.category_id === catBikeId && (
@@ -26094,7 +26742,7 @@ USING (true);`;
                           </tr>
                         ) : allowedEmails.map(row => {
                           const isSelf = row.email.toLowerCase() === user?.email?.toLowerCase();
-                          const fmtDate = row.created_at ? row.created_at.split('T')[0].split('-').reverse().join('/') : '—';
+                          const fmtDate = fmtDMY(row.created_at);
                           
                           return (
                             <tr key={row.id} style={{ background: isSelf ? 'rgba(99,102,241,0.06)' : undefined }}>
@@ -26174,6 +26822,8 @@ USING (true);`;
           {[
             { key: 'analytics',     icon: '📊', label: t.dashboard },
             { key: 'balance',       icon: '💰', label: t.balance },
+            { key: 'invoicing',     icon: '🧾', label: language === 'es' ? 'Facturación' : 'Invoicing' },
+            { key: 'expenses',      icon: '🛒', label: language === 'es' ? 'Compras y Gastos' : 'Purchases' },
             { key: 'stock',         icon: '📦', label: t.stock },
             { key: 'rental_wizard', icon: '⚡', label: t.wizard },
             { key: 'accounts',      icon: '🛵', label: t.accounts },

@@ -34,6 +34,14 @@
   --roi-orange: #f97316;
   --roi-green: #10b981;
   --roi-gray: #6b7280;
+
+  /* Fondo OPACO para la primera columna fija de las tablas. Tiene que ser
+     solido (sin alfa) para que el contenido que pasa por debajo al hacer
+     scroll horizontal no se transparente. Aproxima el color de la tarjeta
+     sobre el fondo base. */
+  --sticky-cell-bg: #141a2b;
+  --sticky-cell-bg-hover: #1b2338;
+  --sticky-head-bg: #10151f;
 }
 
 /* Light Theme overrides */
@@ -52,6 +60,10 @@
   --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.05);
   --shadow-md: 0 8px 24px rgba(148, 163, 184, 0.15);
   --shadow-lg: 0 12px 32px rgba(148, 163, 184, 0.2);
+
+  --sticky-cell-bg: #eef2f7;
+  --sticky-cell-bg-hover: #e2e8f0;
+  --sticky-head-bg: #e6ebf1;
 }
 
 * {
@@ -430,6 +442,29 @@ h1, h2, h3, h4, h5, h6 {
 .custom-table tr:hover td {
   background: rgba(255, 255, 255, 0.02);
   color: var(--text-bright);
+}
+
+/* Primera columna fija: al hacer scroll horizontal (sobre todo en movil)
+   la columna identificadora queda pegada a la izquierda, para no perder de
+   vista en que fila se esta. El fondo es opaco a proposito. */
+.custom-table th:first-child,
+.custom-table td:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  background: var(--sticky-cell-bg);
+  /* Sombra sutil a la derecha que separa la columna fija del contenido
+     que pasa por debajo al desplazarse. */
+  box-shadow: 4px 0 6px -4px rgba(0, 0, 0, 0.35);
+}
+
+.custom-table th:first-child {
+  z-index: 3; /* la esquina superior izquierda va por encima de todo */
+  background: var(--sticky-head-bg);
+}
+
+.custom-table tr:hover td:first-child {
+  background: var(--sticky-cell-bg-hover);
 }
 
 /* Buttons */

@@ -39,7 +39,7 @@ export interface Product {
   price_paid: number;
   price_sold: number | null;
   sold_date: string | null;
-  status: 'Disponible' | 'Rentada' | 'Mantenimiento' | 'Vendida' | 'Perdida' | 'Financiada' | 'Robada' | 'Perdida/Garda';
+  status: 'Disponible' | 'Rentada' | 'Mantenimiento' | 'Vendida' | 'Perdida' | 'Financiada' | 'Robada' | 'Perdida/Garda' | 'Uso Interno';
   notes: string;
   suggested_weekly_rate: number | null;
   suggested_deposit: number | null;
@@ -140,6 +140,13 @@ export interface Rental {
   damage_report: string | null;
   created_at: string;
   deposit_received_via?: string | null;
+  // Codigo visible del alquiler (RNT-2026-0001). Es lo que enlaza sus
+  // facturas, recibos de deposito y notas de credito entre si.
+  rental_code?: string | null;
+  // Facturacion semanal automatica. next_invoice_date es la proxima
+  // fecha de cobro; el cron diario emite la factura de quien vence hoy.
+  auto_invoice?: boolean;
+  next_invoice_date?: string | null;
 }
 
 export interface RentalItem {
