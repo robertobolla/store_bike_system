@@ -39,6 +39,9 @@ export interface Product {
   price_paid: number;
   price_sold: number | null;
   sold_date: string | null;
+  // Fecha en que se reporto el robo/perdida. Solo tiene valor cuando el
+  // estado es 'Robada' | 'Perdida' | 'Perdida/Garda'.
+  lost_date?: string | null;
   status: 'Disponible' | 'Rentada' | 'Mantenimiento' | 'Vendida' | 'Perdida' | 'Financiada' | 'Robada' | 'Perdida/Garda' | 'Uso Interno';
   notes: string;
   suggested_weekly_rate: number | null;
@@ -147,6 +150,10 @@ export interface Rental {
   // fecha de cobro; el cron diario emite la factura de quien vence hoy.
   auto_invoice?: boolean;
   next_invoice_date?: string | null;
+  // Envio de correos al cliente (confirmacion de alta y facturas
+  // semanales del cron). Independiente de auto_invoice: se puede
+  // facturar sin enviar correos. Por defecto true.
+  auto_email?: boolean;
 }
 
 export interface RentalItem {
@@ -200,6 +207,10 @@ export interface RentalPayment {
   payment_date: string;
   payment_method?: string;
   received_via?: string;
+  // Factura que documenta este cobro. Se enlaza al emitirla, no al
+  // registrar el pago, porque la factura llega despues (y a veces la
+  // emitio el cron dias antes y solo se marca pagada aqui).
+  document_id?: string | null;
 }
 
 export interface MaintenanceExpense {
@@ -515,6 +526,7 @@ function mapRowToProduct(row: Record<string, unknown>): Product {
     price_paid: (row.price_paid as number) ?? 0,
     price_sold: (row.price_sold as number) ?? null,
     sold_date: (row.sold_date as string) ?? null,
+    lost_date: (row.lost_date as string) ?? null,
     status: (row.status as Product['status']) ?? 'Disponible',
     notes: (row.notes as string) ?? '',
     suggested_weekly_rate: (pm?.suggested_weekly_rate as number) ?? null,
@@ -773,6 +785,7 @@ export async function upsertProduct(p: Product): Promise<void> {
     price_paid: p.price_paid,
     price_sold: p.price_sold,
     sold_date: p.sold_date,
+    lost_date: p.lost_date ?? null,
     status: p.status,
     notes: p.notes,
     odometer: p.odometer,
@@ -892,6 +905,18 @@ export async function uploadRentalPhoto(rentalId: string, file: File): Promise<s
 }
 
 // Upload rider passport / ID document photo
+// ================================================================
+// DOCUMENTO DE IDENTIDAD DEL RIDER
+//
+// El bucket es PRIVADO: un pasaporte o un DNI son datos personales
+// sensibles, y en un bucket publico basta con que se filtre la URL (un
+// correo reenviado, un historial, un log) para que quede a la vista de
+// cualquiera sin necesidad de estar logueado.
+//
+// Por eso se guarda la RUTA, no una URL. Para verlo se firma un enlace
+// temporal en el momento.
+// ================================================================
+
 export async function uploadRiderDocument(customerId: string, file: File): Promise<string> {
   const ext = file.name.split('.').pop() ?? 'jpg';
   const filePath = `riders/${customerId}/id_${Date.now()}.${ext}`;
@@ -901,11 +926,29 @@ export async function uploadRiderDocument(customerId: string, file: File): Promi
     .upload(filePath, file, { upsert: true });
   if (uploadErr) throw uploadErr;
 
-  const { data } = supabase.storage
-    .from('rider-documents')
-    .getPublicUrl(filePath);
+  // Se devuelve la ruta. Antes se devolvia la URL publica, y esos valores
+  // siguen en la base: getRiderDocumentUrl entiende los dos formatos.
+  return filePath;
+}
 
-  return data.publicUrl;
+/**
+ * Enlace temporal para ver el documento de identidad.
+ *
+ * Acepta tanto una ruta (formato nuevo) como una URL publica completa
+ * (las que quedaron guardadas cuando el bucket era publico). De la URL
+ * vieja se extrae la ruta, asi no hace falta migrar datos: los registros
+ * antiguos se siguen viendo, ya con enlace firmado.
+ */
+export async function getRiderDocumentUrl(stored: string): Promise<string> {
+  const marker = '/rider-documents/';
+  const idx = stored.indexOf(marker);
+  const path = idx >= 0 ? stored.slice(idx + marker.length).split('?')[0] : stored;
+
+  const { data, error } = await supabase.storage
+    .from('rider-documents')
+    .createSignedUrl(decodeURIComponent(path), 3600);
+  if (error) throw error;
+  return data.signedUrl;
 }
 
 // Upload physical contract photo for a rental
@@ -1280,6 +1323,37 @@ export async function deleteCustomer(id: string): Promise<void> {
 }
 
 // ================================================================
+// HUERFANOS AL BORRAR
+//
+// Las claves foraneas de rentals hacia products y customers son
+// ON DELETE SET NULL: borrar una bici o un cliente NO borra su alquiler,
+// le pone el campo en null. El alquiler sobrevive sin bici ni cliente,
+// invisible en toda pantalla que cruce por esos ids, y arrastrando sus
+// fotos y su contrato.
+//
+// Asi aparecieron los 10 alquileres huerfanos de junio de 2026. Estas
+// funciones existen para preguntar ANTES de borrar, no despues.
+// ================================================================
+
+/** Alquileres que quedarian huerfanos al borrar este producto. */
+export async function countRentalsForProduct(productId: string): Promise<number> {
+  const [asBike, asItem] = await Promise.all([
+    supabase.from('rentals').select('id', { count: 'exact', head: true }).eq('bike_id', productId),
+    supabase.from('rental_items').select('id', { count: 'exact', head: true }).eq('product_id', productId),
+  ]);
+  return (asBike.count ?? 0) + (asItem.count ?? 0);
+}
+
+/** Alquileres que quedarian huerfanos al borrar este cliente. */
+export async function countRentalsForCustomer(customerId: string): Promise<number> {
+  const { count } = await supabase
+    .from('rentals')
+    .select('id', { count: 'exact', head: true })
+    .eq('customer_id', customerId);
+  return count ?? 0;
+}
+
+// ================================================================
 // RENTALS
 // ================================================================
 
@@ -1479,6 +1553,18 @@ export async function upsertPayment(p: RentalPayment): Promise<void> {
 
 export async function deletePayment(id: string): Promise<void> {
   const { error } = await supabase.from('rental_payments').delete().eq('id', id);
+  if (error) throw error;
+}
+
+// Enlaza un cobro con la factura que lo documenta. Best-effort: si falla,
+// el pago y la factura ya existen y el emparejador por importe y fecha
+// sigue cubriendo el caso (ver invoicing/paymentInvoices.ts). Lo que no
+// puede es tumbar el registro del cobro.
+export async function linkPaymentToDocument(paymentId: string, documentId: string): Promise<void> {
+  const { error } = await supabase
+    .from('rental_payments')
+    .update({ document_id: documentId })
+    .eq('id', paymentId);
   if (error) throw error;
 }
 
@@ -1749,6 +1835,29 @@ export interface QuickReply {
   created_at: string;
 }
 
+/** Medio por el que se contesto al cliente. */
+export type ResponseChannel = 'email' | 'whatsapp' | 'instagram' | 'otro';
+
+/**
+ * Un registro de cuanto se tardo en contestarle a un cliente.
+ *
+ * response_minutes va siempre en minutos, aunque en pantalla se cargue
+ * en horas o dias: es lo que permite promediar filas cargadas con
+ * unidades distintas.
+ */
+export interface ResponseLog {
+  id: string;
+  customer_name: string;
+  phone: string;
+  email: string;
+  channel: ResponseChannel;
+  channel_detail: string;
+  response_minutes: number;
+  notes: string;
+  logged_at: string;
+  created_at?: string;
+}
+
 export async function getQuickReplies(): Promise<QuickReply[]> {
   try {
     const { data, error } = await supabase
@@ -1774,6 +1883,45 @@ export async function upsertQuickReply(qr: QuickReply): Promise<void> {
 
 export async function deleteQuickReply(id: string): Promise<void> {
   const { error } = await supabase.from('quick_replies').delete().eq('id', id);
+  if (error) throw error;
+}
+
+// ================================================================
+// TIEMPOS DE RESPUESTA
+// ================================================================
+
+export async function getResponseLogs(): Promise<ResponseLog[]> {
+  try {
+    const { data, error } = await supabase
+      .from('response_logs')
+      .select('*')
+      .order('logged_at', { ascending: false })
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    return (data ?? []) as ResponseLog[];
+  } catch {
+    // La tabla puede no existir todavia: mejor lista vacia que pantalla rota.
+    return [];
+  }
+}
+
+export async function upsertResponseLog(r: ResponseLog): Promise<void> {
+  const { error } = await supabase.from('response_logs').upsert({
+    id: r.id,
+    customer_name: r.customer_name,
+    phone: r.phone,
+    email: r.email,
+    channel: r.channel,
+    channel_detail: r.channel_detail,
+    response_minutes: r.response_minutes,
+    notes: r.notes,
+    logged_at: r.logged_at,
+  });
+  if (error) throw error;
+}
+
+export async function deleteResponseLog(id: string): Promise<void> {
+  const { error } = await supabase.from('response_logs').delete().eq('id', id);
   if (error) throw error;
 }
 

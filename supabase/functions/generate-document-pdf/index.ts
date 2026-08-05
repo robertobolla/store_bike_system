@@ -192,8 +192,19 @@ Deno.serve(async (req: Request) => {
       const to = customer?.email;
       const accounting = company?.accounting_email;
 
-      if (!to) {
-        console.warn(`${first.number}: el cliente no tiene email, no se envia.`);
+      // accounting_only: la copia va SOLO a administracion, sin tocar al
+      // cliente. Sirve para reenviarse una factura ya entregada sin que
+      // al rider le llegue por segunda vez.
+      const accountingOnly = body.accounting_only === true;
+      // Sin email del cliente antes no se enviaba NADA, y la copia
+      // contable se perdia por un dato que no depende de ella. Ahora la
+      // copia sale igual mientras haya correo de administracion.
+      const destinatarios = accountingOnly
+        ? (accounting ? [accounting] : [])
+        : (to ? [to] : (accounting ? [accounting] : []));
+
+      if (destinatarios.length === 0) {
+        console.warn(`${first.number}: sin destinatario (ni cliente ni administracion), no se envia.`);
       } else {
         const labels = rendered.map(r => EMAIL_SUBJECTS[r.doc.doc_type] ?? 'Document');
         const subject = rendered.length > 1
@@ -209,11 +220,12 @@ Deno.serve(async (req: Request) => {
               Authorization: `Bearer ${Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')}`,
             },
             body: JSON.stringify({
-              to,
-              // La copia para The Fast Sheep va en cc, ademas de quedar
-              // archivada en Storage.
-              cc: accounting ? [accounting] : undefined,
-              subject,
+              to: destinatarios,
+              // En el envio normal la copia para The Fast Sheep va en cc.
+              // En accounting_only administracion ya es el destinatario:
+              // repetirla en cc le mandaria el correo dos veces.
+              cc: (!accountingOnly && to && accounting) ? [accounting] : undefined,
+              subject: accountingOnly ? `[Copy] ${subject}` : subject,
               html: buildEmailHtml(rendered, company),
               attachments: rendered.map(r => ({
                 filename: `${r.doc.number}.pdf`,
@@ -226,10 +238,17 @@ Deno.serve(async (req: Request) => {
         if (emailRes.ok) {
           emailed = true;
           const now = new Date().toISOString();
+          // Solo se marca como enviado a quien de verdad lo recibio: si
+          // fue una copia a administracion, el cliente no se entero.
+          const llegoAlCliente = !accountingOnly && !!to;
+          const llegoAContabilidad = accountingOnly || (!!to && !!accounting);
           for (const r of rendered) {
-            await supabase.from('documents')
-              .update({ sent_to_customer_at: now, sent_to_accounting_at: accounting ? now : null })
-              .eq('id', r.doc.id);
+            const patch: Record<string, string> = {};
+            if (llegoAlCliente) patch.sent_to_customer_at = now;
+            if (llegoAContabilidad) patch.sent_to_accounting_at = now;
+            if (Object.keys(patch).length > 0) {
+              await supabase.from('documents').update(patch).eq('id', r.doc.id);
+            }
           }
         } else {
           // Los PDF ya estan archivados: el envio se puede reintentar sin

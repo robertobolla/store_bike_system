@@ -2,6 +2,7 @@
 // Supabase, sin cache local, los errores se propagan al llamador.
 
 import { supabase } from '../supabaseClient';
+import { formatDate } from '../utils/date';
 import { round2, splitVatInclusive } from './money';
 import type {
   CompanySettings,
@@ -13,6 +14,7 @@ import type {
   FinancingSnapshot,
   FiscalDocument,
   NewDocument,
+  NewDocumentLine,
 } from './types';
 
 // ================================================================
@@ -37,6 +39,21 @@ export async function updateCompanySettings(patch: Partial<CompanySettings>): Pr
 // ================================================================
 // EMISION
 // ================================================================
+
+// Los conceptos de un documento van SIEMPRE en ingles, igual que el resto
+// del PDF. El papel es el mismo para todos los clientes y no puede
+// depender del idioma que tuviera abierta la app quien registro el cobro:
+// dos facturas del mismo alquiler no pueden decir una "Alquiler de e-bike"
+// y la otra "E-bike rental".
+//
+// Viven aqui y no en cada llamador justamente para que nadie pueda pasar
+// un texto traducido por descuido.
+export const LINE_TEXT = {
+  rental: 'E-bike rental',
+  extraCharge: 'Additional charge',
+  sale: 'Sale',
+  deposit: 'Security deposit',
+} as const;
 
 // Emite un documento con su numeracion. Numero, cabecera y lineas se
 // insertan en una sola transaccion del lado de Postgres: si algo falla no
@@ -132,7 +149,9 @@ export async function issueRentalInvoice(opts: {
   amount: number;
   paymentMethod: string;
   paymentDate: string;
-  description: string;
+  // Solo para cobros que no son la renta (un extra, un recargo). El
+  // concepto normal lo pone LINE_TEXT y no se traduce.
+  description?: string;
   createdBy?: string | null;
 }): Promise<FiscalDocument> {
   const { data: rental, error: rErr } = await supabase
@@ -157,7 +176,7 @@ export async function issueRentalInvoice(opts: {
     company_snapshot: await getCompanySettings(),
     created_by: opts.createdBy ?? null,
     lines: [{
-      description: opts.description,
+      description: opts.description || LINE_TEXT.rental,
       quantity: 1,
       unit_price: breakdown.total,
       line_total: breakdown.total,
@@ -174,39 +193,73 @@ export async function issueRentalInvoice(opts: {
 // Los importes se introducen en positivo. En una nota de credito se
 // guardan en NEGATIVO (una CN resta), igual que las que salen de
 // createCreditNote. El importe de cada linea es CON VAT incluido.
+export type ManualDocType = 'INV' | 'CN' | 'DEP' | 'REF';
+
+/** Documentos que restan: se guardan en negativo aunque se tecleen en positivo. */
+const NEGATIVE_TYPES: ReadonlySet<ManualDocType> = new Set<ManualDocType>(['CN', 'REF']);
+
+/**
+ * Documentos que NO llevan VAT.
+ *
+ * Un deposito no es una entrega sujeta a impuesto: es una garantia que se
+ * retiene y se devuelve. Cobrarle VAT lo convertiria en un ingreso que no
+ * es. Su devolucion (REF) sigue el mismo criterio.
+ */
+const VAT_FREE_TYPES: ReadonlySet<ManualDocType> = new Set<ManualDocType>(['DEP', 'REF']);
+
 export async function issueManualDocument(opts: {
-  docType: 'INV' | 'CN';
+  docType: ManualDocType;
   customerId?: string | null;
   customerName?: string;
+  // Destinatario del documento. Pisa el email del cliente en el snapshot:
+  // es a esta direccion a la que se envia el PDF. Permite facturar a un
+  // cliente y mandarselo a otra casilla (su gestoria, un email nuevo).
+  customerEmail?: string;
+  rentalId?: string | null;
   lines: Array<{ description: string; amount: number }>;
   issueDate: string;
   status: 'paid' | 'pending';
   paymentMethod?: string;
   createdBy?: string | null;
 }): Promise<FiscalDocument> {
-  const sign = opts.docType === 'CN' ? -1 : 1;
+  const sign = NEGATIVE_TYPES.has(opts.docType) ? -1 : 1;
+  const vatFree = VAT_FREE_TYPES.has(opts.docType);
+
   const gross = round2(opts.lines.reduce((s, l) => s + round2(l.amount), 0));
-  const breakdown = splitVatInclusive(gross);
+  // En un documento sin VAT el importe es todo base: no se desglosa nada.
+  const breakdown = vatFree
+    ? { subtotal: gross, vat_rate: 0, vat_amount: 0, total: gross }
+    : splitVatInclusive(gross);
 
   let snapshot: CustomerSnapshot | undefined;
   if (opts.customerId) {
     snapshot = await buildCustomerSnapshot(opts.customerId);
-  } else if (opts.customerName) {
-    snapshot = { name: opts.customerName, email: '', address: '', phone: '', customer_code: '' };
+  } else if (opts.customerName || opts.customerEmail) {
+    snapshot = { name: opts.customerName ?? '', email: '', address: '', phone: '', customer_code: '' };
   }
+  // El email elegido manda sobre el del cliente: el envio sale del
+  // snapshot, asi que es aqui donde hay que dejarlo.
+  const chosenEmail = opts.customerEmail?.trim();
+  if (snapshot && chosenEmail) snapshot = { ...snapshot, email: chosenEmail };
 
   return issueDocument({
     doc_type: opts.docType,
     issue_date: opts.issueDate,
-    // Una nota de credito se emite ya asentada; no tiene estado de cobro.
-    status: opts.docType === 'CN' ? 'issued' : opts.status,
+    // Solo una factura queda pendiente de cobro. Una nota de credito, un
+    // recibo de deposito y una devolucion nacen ya asentados.
+    status: opts.docType === 'INV' ? opts.status : 'issued',
     customer_id: opts.customerId ?? null,
+    rental_id: opts.rentalId ?? null,
     subtotal: sign * breakdown.subtotal,
     vat_rate: breakdown.vat_rate,
     vat_amount: sign * breakdown.vat_amount,
     total: sign * breakdown.total,
     payment_method: opts.paymentMethod ?? '',
-    payment_date: opts.docType === 'INV' && opts.status === 'paid' ? opts.issueDate : null,
+    // El deposito y su devolucion mueven dinero el mismo dia que se
+    // emiten; la factura solo si se marca cobrada.
+    payment_date: opts.docType === 'INV'
+      ? (opts.status === 'paid' ? opts.issueDate : null)
+      : (vatFree ? opts.issueDate : null),
     customer_snapshot: snapshot,
     company_snapshot: await getCompanySettings(),
     created_by: opts.createdBy ?? null,
@@ -218,6 +271,135 @@ export async function issueManualDocument(opts: {
       vat_rate: breakdown.vat_rate,
     })),
   });
+}
+
+// ================================================================
+// COBRO COMBINADO: ALQUILER + ARTICULOS DE TIENDA
+//
+// El rider paga la semana y ademas se lleva un casco: al banco entra UN
+// movimiento de 120. Para que el papel case con el extracto, alquiler y
+// articulos van en la MISMA factura, una linea cada uno.
+//
+// Los dos apuntes de siempre se siguen escribiendo aparte (el cobro en
+// rental_payments y la venta en sales/sale_items), asi que el Balance, la
+// rentabilidad y el stock no se enteran de nada. Lo unico que se fusiona
+// es el documento.
+// ================================================================
+
+// Reemplaza un documento por otro que HEREDA SU NUMERO. Ver
+// replace_document en 20260805_factura_combinada.sql: borra e inserta en
+// la misma transaccion y no toca la secuencia, asi que no deja hueco.
+async function replaceDocument(oldId: string, input: NewDocument): Promise<FiscalDocument> {
+  const { data, error } = await supabase.rpc('replace_document', { p_old_id: oldId, p: input });
+  if (error) throw error;
+  return data as FiscalDocument;
+}
+
+/**
+ * Emite la factura de un cobro de alquiler que ademas lleva articulos.
+ *
+ * Si el cron ya habia dejado la factura semanal en 'pending', esa se
+ * reemplaza: la nueva sale con su mismo numero, por el importe real y ya
+ * pagada. La de 70 deja de existir, tambien su PDF archivado, que vive en
+ * la misma ruta {year}/{number}.pdf y se sobrescribe al regenerarlo.
+ *
+ * Si no hay ninguna pendiente (alquiler sin facturacion automatica), la
+ * combinada nace directamente con numero nuevo.
+ */
+export async function issueRentalInvoiceWithItems(opts: {
+  rentalId: string;
+  rentAmount: number;
+  rentDescription?: string;
+  // El precio es POR UNIDAD y la cantidad viaja aparte: la factura tiene
+  // que decir "Casco Negro · 3 · 40,00 · 120,00" y no una linea de 120
+  // sin explicar de donde sale.
+  items: Array<{ description: string; quantity: number; unitPrice: number }>;
+  saleId?: string | null;
+  paymentMethod: string;
+  paymentDate: string;
+  createdBy?: string | null;
+}): Promise<FiscalDocument> {
+  const { data: rental, error: rErr } = await supabase
+    .from('rentals').select('customer_id').eq('id', opts.rentalId).single();
+  if (rErr) throw rErr;
+
+  const rent = round2(opts.rentAmount);
+  const items = opts.items
+    .map(i => {
+      const quantity = Math.max(1, Math.round(i.quantity || 1));
+      const unitPrice = round2(i.unitPrice);
+      // El total sale de multiplicar, nunca al reves: asi lo que imprime la
+      // factura (3 x 40,00 = 120,00) cuadra exactamente con el total.
+      return { description: i.description, quantity, unitPrice, amount: round2(quantity * unitPrice) };
+    })
+    .filter(i => i.amount > 0);
+  if (items.length === 0) {
+    throw new Error('Una factura combinada necesita al menos un articulo; si no, es una factura de alquiler normal.');
+  }
+
+  // Todo va al mismo tipo de VAT (alquiler y bienes, 23% incluido), asi
+  // que el desglose se hace una vez sobre el total. Un deposito no puede
+  // entrar aqui: va al 0% y la cabecera solo admite un tipo.
+  const breakdown = splitVatInclusive(round2(rent + items.reduce((s, i) => s + i.amount, 0)));
+
+  const lines: NewDocumentLine[] = [];
+  if (rent > 0) {
+    lines.push({
+      description: opts.rentDescription || LINE_TEXT.rental,
+      quantity: 1,
+      unit_price: rent,
+      line_total: rent,
+      vat_rate: breakdown.vat_rate,
+    });
+  }
+  items.forEach(i => {
+    lines.push({
+      description: i.description,
+      quantity: i.quantity,
+      unit_price: i.unitPrice,
+      line_total: i.amount,
+      vat_rate: breakdown.vat_rate,
+    });
+  });
+
+  const docs = await getDocumentsByRental(opts.rentalId);
+  const pending = docs.find(d => d.doc_type === 'INV' && d.status === 'pending');
+
+  const payload: NewDocument = {
+    doc_type: 'INV',
+    // Al reemplazar se conserva la fecha de emision de la semanal. El
+    // numero se hereda, y darle una fecha posterior romperia el orden
+    // numero<->fecha que el resto de la numeracion mantiene (y, a fin de
+    // ano, dejaria un numero de 2026 con fecha de 2027). Cuando entro el
+    // dinero lo dice payment_date, que es lo que cuadra con el banco.
+    issue_date: pending?.issue_date ?? opts.paymentDate,
+    status: 'paid',
+    rental_id: opts.rentalId,
+    sale_id: opts.saleId ?? null,
+    customer_id: rental.customer_id,
+    subtotal: breakdown.subtotal,
+    vat_rate: breakdown.vat_rate,
+    vat_amount: breakdown.vat_amount,
+    total: breakdown.total,
+    payment_method: opts.paymentMethod,
+    payment_date: opts.paymentDate,
+    customer_snapshot: await buildCustomerSnapshot(rental.customer_id),
+    company_snapshot: await getCompanySettings(),
+    // El periodo semanal viaja a la factura nueva: es la misma semana. El
+    // indice unico que lo protege queda libre al borrarse la anterior
+    // dentro de la misma transaccion.
+    billing_period_start: pending?.billing_period_start ?? null,
+    billing_period_end: pending?.billing_period_end ?? null,
+    // Lo que neutraliza el email viejo: el rider tiene un PDF con este
+    // mismo numero por 70, y este dice que aquella version ya no vale.
+    notes: pending
+      ? `Updated ${formatDate(opts.paymentDate)} — replaces the previously issued version of this invoice.`
+      : '',
+    created_by: opts.createdBy ?? null,
+    lines,
+  };
+
+  return pending ? replaceDocument(pending.id, payload) : issueDocument(payload);
 }
 
 // Recibo de deposito de seguridad (DEP). No es una factura y no lleva
@@ -251,7 +433,7 @@ export async function issueDepositReceipt(opts: {
     company_snapshot: await getCompanySettings(),
     created_by: opts.createdBy ?? null,
     lines: [{
-      description: 'Security deposit',
+      description: LINE_TEXT.deposit,
       quantity: 1,
       unit_price: amount,
       line_total: amount,
@@ -284,7 +466,7 @@ export async function issueSaleInvoice(opts: {
   if (error) throw error;
 
   const breakdown = splitVatInclusive(Number(sale.total_amount ?? 0));
-  const description = opts.description ?? 'Sale';
+  const description = opts.description || LINE_TEXT.sale;
 
   return issueDocument({
     doc_type: 'INV',
@@ -468,9 +650,13 @@ export async function getDocumentPdfUrl(pdfPath: string): Promise<string> {
 export async function generateDocumentPdf(
   documentId: string,
   sendEmail: boolean,
+  // accountingOnly: manda la copia SOLO al correo de administracion, sin
+  // que le vuelva a llegar al cliente. Para reenviarse un documento ya
+  // entregado sin molestar a quien ya lo tiene.
+  accountingOnly = false,
 ): Promise<{ pdf_url: string; emailed: boolean }> {
   const { data, error } = await supabase.functions.invoke('generate-document-pdf', {
-    body: { document_id: documentId, send_email: sendEmail },
+    body: { document_id: documentId, send_email: sendEmail, accounting_only: accountingOnly },
   });
   if (error) throw error;
   return data as { pdf_url: string; emailed: boolean };
@@ -520,7 +706,7 @@ export async function markOldestPendingRentalInvoicePaid(opts: {
   paymentMethod: string;
   paymentDate: string;
   fallbackAmount: number;
-  fallbackDescription: string;
+  fallbackDescription?: string;
   createdBy?: string | null;
 }): Promise<FiscalDocument> {
   const docs = await getDocumentsByRental(opts.rentalId);
@@ -592,10 +778,13 @@ export async function sendDocumentCancelledEmail(doc: FiscalDocument): Promise<b
   return !error;
 }
 
-// Borra un documento y, si era el ultimo numero de su tipo/anio, retrocede
-// el contador para que el proximo lo reuse (ver delete_document en la
-// migracion). Tambien borra el PDF archivado. Pensado para limpiar datos
-// de prueba: un documento fiscal real no deberia borrarse.
+// Borra un documento y su PDF archivado. El numero NO se reutiliza: queda
+// como hueco en la secuencia (ver delete_document en
+// 20260805_numeracion_sin_reuso.sql). Reusarlo se lo daba a un documento
+// nuevo con fecha de hoy, y la numeracion dejaba de seguir a las fechas.
+//
+// Pensado para limpiar datos de prueba: un documento fiscal real no
+// deberia borrarse, y ahora ademas deja rastro de que estuvo.
 export async function deleteDocument(id: string, pdfPath?: string | null): Promise<void> {
   if (pdfPath) {
     // El PDF puede no existir; el fallo al borrarlo no debe frenar el borrado.
@@ -675,6 +864,47 @@ export async function updateBusinessExpense(id: string, patch: Partial<Expense>)
 
 export async function deleteBusinessExpense(id: string): Promise<void> {
   const { error } = await supabase.from('expenses').delete().eq('id', id);
+  if (error) throw error;
+}
+
+// ================================================================
+// COMPROBANTES DE GASTO
+//
+// El bucket es privado: se guarda la RUTA en expenses.invoice_file_url,
+// no una URL publica. Para verlo se firma una URL temporal en el momento.
+// Guardar una URL publica dejaria los datos fiscales de la empresa al
+// alcance de cualquiera que diera con el enlace.
+// ================================================================
+
+const RECEIPTS_BUCKET = 'expense-receipts';
+
+/** Sube el comprobante y devuelve la ruta a guardar en el gasto. */
+export async function uploadExpenseReceipt(file: File): Promise<string> {
+  const ext = (file.name.split('.').pop() || 'bin').toLowerCase();
+  // La ruta lleva la fecha para que el bucket quede navegable por periodo
+  // cuando haya que buscar un recibo a mano.
+  const stamp = new Date().toISOString().slice(0, 10);
+  const path = `${stamp}/${crypto.randomUUID()}.${ext}`;
+
+  const { error } = await supabase.storage
+    .from(RECEIPTS_BUCKET)
+    .upload(path, file, { upsert: false, contentType: file.type || undefined });
+  if (error) throw error;
+
+  return path;
+}
+
+/** URL firmada y temporal para abrir un comprobante ya guardado. */
+export async function getExpenseReceiptUrl(path: string): Promise<string> {
+  const { data, error } = await supabase.storage
+    .from(RECEIPTS_BUCKET)
+    .createSignedUrl(path, 3600);
+  if (error) throw error;
+  return data.signedUrl;
+}
+
+export async function deleteExpenseReceipt(path: string): Promise<void> {
+  const { error } = await supabase.storage.from(RECEIPTS_BUCKET).remove([path]);
   if (error) throw error;
 }
 

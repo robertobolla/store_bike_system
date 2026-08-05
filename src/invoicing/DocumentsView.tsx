@@ -10,6 +10,7 @@ import {
   getDocuments, getDocumentPdfUrl, generateDocumentPdf, markDocumentPaid,
   issueManualDocument, deleteDocument, sendDocumentCancelledEmail,
 } from './api';
+import type { ManualDocType } from './api';
 import { formatMoney, round2, splitVatInclusive } from './money';
 import { formatDate as fmtDate } from '../utils/date';
 import type { DocType, FiscalDocument } from './types';
@@ -44,32 +45,58 @@ function statusBadge(doc: FiscalDocument, lang: 'es' | 'en') {
   return <span className="badge status-maintenance">{lang === 'es' ? 'Pendiente' : 'Unpaid'}</span>;
 }
 
+// Alquiler con codigo visible. Solo entran los que tienen RNT: ligar un
+// documento a un alquiler sin codigo no se veria ni en la tabla ni en el PDF.
+export interface RentalOption {
+  id: string;
+  code: string;          // RNT-2026-0024
+  customerId: string;
+  active: boolean;
+}
+
 interface Props {
   language: 'es' | 'en';
   showToast: (msg: string, type?: 'success' | 'error') => void;
-  // Codigo visible del alquiler por id, para la columna "Alquiler".
-  rentalCodeById: Map<string, string>;
-  // Clientes para el selector de la factura manual.
-  customers: { id: string; name: string }[];
+  // Alquileres con RNT: dan la columna "Alquiler" de la tabla y el selector
+  // con el que un documento manual se liga a su alquiler.
+  rentals: RentalOption[];
+  // Clientes para el selector de la factura manual. El email se usa para
+  // proponer el destinatario cuando se elige enviar el documento.
+  customers: { id: string; name: string; email?: string }[];
 }
 
 interface ManualLine { description: string; amount: string; }
 
-export function DocumentsView({ language, showToast, rentalCodeById, customers }: Props) {
+export function DocumentsView({ language, showToast, rentals, customers }: Props) {
   const es = language === 'es';
   const [docs, setDocs] = useState<FiscalDocument[]>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<'all' | DocType>('all');
   const [search, setSearch] = useState('');
   const [busyId, setBusyId] = useState<string | null>(null);
+  // Regenerado en lote de los PDF que quedaron sin archivo. Pasa sobre
+  // todo despues de reordenar la numeracion: al cambiar el numero, el PDF
+  // archivado queda mintiendo y se suelta la referencia.
+  const [regen, setRegen] = useState<{ hechos: number; total: number; fallos: number } | null>(null);
 
-  // Formulario de documento manual (factura o nota de credito).
+  // Formulario de documento manual: factura, nota de credito, recibo de
+  // deposito y devolucion de deposito.
   const [showForm, setShowForm] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [mType, setMType] = useState<'INV' | 'CN'>('INV');
+  const [mType, setMType] = useState<ManualDocType>('INV');
   const [mCustomerId, setMCustomerId] = useState('');
   const [mCustomerName, setMCustomerName] = useState('');
+  // Alquiler al que se liga el documento. Es lo que hace que un cobro suelto
+  // (una reparacion, un deposito, una nota de credito) aparezca junto al
+  // resto de papeles del alquiler y se imprima como "Rental ref:".
+  const [mRentalId, setMRentalId] = useState('');
   const [mStatus, setMStatus] = useState<'paid' | 'pending'>('paid');
+  const [mIssueDate, setMIssueDate] = useState(new Date().toISOString().slice(0, 10));
+  // Envio del documento. Arranca apagado a proposito: emitir no deberia
+  // disparar un correo por sorpresa. Al encenderlo se propone el email
+  // del cliente elegido, pero se puede escribir cualquier otro.
+  const [mSendEmail, setMSendEmail] = useState(false);
+  const [mEmail, setMEmail] = useState('');
   const [mLines, setMLines] = useState<ManualLine[]>([{ description: '', amount: '' }]);
 
   // showLoader: solo en la primera carga se muestra "Cargando..."; en las
@@ -91,6 +118,11 @@ export function DocumentsView({ language, showToast, rentalCodeById, customers }
   // el uso legitimo de un efecto.
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { void load(); }, [load]);
+
+  const rentalCodeById = useMemo(
+    () => new Map(rentals.map(r => [r.id, r.code])),
+    [rentals],
+  );
 
   const visible = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -186,8 +218,8 @@ export function DocumentsView({ language, showToast, rentalCodeById, customers }
   const removeDoc = async (doc: FiscalDocument) => {
     const ok = window.confirm(
       es
-        ? `¿Eliminar ${doc.number}? Se enviará un aviso de cancelación al cliente. Si es el último número emitido, el próximo lo reutilizará.`
-        : `Delete ${doc.number}? A cancellation notice will be emailed to the customer. If it is the last issued number, the next one will reuse it.`,
+        ? `¿Eliminar ${doc.number}? Se enviará un aviso de cancelación al cliente. El número queda como hueco en la numeración: no lo reutiliza nadie.`
+        : `Delete ${doc.number}? A cancellation notice will be emailed to the customer. Its number stays as a gap in the sequence: nothing reuses it.`,
     );
     if (!ok) return;
     try {
@@ -210,15 +242,136 @@ export function DocumentsView({ language, showToast, rentalCodeById, customers }
     }
   };
 
+  // Documentos sin PDF archivado. Se cuenta sobre TODOS, no sobre los
+  // visibles: el filtro de arriba no debe cambiar cuantos hay que rehacer.
+  const sinPdf = useMemo(() => docs.filter(d => !d.pdf_url), [docs]);
+
+  // De a UNO, con reintentos y una pausa entre llamadas.
+  //
+  // La Edge Function renderiza el PDF con @react-pdf/renderer dentro del
+  // propio worker, que es caro en CPU y memoria. Pedirle varios por
+  // invocacion, y encadenar invocaciones sin respirar, agota los limites
+  // del worker: en la primera prueba paso un lote de cinco y fallaron los
+  // otros diecinueve. Uno por llamada tarda mas pero llega al final, y un
+  // documento que falle se identifica por su numero en vez de arrastrar a
+  // otros cuatro.
+  const regenerarPdfs = async () => {
+    const pendientes = sinPdf.map(d => ({ id: d.id, number: d.number }));
+    if (pendientes.length === 0) return;
+    const ok = window.confirm(
+      es
+        ? `¿Regenerar ${pendientes.length} PDF? No se envía ningún email: solo se vuelven a archivar. Puede tardar unos minutos.`
+        : `Regenerate ${pendientes.length} PDFs? No email is sent, they are only re-archived. It may take a few minutes.`,
+    );
+    if (!ok) return;
+
+    const dormir = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+    setRegen({ hechos: 0, total: pendientes.length, fallos: 0 });
+    let hechos = 0;
+    const fallidos: string[] = [];
+    let primerError = '';
+
+    for (const doc of pendientes) {
+      let logrado = false;
+      // Tres intentos con espera creciente: la mayoria de los fallos aqui
+      // son del worker saturado, y eso se cura esperando.
+      for (let intento = 0; intento < 3 && !logrado; intento++) {
+        if (intento > 0) await dormir(1000 * intento);
+        try {
+          await generateDocumentPdf(doc.id, false);
+          logrado = true;
+        } catch (e) {
+          if (!primerError) primerError = (e as Error)?.message ?? String(e);
+          console.error(`No se pudo regenerar ${doc.number} (intento ${intento + 1}):`, e);
+        }
+      }
+      if (logrado) hechos++; else fallidos.push(doc.number);
+      setRegen({ hechos, total: pendientes.length, fallos: fallidos.length });
+      // Respiro entre documentos para no encadenar invocaciones.
+      await dormir(150);
+    }
+
+    await load();
+    setRegen(null);
+    if (fallidos.length === 0) {
+      showToast(es ? `${hechos} PDF regenerados.` : `${hechos} PDFs regenerated.`, 'success');
+    } else {
+      console.error('Documentos sin regenerar:', fallidos.join(', '));
+      showToast(
+        es
+          ? `${hechos} regenerados, ${fallidos.length} fallaron. ${primerError}`
+          : `${hechos} regenerated, ${fallidos.length} failed. ${primerError}`,
+        'error',
+      );
+    }
+  };
+
   const setLine = (i: number, patch: Partial<ManualLine>) =>
     setMLines(prev => prev.map((l, idx) => (idx === i ? { ...l, ...patch } : l)));
 
+  // Un deposito y su devolucion no llevan VAT: no son una entrega sujeta
+  // a impuesto, son una garantia que se retiene y se devuelve.
+  const isVatFree = mType === 'DEP' || mType === 'REF';
+  const isNegative = mType === 'CN' || mType === 'REF';
   const manualTotal = round2(mLines.reduce((s, l) => s + (parseFloat(l.amount) || 0), 0));
-  const manualBreakdown = manualTotal > 0 ? splitVatInclusive(manualTotal) : null;
+  const manualBreakdown = manualTotal > 0 && !isVatFree ? splitVatInclusive(manualTotal) : null;
+
+  const emailOf = (customerId: string) => customers.find(c => c.id === customerId)?.email ?? '';
+  const nameOf = (customerId: string) => customers.find(c => c.id === customerId)?.name ?? '';
+
+  // Alquileres ofrecidos: los del cliente elegido, o todos si aun no hay
+  // ninguno. Los activos primero y, dentro de cada grupo, el RNT mas alto
+  // arriba: el alquiler en curso es casi siempre el que se busca.
+  const rentalOptions = useMemo(() => {
+    const list = mCustomerId ? rentals.filter(r => r.customerId === mCustomerId) : rentals;
+    return [...list].sort((a, b) =>
+      (Number(b.active) - Number(a.active)) || b.code.localeCompare(a.code));
+  }, [rentals, mCustomerId]);
+
+  // "RNT-2026-0024 — Silas Scalcon (finalizado)". El nombre solo hace falta
+  // mientras no haya cliente elegido: en cuanto lo hay, la lista ya es suya.
+  const rentalLabel = (r: RentalOption) =>
+    r.code
+    + (mCustomerId ? '' : ` — ${nameOf(r.customerId)}`)
+    + (r.active ? '' : (es ? ' (finalizado)' : ' (ended)'));
+
+  // Al cambiar de cliente se propone su email. Se hace aqui y no en un
+  // efecto para que el valor propuesto sea consecuencia directa de la
+  // eleccion, y no algo que aparece solo despues de renderizar.
+  const pickCustomer = (id: string) => {
+    setMCustomerId(id);
+    setMEmail(id ? emailOf(id) : '');
+    // Un alquiler de otro cliente no puede quedar enganchado: el documento
+    // saldria facturado a uno y referenciando el alquiler de otro.
+    if (id && mRentalId && !rentals.some(r => r.id === mRentalId && r.customerId === id)) {
+      setMRentalId('');
+    }
+  };
+
+  // Elegir alquiler fija tambien su titular: un documento que cuelga de un
+  // alquiler es de quien lo tiene, no de quien se elija a mano.
+  const pickRental = (id: string) => {
+    setMRentalId(id);
+    const owner = rentals.find(r => r.id === id)?.customerId;
+    if (owner && owner !== mCustomerId && customers.some(c => c.id === owner)) {
+      setMCustomerId(owner);
+      setMEmail(emailOf(owner));
+    }
+  };
+
+  const toggleSendEmail = (on: boolean) => {
+    setMSendEmail(on);
+    // Al encenderlo se rellena con el email del cliente si aun no hay uno,
+    // sin pisar lo que se haya escrito a mano.
+    if (on && !mEmail.trim() && mCustomerId) setMEmail(emailOf(mCustomerId));
+  };
 
   const resetManual = () => {
-    setMType('INV'); setMCustomerId(''); setMCustomerName('');
-    setMStatus('paid'); setMLines([{ description: '', amount: '' }]);
+    setMType('INV'); setMCustomerId(''); setMCustomerName(''); setMRentalId('');
+    setMStatus('paid'); setMIssueDate(new Date().toISOString().slice(0, 10));
+    setMSendEmail(false); setMEmail('');
+    setMLines([{ description: '', amount: '' }]);
   };
 
   const createManual = async () => {
@@ -229,6 +382,13 @@ export function DocumentsView({ language, showToast, rentalCodeById, customers }
       showToast(es ? 'Agrega al menos un concepto con importe.' : 'Add at least one line with an amount.', 'error');
       return;
     }
+    // Marcar "enviar" sin destinatario emitiria el documento y no lo
+    // mandaria a ningun lado, en silencio.
+    const destino = mEmail.trim();
+    if (mSendEmail && !destino) {
+      showToast(es ? 'Indica el email al que enviarlo.' : 'Enter the email to send it to.', 'error');
+      return;
+    }
     try {
       setCreating(true);
       const custName = mCustomerId ? (customers.find(c => c.id === mCustomerId)?.name ?? '') : mCustomerName.trim();
@@ -236,18 +396,25 @@ export function DocumentsView({ language, showToast, rentalCodeById, customers }
         docType: mType,
         customerId: mCustomerId || null,
         customerName: custName || undefined,
+        customerEmail: destino || undefined,
+        rentalId: mRentalId || null,
         lines,
-        issueDate: new Date().toISOString().slice(0, 10),
+        issueDate: mIssueDate || new Date().toISOString().slice(0, 10),
         status: mStatus,
       });
-      // Genera el PDF de una vez; el envio se hace luego con el boton Enviar.
-      await generateDocumentPdf(doc.id, false);
+      // El PDF se genera siempre; el email solo si se pidio.
+      const res = await generateDocumentPdf(doc.id, mSendEmail);
       await load();
+      const tipo = es ? DOC_LABELS[mType].es : DOC_LABELS[mType].en;
       resetManual();
       setShowForm(false);
       showToast(
-        (mType === 'CN' ? (es ? 'Nota de crédito emitida: ' : 'Credit note issued: ') : (es ? 'Factura emitida: ' : 'Invoice issued: ')) + doc.number,
-        'success',
+        mSendEmail
+          ? (res.emailed
+              ? `${tipo}: ${doc.number} — ${es ? `enviado a ${destino}` : `sent to ${destino}`}`
+              : `${tipo}: ${doc.number} — ${es ? 'emitido, pero el email no salió' : 'issued, but the email failed'}`)
+          : `${tipo}: ${doc.number}`,
+        mSendEmail && !res.emailed ? 'error' : 'success',
       );
     } catch (e) {
       showToast(es ? 'No se pudo emitir el documento.' : 'Could not issue the document.', 'error');
@@ -261,25 +428,51 @@ export function DocumentsView({ language, showToast, rentalCodeById, customers }
     <>
       <div className="filter-row" style={{ justifyContent: 'space-between' }}>
         <button className="btn-primary" onClick={() => setShowForm(v => !v)}>
-          {showForm ? (es ? '✕ Cerrar' : '✕ Close') : (es ? '➕ Nueva factura / nota' : '➕ New invoice / note')}
+          {showForm ? (es ? '✕ Cerrar' : '✕ Close') : (es ? '➕ Nuevo documento' : '➕ New document')}
         </button>
+
+        {/* Solo aparece si hay algo que rehacer. Si todos los documentos
+            tienen su PDF archivado, el boton no pinta nada. */}
+        {(sinPdf.length > 0 || regen) && (
+          <button className="btn-secondary" disabled={!!regen} onClick={regenerarPdfs}>
+            {regen
+              ? `⏳ ${regen.hechos}/${regen.total}${regen.fallos > 0 ? ` · ${regen.fallos} ${es ? 'fallaron' : 'failed'}` : ''}`
+              : `🔄 ${es ? `Regenerar ${sinPdf.length} PDF` : `Regenerate ${sinPdf.length} PDFs`}`}
+          </button>
+        )}
       </div>
 
       {showForm && (
         <div className="glass-card" style={{ padding: '18px', marginBottom: '16px' }}>
-          <div style={{ display: 'flex', gap: '8px', marginBottom: '14px' }}>
-            <button className={mType === 'INV' ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'} onClick={() => setMType('INV')}>
-              🧾 {es ? 'Factura' : 'Invoice'}
-            </button>
-            <button className={mType === 'CN' ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'} onClick={() => setMType('CN')}>
-              ➖ {es ? 'Nota de crédito' : 'Credit note'}
-            </button>
+          <div style={{ display: 'flex', gap: '8px', marginBottom: '14px', flexWrap: 'wrap' }}>
+            {([
+              { key: 'INV', icon: '🧾' },
+              { key: 'CN', icon: '➖' },
+              { key: 'DEP', icon: '🏦' },
+              { key: 'REF', icon: '↩️' },
+            ] as Array<{ key: ManualDocType; icon: string }>).map(t => (
+              <button
+                key={t.key}
+                className={mType === t.key ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
+                onClick={() => setMType(t.key)}
+              >
+                {t.icon} {es ? DOC_LABELS[t.key].es : DOC_LABELS[t.key].en}
+              </button>
+            ))}
           </div>
+
+          {isVatFree && (
+            <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: 0, marginBottom: '12px' }}>
+              {es
+                ? 'Un depósito es una garantía, no una venta: no lleva VAT y no se desglosa. La devolución se registra en negativo.'
+                : 'A deposit is a guarantee, not a sale: no VAT applies and nothing is broken down. A refund is recorded as negative.'}
+            </p>
+          )}
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '14px' }}>
             <div className="form-group">
               <label className="form-label">{es ? 'Cliente (opcional)' : 'Customer (optional)'}</label>
-              <select className="form-control" value={mCustomerId} onChange={e => setMCustomerId(e.target.value)}>
+              <select className="form-control" value={mCustomerId} onChange={e => pickCustomer(e.target.value)}>
                 <option value="">{es ? '— Sin cliente / escribir nombre —' : '— No customer / type name —'}</option>
                 {customers.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
               </select>
@@ -291,6 +484,24 @@ export function DocumentsView({ language, showToast, rentalCodeById, customers }
                   placeholder={es ? 'Ej: cliente ocasional' : 'E.g. walk-in customer'} />
               </div>
             )}
+            <div className="form-group">
+              <label className="form-label">{es ? 'Alquiler (opcional)' : 'Rental (optional)'}</label>
+              <select className="form-control" value={mRentalId} onChange={e => pickRental(e.target.value)}>
+                <option value="">{es ? '— Sin alquiler —' : '— No rental —'}</option>
+                {rentalOptions.map(r => (
+                  <option key={r.id} value={r.id}>{rentalLabel(r)}</option>
+                ))}
+              </select>
+              <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '6px 0 0' }}>
+                {mRentalId
+                  ? (es
+                      ? 'Quedará junto al resto de documentos del alquiler y se imprimirá como "Rental ref:".'
+                      : 'It will sit with the rest of the rental documents and print as "Rental ref:".')
+                  : (es
+                      ? 'Elegí el alquiler si el cobro sale de uno: reparación, depósito, corrección...'
+                      : 'Pick the rental if the charge comes from one: repair, deposit, correction...')}
+              </p>
+            </div>
             {mType === 'INV' && (
               <div className="form-group">
                 <label className="form-label">{es ? 'Estado' : 'Status'}</label>
@@ -300,14 +511,29 @@ export function DocumentsView({ language, showToast, rentalCodeById, customers }
                 </select>
               </div>
             )}
+            <div className="form-group">
+              <label className="form-label">{es ? 'Fecha del documento' : 'Document date'}</label>
+              <input className="form-control" type="date" value={mIssueDate}
+                onChange={e => setMIssueDate(e.target.value)} />
+            </div>
           </div>
 
           <div style={{ marginTop: '14px' }}>
             <label className="form-label">{es ? 'Conceptos' : 'Line items'}</label>
+            {/* El ejemplo va en ingles aunque la app este en espanol: esto no
+                es texto de pantalla, es lo que se imprime en la factura que
+                recibe el cliente, y el resto del documento esta en ingles. */}
+            <p style={{ margin: '0 0 8px', fontSize: '11px', color: 'var(--text-muted)' }}>
+              {es
+                ? 'Se imprime tal cual en la factura: escribilo en inglés.'
+                : 'Printed on the invoice exactly as typed.'}
+            </p>
             {mLines.map((l, i) => (
               <div key={i} style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
                 <input className="form-control" style={{ flex: 1 }} value={l.description}
-                  placeholder={es ? 'Concepto (ej: reparación, accesorio...)' : 'Description'}
+                  placeholder={isVatFree
+                    ? 'Description (e.g. security deposit)'
+                    : 'Description (e.g. repair, accessory...)'}
                   onChange={e => setLine(i, { description: e.target.value })} />
                 <input className="form-control" style={{ width: '120px' }} type="number" step="0.01"
                   value={l.amount} placeholder="0.00" onChange={e => setLine(i, { amount: e.target.value })} />
@@ -326,15 +552,58 @@ export function DocumentsView({ language, showToast, rentalCodeById, customers }
               <span>{es ? 'Base' : 'Net'}: {formatMoney(manualBreakdown.subtotal)}</span>
               <span>VAT: {formatMoney(manualBreakdown.vat_amount)}</span>
               <span style={{ color: 'var(--text-bright)', fontWeight: 600 }}>
-                {es ? 'Total' : 'Total'}: {mType === 'CN' ? '-' : ''}{formatMoney(manualBreakdown.total)}
+                {es ? 'Total' : 'Total'}: {isNegative ? '-' : ''}{formatMoney(manualBreakdown.total)}
               </span>
             </div>
           )}
 
+          {isVatFree && manualTotal > 0 && (
+            <div style={{ marginTop: '12px', fontSize: '13px', display: 'flex', gap: '18px', flexWrap: 'wrap' }}>
+              <span style={{ color: 'var(--text-muted)' }}>{es ? 'Sin VAT' : 'No VAT'}</span>
+              <span style={{ color: 'var(--text-bright)', fontWeight: 600 }}>
+                {es ? 'Total' : 'Total'}: {isNegative ? '-' : ''}{formatMoney(manualTotal)}
+              </span>
+            </div>
+          )}
+
+          {/* Envio del documento por email. */}
+          <div style={{ marginTop: '16px', paddingTop: '14px', borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '13px' }}>
+              <input
+                type="checkbox"
+                checked={mSendEmail}
+                onChange={e => toggleSendEmail(e.target.checked)}
+                style={{ width: '16px', height: '16px' }}
+              />
+              {es
+                ? `Enviar ${(DOC_LABELS[mType].es).toLowerCase()} por email`
+                : `Send ${(DOC_LABELS[mType].en).toLowerCase()} by email`}
+            </label>
+
+            {mSendEmail && (
+              <div className="form-group" style={{ marginTop: '10px', maxWidth: '420px' }}>
+                <label className="form-label">{es ? 'Enviar a' : 'Send to'}</label>
+                <input
+                  className="form-control"
+                  type="email"
+                  value={mEmail}
+                  onChange={e => setMEmail(e.target.value)}
+                  placeholder="cliente@email.com"
+                />
+                <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '6px 0 0' }}>
+                  {mCustomerId && mEmail === emailOf(mCustomerId) && mEmail
+                    ? (es ? 'Email del cliente seleccionado. Podés cambiarlo.' : "Selected customer's email. You can change it.")
+                    : (es ? 'Se enviará a esta dirección, con copia a administración.' : 'It will be sent to this address, with a copy to accounting.')}
+                </p>
+              </div>
+            )}
+          </div>
+
           <div style={{ marginTop: '16px' }}>
             <button className="btn-primary" disabled={creating} onClick={createManual}>
-              {creating ? (es ? 'Emitiendo...' : 'Issuing...')
-                : (mType === 'CN' ? (es ? 'Emitir nota de crédito' : 'Issue credit note') : (es ? 'Emitir factura' : 'Issue invoice'))}
+              {creating
+                ? (es ? 'Emitiendo...' : 'Issuing...')
+                : `${es ? 'Emitir' : 'Issue'} ${(es ? DOC_LABELS[mType].es : DOC_LABELS[mType].en).toLowerCase()}`}
             </button>
           </div>
         </div>

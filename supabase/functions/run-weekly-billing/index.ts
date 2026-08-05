@@ -65,7 +65,7 @@ Deno.serve(async (req: Request) => {
 
     const { data: rentals, error } = await supabase
       .from('rentals')
-      .select('id, rental_code, customer_id, bike_id, rental_rate, next_invoice_date')
+      .select('id, rental_code, customer_id, bike_id, rental_rate, next_invoice_date, auto_email')
       .eq('rate_type', 'semanal')
       .eq('auto_invoice', true)
       .eq('status', 'Activo')
@@ -130,8 +130,10 @@ Deno.serve(async (req: Request) => {
           } else if (doc) {
             emitidas.push(doc.number);
             // El PDF y el email van aparte: si el envio falla, la
-            // factura ya existe y se reintenta sin renumerar nada.
-            await generarPdf(doc.id);
+            // factura ya existe y se reintenta sin renumerar nada. El
+            // email solo sale si el alquiler tiene el envio activado; el
+            // PDF se genera igual para que la factura quede completa.
+            await generarPdf(doc.id, rental.auto_email !== false);
           }
 
           due = addDays(due, 7);
@@ -173,7 +175,7 @@ async function buildDescription(
   return partes ? `E-bike weekly rental — ${partes}` : 'E-bike weekly rental';
 }
 
-async function generarPdf(documentId: string): Promise<void> {
+async function generarPdf(documentId: string, sendEmail = true): Promise<void> {
   try {
     const res = await fetch(
       `${Deno.env.get('SUPABASE_URL')}/functions/v1/generate-document-pdf`,
@@ -183,7 +185,7 @@ async function generarPdf(documentId: string): Promise<void> {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')}`,
         },
-        body: JSON.stringify({ document_id: documentId, send_email: true }),
+        body: JSON.stringify({ document_id: documentId, send_email: sendEmail }),
       },
     );
     if (!res.ok) console.error(`PDF no generado para ${documentId}: ${await res.text()}`);

@@ -170,6 +170,9 @@ export interface UnifiedExpenseRow {
   categoryName: string;
   amount: number;       // total con VAT si lo lleva
   origin: 'stock' | 'maintenance' | 'manual';
+  // Ruta del comprobante en el bucket privado, si se adjunto uno. No es
+  // una URL: para abrirlo hay que firmarla en el momento.
+  receiptPath?: string | null;
 }
 
 export interface Expense {

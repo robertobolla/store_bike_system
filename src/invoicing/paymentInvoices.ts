@@ -16,6 +16,10 @@ export interface PayableRecord {
   rental_id: string;
   payment_date: string;
   amount: number;
+  // Enlace real, guardado al emitir. Los cobros anteriores a que se
+  // empezara a escribir no lo tienen, y para esos sigue el emparejado
+  // por importe y fecha.
+  document_id?: string | null;
 }
 
 function clave(rentalId: string, date: string, amount: number): string {
@@ -25,8 +29,15 @@ function clave(rentalId: string, date: string, amount: number): string {
 /**
  * Devuelve, por id de pago, la factura que lo documenta.
  *
- * Solo entran facturas (INV) con fecha de cobro: una factura emitida y
- * aun pendiente no corresponde a ningun pago todavia.
+ * Si el cobro trae document_id, manda ese: es el enlace real y funciona
+ * aunque los importes no coincidan, que es justo lo que pasa cuando el
+ * rider paga la semana y un casco en el mismo movimiento (cobro de 70,
+ * factura de 120).
+ *
+ * Para los cobros historicos, que se registraron antes de que se guardara
+ * el enlace, se sigue adivinando por alquiler, fecha e importe. Solo
+ * entran facturas (INV) con fecha de cobro: una factura emitida y aun
+ * pendiente no corresponde a ningun pago todavia.
  *
  * Cada factura se asigna a un unico pago. Sin eso, dos cobros del mismo
  * importe el mismo dia apuntarian los dos a la primera factura y el
@@ -36,9 +47,24 @@ export function matchInvoicesToPayments(
   documents: FiscalDocument[],
   payments: PayableRecord[],
 ): Map<string, FiscalDocument> {
+  const porId = new Map(documents.map(d => [d.id, d]));
+
+  const resultado = new Map<string, FiscalDocument>();
+  const yaUsados = new Set<string>();
+  for (const p of payments) {
+    const doc = p.document_id ? porId.get(p.document_id) : undefined;
+    if (doc) {
+      resultado.set(p.id, doc);
+      yaUsados.add(doc.id);
+    }
+  }
+
   const disponibles = new Map<string, FiscalDocument[]>();
   for (const d of documents) {
     if (d.doc_type !== 'INV' || !d.rental_id || !d.payment_date) continue;
+    // Una factura ya enlazada a su cobro no puede volver a asignarse por
+    // parecido a un cobro distinto.
+    if (yaUsados.has(d.id)) continue;
     const k = clave(d.rental_id, d.payment_date, d.total);
     const lista = disponibles.get(k);
     if (lista) lista.push(d);
@@ -51,11 +77,11 @@ export function matchInvoicesToPayments(
     lista.sort((a, b) => a.number.localeCompare(b.number));
   }
 
-  const resultado = new Map<string, FiscalDocument>();
   const ordenados = [...payments].sort(
     (a, b) => a.payment_date.localeCompare(b.payment_date) || a.id.localeCompare(b.id),
   );
   for (const p of ordenados) {
+    if (resultado.has(p.id)) continue;
     const doc = disponibles.get(clave(p.rental_id, p.payment_date, p.amount))?.shift();
     if (doc) resultado.set(p.id, doc);
   }

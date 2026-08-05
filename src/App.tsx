@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { InputHTMLAttributes } from 'react';
+import { buildRentalPaymentDays } from './rentals/paymentCalendar';
+import type { RentalPaymentDay, RentalPaymentStatus } from './rentals/paymentCalendar';
 import type { Session, User } from '@supabase/supabase-js';
 import { supabase } from './supabaseClient';
 import type {
@@ -19,17 +21,19 @@ import {
   getProducts, upsertProduct, deleteProduct, uploadProductImage,
   getProductModels, upsertProductModel, deleteProductModel, uploadModelImage, batchCreateProducts, batchInsertProducts,
   getCustomers, upsertCustomer, deleteCustomer,
+  countRentalsForProduct, countRentalsForCustomer,
   getRentals, upsertRental, getRentalItems, insertRentalItems, deleteRentalItems, deleteRental,
   getBikeAssignments, openBikeAssignment, switchRentalBike,
   getContractAmendments, getContractAmendment, createContractAmendment, signContractAmendment, nextAmendmentNumber,
   getPayments, insertPayment, deletePayment,
   getExpenses, insertExpense,
-  uploadRentalPhoto, uploadRiderDocument, uploadContractPhoto, uploadSignatureImage,
+  uploadRentalPhoto, uploadRiderDocument, getRiderDocumentUrl, uploadContractPhoto, uploadSignatureImage,
   getLeadCategories, getLeads, upsertLead, deleteLead, insertLeadCategory,
   getSuppliers, upsertSupplier, deleteSupplier, getSupplierProducts, upsertSupplierProduct, deleteSupplierProduct,
   getPlatforms, getVehicles, getAppAccounts, upsertAppAccount, deleteAppAccount, insertPlatform, insertVehicle, updatePlatform, deletePlatform, updateVehicle, deleteVehicle,
   getAccountNotes, insertAccountNote, deleteAccountNote, getAccountEarnings, insertAccountEarning, deleteAccountEarning,
   getEvents, upsertEvent, deleteEvent,
+  linkPaymentToDocument,
   getRecords, deleteRecord, upsertRecord,
   getQuickReplies, upsertQuickReply, deleteQuickReply,
   getSales, insertSale, updateSaleStatus, deleteSale,
@@ -51,12 +55,18 @@ import {
 import type { AllowedEmail, BikeModification, DeliveryChecklist, RentalContractSnapshot, RentalContractAmendment, AmendmentChange, StockAlarm } from './db';
 import { downloadBackupXlsx } from './backup';
 import { formatDate as fmtDMY, formatDateTime as fmtDMYTime } from './utils/date';
+import { ProfitabilityView } from './analytics/ProfitabilityView';
+import { ResponseTimesView } from './response/ResponseTimesView';
+import { NotificationsView } from './notifications/NotificationsView';
+import { buildNotifications, loadSeen, saveSeen } from './notifications/engine';
+import type { TargetTab } from './notifications/engine';
 import { DocumentsView } from './invoicing/DocumentsView';
 import { ExpensesView } from './invoicing/ExpensesView';
 import { RentalDocuments } from './invoicing/RentalDocuments';
 import {
-  issueRentalInvoice, issueDepositReceipt, generateDocumentPdf, generateDocumentPdfBatch,
-  markOldestPendingRentalInvoicePaid, getDocuments, getDocumentPdfUrl,
+  issueRentalInvoice, issueSaleInvoice, issueDepositReceipt, generateDocumentPdf, generateDocumentPdfBatch,
+  markOldestPendingRentalInvoicePaid, issueRentalInvoiceWithItems, getDocuments, getDocumentPdfUrl,
+  LINE_TEXT,
 } from './invoicing/api';
 import type { FiscalDocument } from './invoicing/types';
 import { matchInvoicesToPayments } from './invoicing/paymentInvoices';
@@ -68,6 +78,7 @@ import {
 import type { ProductDraft, RowIssue } from './stock/bulkImport';
 import {
   getBusinessExpenses, insertBusinessExpense, deleteBusinessExpense,
+  uploadExpenseReceipt,
   getExpenseCategories as getDbExpenseCategories,
   insertExpenseCategory, updateExpenseCategory, deleteExpenseCategory,
 } from './invoicing/api';
@@ -193,6 +204,252 @@ const getNextCustomerCode = (customers: Customer[]): string => {
   });
   return `US-${maxNum + 1}`;
 };
+
+// Descripcion de la linea de una factura de venta. Lleva el NOMBRE del
+// articulo ("Casco Negro"), no su codigo de inventario ("APA-124"): el
+// codigo es interno y al cliente no le dice nada.
+//
+// Las unidades identicas se agrupan ("Casco Negro x2"). Con el codigo cada
+// unidad era distinta; con el nombre dejan de serlo y saldrian repetidas.
+//
+// No recibe idioma: el concepto de un documento va siempre en ingles (ver
+// LINE_TEXT). El nombre del producto sale del stock tal cual esta cargado.
+const saleInvoiceDescription = (
+  items: Array<Pick<Product, 'name' | 'serial_number'>>,
+): string => {
+  const counts = new Map<string, number>();
+  items.forEach(p => {
+    // Sin nombre se cae al codigo: mejor un codigo que una linea vacia.
+    const label = (p.name || '').trim() || (p.serial_number || '').trim();
+    if (label) counts.set(label, (counts.get(label) ?? 0) + 1);
+  });
+  const parts = [...counts].map(([label, n]) => (n > 1 ? `${label} x${n}` : label));
+  return parts.join(', ') || LINE_TEXT.sale;
+};
+
+// Vende N unidades: actualiza el stock y devuelve las lineas de venta a
+// insertar. Vive fuera del componente porque la usan dos caminos, el modal
+// de venta y el cobro de un alquiler con articulos, y duplicar esto seria
+// duplicar el manejo de genericos, distribuciones por ubicacion y splits.
+//
+// Hace los upsert/delete de productos por su cuenta; el insertSaleItems lo
+// hace el llamador, que es quien sabe si la venta llego a crearse.
+async function sellProductUnits(opts: {
+  products: Product[];
+  soldProducts: { tempId: string; product: Product }[];
+  soldProductPrices: Record<string, number>;
+  soldProductLocations: Record<string, string>;
+  soldPaymentType: 'contado' | 'financiado';
+  soldFormDate: string;
+  newSaleId: string;
+  isProductGeneric: (p: Product) => boolean;
+}): Promise<{ sale_id: string; product_id: string; unit_price: number }[]> {
+  const {
+    products, soldProducts, soldProductPrices, soldProductLocations,
+    soldPaymentType, soldFormDate, newSaleId, isProductGeneric,
+  } = opts;
+  const saleItemsToInsert = [];
+  // Working copy kept in sync with every DB mutation below, so that selling several
+  // units of the same consolidated/generic serial in a single sale always reads the
+  // up-to-date distribution (prevents stale-snapshot double counting).
+  let currentProducts = products.map(pp => ({ ...pp, custom_field_values: { ...pp.custom_field_values } }));
+  const applyUpsert = async (row: Product) => {
+    await upsertProduct(row);
+    const syncedRow = { ...row, custom_field_values: { ...row.custom_field_values } };
+    const idx = currentProducts.findIndex(cp => cp.id === row.id);
+    if (idx >= 0) currentProducts[idx] = syncedRow; else currentProducts.push(syncedRow);
+  };
+  const applyDelete = async (id: string) => {
+    await deleteProduct(id);
+    currentProducts = currentProducts.filter(cp => cp.id !== id);
+  };
+  for (const item of soldProducts) {
+    const p = item.product;
+    const tempId = item.tempId;
+    const actualUnitPrice = soldProductPrices[tempId] ?? (p.price_sold ?? 0);
+    const statusToSet = soldPaymentType === 'financiado' ? 'Financiada' : 'Vendida';
+    const isGeneric = isProductGeneric(p);
+    const selectedLoc = soldProductLocations[tempId] || 'Almacén Central';
+    const dist = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
+    const totalQty = dist ? Object.values(dist).reduce((a, b) => a + b, 0) : 0;
+
+    if (isGeneric) {
+      const pGroup = currentProducts.filter(item => item.serial_number === p.serial_number && item.status === 'Disponible');
+
+      // Find the product in the group that has the selected location in its distribution (or as its single location)
+      const targetProduct = pGroup.find(mp => {
+        const distMap = (mp.custom_field_values?.location_distribution as Record<string, number>) || {};
+        if (distMap[selectedLoc] > 0) return true;
+        if (Object.keys(distMap).length === 0 && mp.custom_field_values?.location === selectedLoc) return true;
+        return false;
+      }) || pGroup[0] || p;
+
+      const tDist = (targetProduct.custom_field_values?.location_distribution as Record<string, number>) || {};
+      const tTotalQty = Object.values(tDist).reduce((a, b) => a + b, 0);
+
+      if (Object.keys(tDist).length > 0 && tTotalQty > 1) {
+        const splitId = crypto.randomUUID();
+      
+        // Insert the split-off sold unit
+        await applyUpsert({
+          ...targetProduct,
+          id: splitId,
+          status: statusToSet,
+          price_sold: actualUnitPrice,
+          sold_date: soldFormDate,
+          custom_field_values: { 
+            ...targetProduct.custom_field_values, 
+            location: selectedLoc, 
+            location_distribution: undefined 
+          },
+        });
+
+        saleItemsToInsert.push({
+          sale_id: newSaleId,
+          product_id: splitId,
+          unit_price: actualUnitPrice
+        });
+
+        // Decrement quantity from targetProduct
+        const updatedDist = { ...tDist };
+        updatedDist[selectedLoc] = (updatedDist[selectedLoc] || 1) - 1;
+        Object.keys(updatedDist).forEach(k => { if (updatedDist[k] <= 0) delete updatedDist[k]; });
+        const newTotal = Object.values(updatedDist).reduce((a, b) => a + b, 0);
+
+        if (newTotal <= 0) {
+          const totalRowsInGroup = currentProducts.filter(item => item.serial_number === p.serial_number).length;
+          if (totalRowsInGroup <= 1) {
+            await applyUpsert({
+              ...targetProduct,
+              custom_field_values: {
+                ...targetProduct.custom_field_values,
+                location: null,
+                location_distribution: {}
+              }
+            });
+          } else {
+            await applyDelete(targetProduct.id);
+          }
+        } else {
+          let mainLocation = '';
+          let maxQ = -1;
+          Object.entries(updatedDist).forEach(([l, v]) => {
+              if (v > maxQ) {
+                maxQ = v;
+                mainLocation = l;
+              }
+          });
+          await applyUpsert({
+            ...targetProduct,
+            custom_field_values: { 
+              ...targetProduct.custom_field_values, 
+              location: mainLocation || 'Almacén Central',
+              location_distribution: updatedDist 
+            }
+          });
+        }
+      } else {
+        // Standard or last unit of generic item
+        const totalRowsInGroup = currentProducts.filter(item => item.serial_number === p.serial_number).length;
+        if (totalRowsInGroup <= 1) {
+          await applyUpsert({
+            ...targetProduct,
+            status: statusToSet,
+            price_sold: actualUnitPrice,
+            sold_date: soldFormDate,
+            custom_field_values: { 
+              ...targetProduct.custom_field_values, 
+              location: selectedLoc, 
+              location_distribution: undefined 
+            }
+          });
+          saleItemsToInsert.push({
+            sale_id: newSaleId,
+            product_id: targetProduct.id,
+            unit_price: actualUnitPrice
+          });
+        } else {
+          const splitId = crypto.randomUUID();
+          await applyUpsert({
+            ...targetProduct,
+            id: splitId,
+            status: statusToSet,
+            price_sold: actualUnitPrice,
+            sold_date: soldFormDate,
+            custom_field_values: { 
+              ...targetProduct.custom_field_values, 
+              location: selectedLoc, 
+              location_distribution: undefined 
+            }
+          });
+          saleItemsToInsert.push({
+            sale_id: newSaleId,
+            product_id: splitId,
+            unit_price: actualUnitPrice
+          });
+          await applyDelete(targetProduct.id);
+        }
+      }
+    } else {
+      // Standard non-generic (unique item)
+      if (dist && totalQty > 1) {
+        const splitId = crypto.randomUUID();
+        const mainLoc = Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central';
+      
+        await applyUpsert({
+          ...p,
+          id: splitId,
+          status: statusToSet,
+          price_sold: actualUnitPrice,
+          sold_date: soldFormDate,
+          custom_field_values: { ...p.custom_field_values, location: mainLoc, location_distribution: undefined },
+        });
+
+        saleItemsToInsert.push({
+          sale_id: newSaleId,
+          product_id: splitId,
+          unit_price: actualUnitPrice
+        });
+
+        const updatedDist = { ...dist };
+        const locToDecrement = Object.keys(updatedDist).find(k => updatedDist[k] > 0) || mainLoc;
+        updatedDist[locToDecrement] = (updatedDist[locToDecrement] || 1) - 1;
+        Object.keys(updatedDist).forEach(k => { if (updatedDist[k] <= 0) delete updatedDist[k]; });
+        const newTotal = Object.values(updatedDist).reduce((a, b) => a + b, 0);
+
+        if (newTotal <= 0) {
+          await applyUpsert({
+            ...p,
+            status: statusToSet,
+            price_sold: actualUnitPrice,
+            sold_date: soldFormDate,
+            custom_field_values: { ...p.custom_field_values, location_distribution: undefined }
+          });
+        } else {
+          await applyUpsert({
+            ...p,
+            custom_field_values: { ...p.custom_field_values, location_distribution: updatedDist }
+          });
+        }
+      } else {
+        await applyUpsert({
+          ...p,
+          status: statusToSet,
+          price_sold: actualUnitPrice,
+          sold_date: soldFormDate
+        });
+
+        saleItemsToInsert.push({
+          sale_id: newSaleId,
+          product_id: p.id,
+          unit_price: actualUnitPrice
+        });
+      }
+    }
+  }
+  return saleItemsToInsert;
+}
+
 
 const deduplicateCustomerCodes = async (existingCusts: Customer[], setCustomersState: (c: Customer[]) => void) => {
   const seenCodes = new Set<string>();
@@ -2331,6 +2588,90 @@ const translations = {
 };
 
 // ============================================================
+// EVENTOS DE CALENDARIO: VINCULO CON SU ORIGEN
+//
+// Todo evento que genera el sistema lleva en la descripcion el ID de la
+// fila que lo creo: "Plan ID:", "Rental ID:", "Service ID:", "[LeadID:]".
+// Ese ID es lo unico que decide si el evento sigue teniendo sentido.
+//
+// Antes se comparaba el TEXTO del titulo contra nombres de clientes, de
+// leads y numeros de serie. Renombrar un cliente, cambiar el serial de
+// una bici o editar el titulo a mano dejaba el evento "huerfano" y se
+// borraba solo, sin aviso.
+// ============================================================
+type EventRefLabel = 'Plan ID' | 'Rental ID' | 'Service ID' | 'LeadID';
+
+// Se exige la forma completa de UUID: asi un evento escrito a mano que
+// mencione "Rental ID: el de Juan" nunca se toma como vinculado.
+function eventRef(description: string, label: EventRefLabel): string | null {
+  const m = new RegExp(`${label}:\\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})`, 'i')
+    .exec(description || '');
+  return m ? m[1] : null;
+}
+
+function hasEventRef(description: string): boolean {
+  return (['Plan ID', 'Rental ID', 'Service ID', 'LeadID'] as EventRefLabel[])
+    .some(label => eventRef(description, label) !== null);
+}
+
+// Cuotas y services tienen su propia pantalla: desde el calendario se
+// miran, no se editan.
+function isManagedElsewhere(ev: CompanyEvent): boolean {
+  return ev.title.toLowerCase().includes('cuota') || ev.title.startsWith('[Service]');
+}
+
+// ============================================================
+// ETIQUETAS DEL CALENDARIO
+//
+// Tres tonos, uno por significado, y no uno por tipo de fila: lo que el
+// ojo tiene que separar de un vistazo es "esto reclama algo hoy" de "esto
+// ya esta" y de "esto todavia no toca".
+// ============================================================
+type CalTone = 'ok' | 'alert' | 'soon';
+
+const CAL_TONES: Record<CalTone, { bg: string; border: string; fg: string; dot: string }> = {
+  ok:    { bg: 'rgba(16, 185, 129, 0.15)', border: 'rgba(16, 185, 129, 0.3)',  fg: '#34d399', dot: '#10b981' },
+  alert: { bg: 'rgba(239, 68, 68, 0.15)',  border: 'rgba(239, 68, 68, 0.3)',   fg: '#f87171', dot: '#ef4444' },
+  soon:  { bg: 'rgba(245, 158, 11, 0.16)', border: 'rgba(245, 158, 11, 0.32)', fg: '#fbbf24', dot: '#f59e0b' },
+};
+
+function CalendarTag({ label, tone, title, onClick }: {
+  label: string; tone: CalTone; title: string; onClick: () => void;
+}) {
+  const c = CAL_TONES[tone];
+  return (
+    <div
+      className={`event-tag ${tone}`}
+      title={title}
+      onClick={ev => { ev.stopPropagation(); onClick(); }}
+      style={{
+        display: 'flex', alignItems: 'center', gap: '6px',
+        padding: '2px 6px', borderRadius: '4px',
+        fontSize: '10px', fontWeight: 500,
+        background: c.bg, border: `1px solid ${c.border}`, color: c.fg,
+        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+        width: '100%', boxSizing: 'border-box', cursor: 'pointer',
+      }}
+    >
+      <span style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: c.dot, flexShrink: 0 }} />
+      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{label}</span>
+    </div>
+  );
+}
+
+const RENT_TONE: Record<RentalPaymentStatus, CalTone> = {
+  paid: 'ok', overdue: 'alert', upcoming: 'soon',
+};
+
+const RENT_ICON: Record<RentalPaymentStatus, string> = {
+  paid: '✓', overdue: '⚠', upcoming: '💶',
+};
+
+function isoOf(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// ============================================================
 export default function App() {
   // ----------------------------------------------------------
   // AUTH STATES
@@ -2707,13 +3048,21 @@ USING (true);`;
   const [products,        setProducts]        = useState<Product[]>([]);
   const [customers,       setCustomers]       = useState<Customer[]>([]);
   const [rentals,         setRentals]         = useState<Rental[]>([]);
-  // Codigo visible del alquiler (RNT-2026-0001) por id. Lo usa la vista de
-  // Facturacion para mostrar de que alquiler viene cada documento.
-  const rentalCodeById = useMemo(() => {
-    const m = new Map<string, string>();
-    rentals.forEach(r => { if (r.rental_code) m.set(r.id, r.rental_code); });
-    return m;
-  }, [rentals]);
+  // Alquileres con codigo visible (RNT-2026-0001) para la vista de
+  // Facturacion: dan la columna "Alquiler" de la tabla y el selector con el
+  // que un documento manual se liga a su alquiler. Los que aun no tienen
+  // codigo quedan fuera: enlazarlos no se veria ni en la tabla ni en el PDF.
+  const invoicingRentals = useMemo(
+    () => rentals
+      .filter(r => r.rental_code)
+      .map(r => ({
+        id: r.id,
+        code: r.rental_code as string,
+        customerId: r.customer_id,
+        active: r.status === 'Activo',
+      })),
+    [rentals],
+  );
 
   // Ubicaciones conocidas (texto libre): se recolectan de las distribuciones
   // y del campo location de todos los productos. Sirven para los selectores
@@ -3194,66 +3543,123 @@ USING (true);`;
     }
   }, [loadData, dbVer, session]);
 
-  // Cleanup orphaned auto-generated calendar events
+  // Cada evento se intenta una sola vez por sesion. Si el borrado o el
+  // vinculado no prende (permisos, fila protegida), el efecto volveria a
+  // verlo igual despues de recargar: sin esto queda escribiendo contra la
+  // base en bucle.
+  const eventCleanupTried = useRef<Set<string>>(new Set());
+  const eventBackfillTried = useRef<Set<string>>(new Set());
+
+  // ----------------------------------------------------------
+  // LIMPIEZA DE EVENTOS AUTOMATICOS
+  //
+  // Un evento se borra solo cuando la fila que lo genero ya no existe, y
+  // eso se decide unicamente por el ID guardado en su descripcion (ver
+  // eventRef arriba). Un evento sin ID de origen -- escrito a mano, o
+  // viejo y no identificable -- no se toca nunca.
+  // ----------------------------------------------------------
   useEffect(() => {
-    if (!events.length) return;
-    const customerNames = new Set(customers.map(c => `${c.first_name} ${c.last_name}`));
-    const productSerials = new Set(products.map(p => p.serial_number));
-    const leadNames = new Set(leads.map(l => l.name));
+    if (loading || !events.length) return;
 
     const orphaned = events.filter(ev => {
-      // 💳 Cuota X/Y: CustomerName — orphaned if no matching active financing plan
-      if (ev.title.startsWith('💳 Cuota')) {
-        const match = ev.title.match(/Cuota \d+\/(\d+):\s*(.+)/);
-        if (!match) return true;
-        const numInstallments = parseInt(match[1]);
-        const custName = match[2].trim();
-        return !financingPlans.some(fp => {
-          if (fp.num_installments !== numInstallments) return false;
-          const sale = sales.find(s => s.id === fp.sale_id);
-          if (!sale) return false;
-          const cust = customers.find(c => c.id === sale.customer_id);
-          return cust ? `${cust.first_name} ${cust.last_name}` === custName : false;
-        });
+      if (eventCleanupTried.current.has(ev.id)) return false;
+      const planId = eventRef(ev.description, 'Plan ID');
+      if (planId) return !financingPlans.some(p => p.id === planId);
+
+      const leadId = eventRef(ev.description, 'LeadID');
+      if (leadId) return !leads.some(l => l.id === leadId);
+
+      const serviceId = eventRef(ev.description, 'Service ID');
+      if (serviceId) return !records.some(r => r.id === serviceId);
+
+      const rentalId = eventRef(ev.description, 'Rental ID');
+      if (rentalId) {
+        const rental = rentals.find(r => r.id === rentalId);
+        if (!rental) return true;
+        // El aviso de devolucion vive mientras el alquiler sigue abierto.
+        // El resto de los eventos del alquiler se quedan.
+        return ev.title.startsWith('[Devolución]')
+          && rental.status !== 'Activo'
+          && rental.status !== 'Devolución en Proceso';
       }
-      // 🚲 Pago Alquiler: CustomerName — orphaned if customer no longer exists
-      if (ev.title.startsWith('🚲 Pago Alquiler:')) {
-        const custName = ev.title.replace('🚲 Pago Alquiler:', '').trim();
-        return !customerNames.has(custName);
-      }
-      // [Devolución] BikeSerial - CustomerName — orphaned if rental no longer active
-      if (ev.title.startsWith('[Devolución]')) {
-        const match = ev.title.match(/\[Devolución\]\s*(.+?)\s*-\s*(.+)/);
-        if (!match) return false;
-        const serial = match[1].trim();
-        const custName = match[2].trim();
-        return !rentals.some(r => {
-          if (r.status !== 'Activo' && r.status !== 'Devolución en Proceso') return false;
-          const bike = products.find(p => p.id === r.bike_id);
-          if (!bike || bike.serial_number !== serial) return false;
-          const cust = customers.find(c => c.id === r.customer_id);
-          return cust ? `${cust.first_name} ${cust.last_name}` === custName : false;
-        });
-      }
-      // [Service] BikeSerial — orphaned if bike no longer exists
-      if (ev.title.startsWith('[Service]')) {
-        const serial = ev.title.replace('[Service]', '').trim();
-        return !productSerials.has(serial);
-      }
-      // Seguimiento: LeadName — orphaned if lead no longer exists
-      if (ev.title.startsWith('Seguimiento:')) {
-        const leadName = ev.title.replace('Seguimiento:', '').trim();
-        return !leadNames.has(leadName);
-      }
+
       return false;
     });
 
     if (orphaned.length === 0) return;
+    orphaned.forEach(ev => eventCleanupTried.current.add(ev.id));
     (async () => {
-      for (const ev of orphaned) await deleteEvent(ev.id);
-      triggerReload();
+      try {
+        for (const ev of orphaned) await deleteEvent(ev.id);
+        triggerReload();
+      } catch (err) {
+        console.warn('No se pudieron limpiar eventos huerfanos:', err);
+      }
     })();
-  }, [events, financingPlans, sales, customers, rentals, products, leads]);
+  }, [loading, events, financingPlans, leads, records, rentals]);
+
+  // ----------------------------------------------------------
+  // BACKFILL DE EVENTOS VIEJOS
+  //
+  // Los eventos creados antes de este cambio solo llevan el nombre en el
+  // titulo. Se les agrega el ID de origen cuando se puede resolver sin
+  // ambiguedad: un unico candidato posible. Si hay cero o mas de uno, el
+  // evento se deja intacto -- no poder identificarlo nunca es motivo
+  // para borrarlo.
+  // ----------------------------------------------------------
+  useEffect(() => {
+    if (loading || !events.length) return;
+
+    const onlyOne = <T,>(arr: T[]): T | null => (arr.length === 1 ? arr[0] : null);
+    const patches: CompanyEvent[] = [];
+
+    for (const ev of events) {
+      if (hasEventRef(ev.description) || eventBackfillTried.current.has(ev.id)) continue;
+
+      // 💳 Cuota n/N: Cliente  ->  Plan ID
+      const cuota = ev.title.match(/Cuota\s+\d+\/(\d+):\s*(.+)/i);
+      if (cuota) {
+        const total = parseInt(cuota[1], 10);
+        const name = cuota[2].trim().toLowerCase();
+        const custIds = customers
+          .filter(c => `${c.first_name} ${c.last_name}`.trim().toLowerCase() === name)
+          .map(c => c.id);
+        const plan = onlyOne(financingPlans.filter(p => {
+          if (p.num_installments !== total) return false;
+          const sale = sales.find(s => s.id === p.sale_id);
+          return sale?.customer_id ? custIds.includes(sale.customer_id) : false;
+        }));
+        if (plan) patches.push({ ...ev, description: `${ev.description}\nPlan ID: ${plan.id}` });
+        continue;
+      }
+
+      // Los "🚲 Pago Alquiler" viejos no se vinculan ni se borran: ya no
+      // se muestran (el cobro se deriva del ciclo real) y son datos del
+      // usuario. Quedan en la tabla hasta que decida purgarlos.
+      if (ev.title.startsWith('🚲 Pago Alquiler:')) continue;
+
+      // Seguimiento: Lead  ->  LeadID. El evento del alta de lead reusa el
+      // id del lead como id de evento, asi que ese es el vinculo mas firme.
+      if (ev.title.startsWith('Seguimiento:')) {
+        const name = ev.title.replace('Seguimiento:', '').trim().toLowerCase();
+        const lead = leads.find(l => l.id === ev.id)
+          ?? onlyOne(leads.filter(l => l.name.trim().toLowerCase() === name));
+        if (lead) patches.push({ ...ev, description: `${ev.description}\n[LeadID: ${lead.id}]` });
+        continue;
+      }
+    }
+
+    if (patches.length === 0) return;
+    patches.forEach(p => eventBackfillTried.current.add(p.id));
+    (async () => {
+      try {
+        for (const p of patches) await upsertEvent(p);
+        triggerReload();
+      } catch (err) {
+        console.warn('No se pudo vincular eventos viejos con su origen:', err);
+      }
+    })();
+  }, [loading, events, customers, financingPlans, sales, leads]);
 
   // Dark mode on body
   useEffect(() => {
@@ -3319,6 +3725,14 @@ USING (true);`;
 
   const getDynamicEventStatus = useCallback((ev: CompanyEvent): 'Pendiente' | 'Realizado' => {
     if (ev.title.startsWith('[Service]')) {
+      // El estado se deduce de la bici, que es una sola, mientras que una
+      // bici puede tener varios eventos de service (el principal, el
+      // recordatorio personalizado, y los de services posteriores). Un
+      // service agendado a futuro no puede darse por hecho porque la bici
+      // este al dia hoy: hasta que llega su fecha manda lo guardado.
+      const todayStr = new Date().toISOString().split('T')[0];
+      if (ev.event_date > todayStr) return ev.status;
+
       const serial = ev.title.replace('[Service]', '').trim();
       const bike = products.find(p => p.serial_number === serial);
       if (bike) {
@@ -3365,143 +3779,49 @@ USING (true);`;
   // ----------------------------------------------------------
   // NOTIFICATION ALERTS ENGINE
   // ----------------------------------------------------------
-  const fmtAlertDate = (d: string) => {
-    const [y, m, day] = d.split('-');
-    return `${day}/${m}/${y}`;
-  };
-  const activeAlerts = useMemo(() => {
-    const alerts: { id: string; type: string; message: string; priority: 'high' | 'normal'; date?: string }[] = [];
-    const today = new Date();
-    const todayStr = today.toISOString().split('T')[0];
+  // NOTIFICACIONES
+  //
+  // El calculo vive en notifications/engine.ts: agrupa (5 cobros de hoy
+  // son UNA linea, no cinco) y solo deja pasar lo accionable hoy.
+  const notifications = useMemo(() => buildNotifications({
+    language,
+    bikeCategoryId: catBikeId,
+    products, customers, rentals, payments, events,
+    financingPayments: financingPaymentsData, financingPlans, sales, saleItems,
+    documents, stockAlarms, stockQtyBySku,
+  }), [language, catBikeId, products, customers, rentals, payments, events,
+    financingPaymentsData, financingPlans, sales, saleItems, documents,
+    stockAlarms, stockQtyBySku]);
 
-    events.forEach(e => {
-      if (e.status !== 'Pendiente') return;
-      
-      if (e.event_date === todayStr) {
-        const isService = e.title.startsWith('[Service]');
-        const msg = isService
-          ? (language === 'es' ? `¡Hoy es el service!: ${e.title}` : `Today is the service!: ${e.title}`)
-          : (language === 'es' ? `¡Hoy es el evento!: ${e.title}` : `Today is the event!: ${e.title}`);
-        alerts.push({ id: `ev-today-${e.id}`, type: 'event', message: msg, priority: 'high', date: e.event_date });
-      } else {
-        const diff = Math.ceil((new Date(e.event_date).getTime() - today.getTime()) / 86400000);
-        if (diff >= 0 && diff <= 7 && e.remind_one_week)
-          alerts.push({ id: `ev-w-${e.id}`, type: 'event', message: `${language === 'es' ? 'Falta 1 semana para' : '1 week for'}: ${e.title}`, priority: 'normal', date: e.event_date });
-        if (diff >= 0 && diff <= 1 && e.remind_one_day)
-          alerts.push({ id: `ev-d-${e.id}`, type: 'event', message: `¡${language === 'es' ? 'Urgente mañana' : 'Urgent tomorrow'}!: ${e.title}`, priority: 'high', date: e.event_date });
-      }
+  // Dos conjuntos a proposito:
+  //   seenNotifications  -> lo que ya se vio. Apaga el numero de la campanita.
+  //   seenSnapshot       -> copia del anterior al momento de abrir. Es lo
+  //                         que pinta el sello "NUEVA", para que al abrir
+  //                         todavia se distinga lo que no se habia visto.
+  const [seenNotifications, setSeenNotifications] = useState<Set<string>>(() => loadSeen());
+  const [seenSnapshot, setSeenSnapshot] = useState<Set<string>>(() => loadSeen());
+
+  const unreadNotifications = useMemo(
+    () => notifications.filter(n => !seenNotifications.has(n.id)).length,
+    [notifications, seenNotifications],
+  );
+
+  const markNotificationsSeen = useCallback(() => {
+    setSeenSnapshot(new Set(seenNotifications));
+    setSeenNotifications(prev => {
+      const next = new Set(prev);
+      for (const n of notifications) next.add(n.id);
+      saveSeen(next);
+      return next;
     });
+  }, [notifications, seenNotifications]);
 
-    products.forEach(p => {
-      if (p.category_id !== catBikeId || p.status === 'Vendida' || p.status === 'Perdida' || p.status === 'Robada' || p.status === 'Perdida/Garda') return;
-      
-      if (p.next_service_date) {
-        if (p.next_service_date === todayStr) {
-          alerts.push({
-            id: `date-today-${p.id}`,
-            type: 'maintenance',
-            message: language === 'es' ? `¡Hoy es el service de la e-bike ${p.serial_number}!` : `Today is the service for e-bike ${p.serial_number}!`,
-            priority: 'high', date: p.next_service_date
-          });
-        } else {
-          const diff = Math.ceil((new Date(p.next_service_date).getTime() - today.getTime()) / 86400000);
-          if (diff > 0 && diff <= 7) {
-            alerts.push({
-              id: `date-w-${p.id}`,
-              type: 'maintenance',
-              message: language === 'es' ? `Service de ${p.serial_number} programado para el ${p.next_service_date}` : `Service for ${p.serial_number} scheduled on ${p.next_service_date}`,
-              priority: 'normal', date: p.next_service_date
-            });
-          }
-        }
-      }
-
-      if (p.next_service_odometer) {
-        const rem = p.next_service_odometer - p.odometer;
-        if (rem <= p.remind_service_odometer_threshold && rem > 0)
-          alerts.push({ id: `km-${p.id}`, type: 'maintenance', message: `Service pronto: ${p.serial_number} (${rem} km)`, priority: 'normal' });
-        else if (rem <= 0)
-          alerts.push({ id: `km-o-${p.id}`, type: 'maintenance', message: `¡Service excedido!: ${p.serial_number}`, priority: 'high' });
-      }
+  const openNotifications = useCallback(() => {
+    setShowNotifications(open => {
+      if (!open) markNotificationsSeen();
+      return !open;
     });
-
-    // Financing payments alerts
-    financingPaymentsData.forEach(pay => {
-      if (pay.status !== 'Pendiente') return;
-      
-      const plan = financingPlans.find(fp => fp.id === pay.financing_plan_id);
-      const sale = plan ? sales.find(s => s.id === plan.sale_id) : null;
-      const cust = sale ? customers.find(c => c.id === sale.customer_id) : null;
-      const custName = cust ? `${cust.first_name} ${cust.last_name}` : 'Cliente';
-      
-      const itemsInSale = sale ? saleItems.filter(si => si.sale_id === sale.id) : [];
-      const bikeSerials = itemsInSale.map(si => {
-        const prod = products.find(p => p.id === si.product_id);
-        return prod ? prod.serial_number : '';
-      }).filter(Boolean).join(', ');
-
-      const descSuffix = bikeSerials ? ` (${bikeSerials})` : '';
-
-      const payDate = new Date(pay.due_date);
-      // Clean dates to calculate accurate daily differences
-      const cleanPayDate = new Date(payDate.getFullYear(), payDate.getMonth(), payDate.getDate());
-      const cleanToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-      
-      const diffTime = cleanPayDate.getTime() - cleanToday.getTime();
-      const diffDays = Math.ceil(diffTime / 86400000);
-
-      if (diffDays === 0) {
-        alerts.push({
-          id: `fin-today-${pay.id}`,
-          type: 'financing',
-          message: language === 'es' 
-            ? `¡Hoy vence la cuota ${pay.installment_number}/${plan?.num_installments || 1} de ${custName}${descSuffix}!` 
-            : `Installment ${pay.installment_number}/${plan?.num_installments || 1} for ${custName}${descSuffix} is due today!`,
-          priority: 'high', date: pay.due_date
-        });
-      } else if (diffDays < 0) {
-        alerts.push({
-          id: `fin-overdue-${pay.id}`,
-          type: 'financing',
-          message: language === 'es'
-            ? `⚠️ ¡VENCIDA hace ${Math.abs(diffDays)} días!: Cuota ${pay.installment_number}/${plan?.num_installments || 1} de ${custName} (${fmtDMY(pay.due_date)})`
-            : `⚠️ OVERDUE by ${Math.abs(diffDays)} days!: Installment ${pay.installment_number}/${plan?.num_installments || 1} for ${custName} (${fmtDMY(pay.due_date)})`,
-          priority: 'high', date: pay.due_date
-        });
-      } else if (diffDays > 0 && diffDays <= 7) {
-        alerts.push({
-          id: `fin-soon-${pay.id}`,
-          type: 'financing',
-          message: language === 'es'
-            ? `Cuota ${pay.installment_number}/${plan?.num_installments || 1} de ${custName} vence en ${diffDays} días (${fmtDMY(pay.due_date)})`
-            : `Installment ${pay.installment_number}/${plan?.num_installments || 1} for ${custName} is due in ${diffDays} days (${fmtDMY(pay.due_date)})`,
-          priority: 'normal', date: pay.due_date
-        });
-      }
-    });
-
-    // Alarmas de stock por debajo de su umbral. Se listan siempre que
-    // sigan bajas, no solo el dia que saltaron: el correo avisa una vez,
-    // pero el panel tiene que seguir recordandolo mientras no se repone.
-    stockAlarms.forEach(a => {
-      if (!a.active || !stockQtyBySku.has(a.product_key)) return;
-      const qty = stockQtyBySku.get(a.product_key)!;
-      if (qty > a.threshold) return;
-      const prod = products.find(p => p.serial_number === a.product_key);
-      const nombre = prod?.name || a.product_key;
-      const etiqueta = a.label ? ` (${a.label})` : '';
-      alerts.push({
-        id: `stock-alarm-${a.id}`,
-        type: 'stock',
-        message: language === 'es'
-          ? `📦 Stock bajo${etiqueta}: ${nombre} — quedan ${qty} (umbral ${a.threshold})`
-          : `📦 Low stock${etiqueta}: ${nombre} — ${qty} left (threshold ${a.threshold})`,
-        priority: qty === 0 ? 'high' : 'normal',
-      });
-    });
-
-    return alerts;
-  }, [events, products, catBikeId, language, financingPaymentsData, financingPlans, sales, saleItems, customers, stockAlarms, stockQtyBySku]);
+  }, [markNotificationsSeen]);
 
   // Disparo de las alarmas de stock.
   //
@@ -3605,7 +3925,7 @@ USING (true);`;
   // origen 'manual' (los de stock y mantenimiento el Balance ya los cuenta
   // por su lado, no deben duplicarse aqui).
   const [expenseCategories, setExpenseCategories] = useState<{ id: string; name: string; color: string }[]>([]);
-  const [otherExpenses, setOtherExpenses] = useState<{ id: string; name: string; amount: number; categoryId: string; date: string }[]>([]);
+  const [otherExpenses, setOtherExpenses] = useState<{ id: string; name: string; amount: number; categoryId: string; date: string; receiptPath?: string | null }[]>([]);
 
   // Modal control states
   const [isAddExpenseModalOpen, setIsAddExpenseModalOpen] = useState(false);
@@ -3680,6 +4000,7 @@ USING (true);`;
         categoryName: cat ? cat.name : (language === 'es' ? 'Otros Gastos' : 'Other expenses'),
         amount: exp.amount,
         origin: 'manual',
+        receiptPath: exp.receiptPath ?? null,
       });
     });
     return rows.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
@@ -3699,6 +4020,7 @@ USING (true);`;
           amount: Number(e.amount ?? 0),
           categoryId: e.category_id ?? '',
           date: e.expense_date,
+          receiptPath: e.invoice_file_url,
         })),
     );
   }, []);
@@ -4264,6 +4586,7 @@ USING (true);`;
   const [selectedProductId, setSelectedProductId] = useState<string | null>(null);
   const [linkBikeSearchQuery, setLinkBikeSearchQuery] = useState('');
   const [selectedCondition, setSelectedCondition] = useState<'nuevo' | 'bueno' | 'regular' | 'para venta'>('bueno');
+  const [selectedBatteryAvailable, setSelectedBatteryAvailable] = useState<boolean>(true);
   const [activeStockMenuId, setActiveStockMenuId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -4647,6 +4970,9 @@ USING (true);`;
   const [soldReceivedVia, setSoldReceivedVia] = useState<'efectivo' | 'transferencia' | 'mixto'>('efectivo');
   const [soldMixedCash, setSoldMixedCash] = useState(0);
   const [soldMixedTransfer, setSoldMixedTransfer] = useState(0);
+  const [soldEmitInvoice, setSoldEmitInvoice] = useState<boolean>(true);
+  const [soldSendEmail, setSoldSendEmail] = useState<boolean>(true);
+  const [issuingSaleInvoiceId, setIssuingSaleInvoiceId] = useState<string | null>(null);
 
   useEffect(() => {
     const targetAmount = soldPaymentType === 'financiado' ? soldDownPayment : soldFormPrice;
@@ -4684,6 +5010,31 @@ USING (true);`;
   // el alquiler ya facture solo por el cron semanal, donde se apaga para no
   // duplicar (la logica de abajo lo decide al abrir el modal).
   const [payFormEmitInvoice, setPayFormEmitInvoice] = useState<boolean>(true);
+  // Enviar el correo de este cobro. Arranca segun el auto_email del
+  // alquiler, y se apaga siempre en un pago retroactivo: mandarle hoy al
+  // rider el recibo de una semana de hace tres meses no tiene sentido.
+  const [payFormSendEmail, setPayFormSendEmail] = useState<boolean>(true);
+  // Pago retroactivo: se esta cargando una semana ya pasada, no el cobro
+  // de hoy. Cambia la fecha por defecto y apaga los correos.
+  const [payFormIsRetro, setPayFormIsRetro] = useState<boolean>(false);
+  // Articulos de tienda que el rider se lleva en el mismo cobro. Una
+  // entrada por unidad, igual que en el modal de venta: dos cascos iguales
+  // son dos entradas, cada una con su precio.
+  const [payFormItems, setPayFormItems] = useState<{ tempId: string; product: Product }[]>([]);
+  // Precio POR UNIDAD. El total de la linea es cantidad x precio.
+  const [payFormItemPrices, setPayFormItemPrices] = useState<Record<string, number>>({});
+  const [payFormItemQty, setPayFormItemQty] = useState<Record<string, number>>({});
+  const [payFormItemLocations, setPayFormItemLocations] = useState<Record<string, string>>({});
+  const [payFormItemSearch, setPayFormItemSearch] = useState('');
+  // Los articulos no pueden sobrevivir de un cobro al siguiente: se
+  // venderia el casco de ayer otra vez.
+  const resetPayFormItems = useCallback(() => {
+    setPayFormItems([]);
+    setPayFormItemPrices({});
+    setPayFormItemQty({});
+    setPayFormItemLocations({});
+    setPayFormItemSearch('');
+  }, []);
 
   const [payInstallmentProduct, setPayInstallmentProduct] = useState<Product | null>(null);
   const [payInstallmentReceivedVia, setPayInstallmentReceivedVia] = useState<'efectivo' | 'transferencia'>('efectivo');
@@ -5070,6 +5421,38 @@ USING (true);`;
   // ----------------------------------------------------------
   // MODAL OPENERS (initialize form state cleanly)
   // ----------------------------------------------------------
+  // Emite la factura fiscal de una venta ya existente que aun no la tiene
+  // (p.ej. ventas registradas antes de activar la facturacion automatica, o
+  // ventas en las que se desmarco "Emitir factura" en su momento).
+  const emitInvoiceForExistingSale = useCallback(async (saleId: string) => {
+    const sale = sales.find(s => s.id === saleId);
+    if (!sale) return;
+    try {
+      setIssuingSaleInvoiceId(saleId);
+      const invDesc = saleInvoiceDescription(
+        saleItems
+          .filter(si => si.sale_id === saleId)
+          .map(si => products.find(pp => pp.id === si.product_id))
+          .filter((p): p is Product => Boolean(p)),
+      );
+      const doc = await issueSaleInvoice({
+        saleId,
+        description: invDesc,
+        paymentMethod: sale.received_via ?? '',
+        paymentDate: sale.payment_type === 'financiado' ? null : sale.sale_date,
+        issueDate: sale.sale_date,
+      });
+      await generateDocumentPdf(doc.id, false);
+      setDocuments(await getDocuments());
+      showToast(language === 'es' ? `Factura emitida: ${doc.number}` : `Invoice issued: ${doc.number}`, 'success');
+    } catch (e) {
+      console.error('[FastSheep] no se pudo emitir la factura de la venta:', e);
+      showToast(language === 'es' ? 'No se pudo emitir la factura.' : 'Could not issue the invoice.', 'error');
+    } finally {
+      setIssuingSaleInvoiceId(null);
+    }
+  }, [sales, saleItems, products, language, showToast]);
+
   const openProductModal = useCallback((prod?: Product) => {
     const catId = prod?.category_id ?? catBikeId;
     // When editing, respect the product's own prefix (or none). When creating, default by category.
@@ -5289,6 +5672,7 @@ USING (true);`;
     setSoldCustomerAddress('');
     setSoldCustomerSearch('');
     setSoldEmailLang('es');
+    setSoldSendEmail(true);
     const linkedLock = products.find(p => p.category_id === catLockId && p.custom_field_values?.associated_bike_id === prod.id);
     const prodTempId = crypto.randomUUID();
     const lockTempId = crypto.randomUUID();
@@ -5317,6 +5701,7 @@ USING (true);`;
     setSoldProductSearch('');
     setSoldSubmitting(false);
     setSoldReceivedVia('efectivo');
+    setSoldEmitInvoice(true);
     setSelectedProductId(prod.id); setModalType('sold');
   }, [products, language, catLockId, catBikeId]);
 
@@ -5524,7 +5909,7 @@ USING (true);`;
           const reminderEvent = {
             id: crypto.randomUUID(),
             title: `💳 Cuota ${nextNext.installment_number}/${plan.num_installments}: ${custName}`,
-            description: `Vencimiento de la cuota ${nextNext.installment_number} del financiamiento por la compra de: ${bikeSerials}. Monto: €${fmt2(nextNext.amount)}.`,
+            description: `Vencimiento de la cuota ${nextNext.installment_number} del financiamiento por la compra de: ${bikeSerials}. Monto: €${fmt2(nextNext.amount)}.\nPlan ID: ${plan.id}`,
             event_date: nextNext.due_date,
             remind_one_week: true,
             remind_one_day: true,
@@ -5644,6 +6029,8 @@ USING (true);`;
   const [wizDeposit,     setWizDeposit]     = useState(150);
   const [wizRate,        setWizRate]        = useState(60);
   const [wizRateType,    setWizRateType]    = useState<'diario' | 'semanal' | 'mensual'>('semanal');
+  const [wizAutoInvoice, setWizAutoInvoice] = useState(true);
+  const [wizSendEmails,  setWizSendEmails]  = useState(true);
   const [wizStartDate,   setWizStartDate]   = useState(new Date().toISOString().split('T')[0]);
   const [wizRatePaymentMethod, setWizRatePaymentMethod] = useState<'efectivo' | 'transferencia'>('efectivo');
   const [wizDepositPaymentMethod, setWizDepositPaymentMethod] = useState<'efectivo' | 'transferencia'>('efectivo');
@@ -6576,11 +6963,14 @@ USING (true);`;
           : wizKitDetails,
         deposit_refunded: null, damage_report: null, created_at: new Date().toISOString(),
         deposit_received_via: wizDepositPaymentMethod,
-        // Facturacion automatica: los alquileres semanales entran al cron.
+        // Facturacion automatica: los alquileres semanales entran al cron,
+        // salvo que se haya desmarcado la casilla al crear el alquiler.
         // Sin next_invoice_date el cron los ignora, asi que se fija el
         // primer cobro una semana despues del inicio.
-        auto_invoice: wizRateType === 'semanal',
-        next_invoice_date: wizRateType === 'semanal'
+        auto_invoice: wizRateType === 'semanal' && wizAutoInvoice,
+        // Envio de correos al cliente. Independiente de la facturacion.
+        auto_email: wizSendEmails,
+        next_invoice_date: wizRateType === 'semanal' && wizAutoInvoice
           ? (() => {
               const [yy, mm, dd] = wizStartDate.split('-').map(Number);
               const d = new Date(yy, mm - 1, dd + 7);
@@ -6616,7 +7006,6 @@ USING (true);`;
             amount: wizRate,
             paymentMethod: wizRatePaymentMethod,
             paymentDate: wizStartDate,
-            description: language === 'es' ? 'Alquiler de e-bike' : 'E-bike rental',
           });
           firstDocIds.push(firstInvoice.id);
         } catch (invErr) {
@@ -6625,7 +7014,9 @@ USING (true);`;
       }
       if (firstDocIds.length > 0) {
         try {
-          await generateDocumentPdfBatch(firstDocIds, true);
+          // Los documentos se generan siempre; el email solo si el
+          // alquiler tiene el envio de correos activado.
+          await generateDocumentPdfBatch(firstDocIds, wizSendEmails);
         } catch (pdfErr) {
           console.error('[FastSheep] no se pudieron generar/enviar los documentos de alta:', pdfErr);
         }
@@ -6640,26 +7031,19 @@ USING (true);`;
 
       // Trigger Rental Confirmation Email
       if (rider) {
-        sendRentalConfirmationEmail({
-          ...newRental,
-          monthly_rate: wizRateType === 'mensual' ? wizRate : Math.round(wizRate * 4), // Normalize to monthly rate description
-        }, bikeProduct, rider, wizEmailLang, emailTemplates);
+        if (wizSendEmails) {
+          sendRentalConfirmationEmail({
+            ...newRental,
+            monthly_rate: wizRateType === 'mensual' ? wizRate : Math.round(wizRate * 4), // Normalize to monthly rate description
+          }, bikeProduct, rider, wizEmailLang, emailTemplates);
+        }
 
-        // Schedule first monthly payment reminder in Supabase Calendar
-        const startParts = wizStartDate.split('-');
-        const firstInstallmentDate = new Date(parseInt(startParts[0]), parseInt(startParts[1]) - 1 + 1, parseInt(startParts[2]));
-        const formattedFirstInstallmentDate = `${firstInstallmentDate.getFullYear()}-${String(firstInstallmentDate.getMonth() + 1).padStart(2, '0')}-${String(firstInstallmentDate.getDate()).padStart(2, '0')}`;
-
-        const rentalReminderEvent = {
-          id: crypto.randomUUID(),
-          title: `🚲 Pago Alquiler: ${rider.first_name} ${rider.last_name}`,
-          description: `Mensualidad del alquiler de la bicicleta: ${bikeProduct?.name || 'E-Bike'} (${bikeProduct?.serial_number || 'S/N'}). Monto: €${fmt2(wizRateType === 'mensual' ? wizRate : Math.round(wizRate * 4))}.`,
-          event_date: formattedFirstInstallmentDate,
-          remind_one_week: true,
-          remind_one_day: true,
-          status: 'Pendiente' as const
-        };
-        await upsertEvent(rentalReminderEvent);
+        // Los dias de cobro NO se guardan como evento. Antes se creaba aca
+        // un "🚲 Pago Alquiler" a un mes vista: uno solo, para el primer
+        // vencimiento, que nunca se actualizaba y seguia diciendo
+        // "Pendiente" veinte semanas despues. Ahora todo el calendario de
+        // cobros se deriva del ciclo real y de las facturas, en
+        // rentals/paymentCalendar.ts.
       }
 
       // Update bike/battery/lock status
@@ -6835,6 +7219,7 @@ USING (true);`;
       setWizPhone(''); setWizAddress(''); setWizRiderEmail(''); setSignatureData(null);
       setWizKitProductIds([]); setWizKitLocations({}); setWizHasKit(true); setWizKitDetails('');
       setWizCustomerCode(''); setWizStartDate(new Date().toISOString().split('T')[0]);
+      setWizAutoInvoice(true); setWizSendEmails(true);
       // Reset Step 7 evidence states
       setWizConditionFiles([]); setWizConditionPreviews([]);
       setWizInstagramFiles([]); setWizInstagramPreviews([]);
@@ -6922,6 +7307,102 @@ USING (true);`;
   }, []);
 
   const weekDays = useMemo(() => getDaysOfWeek(selectedWeekDate), [selectedWeekDate, getDaysOfWeek]);
+
+  // ----------------------------------------------------------
+  // DIAS DE COBRO DE ALQUILER
+  //
+  // Derivados del ciclo real y de las facturas, no guardados como
+  // eventos: ver rentals/paymentCalendar.ts. Se calculan solo para el
+  // rango que se esta mirando.
+  // ----------------------------------------------------------
+  const calRange = useMemo(() => {
+    if (calendarViewMode === 'week') {
+      return { from: isoOf(weekDays[0]), to: isoOf(weekDays[6]) };
+    }
+    const mm = String(calMonth + 1).padStart(2, '0');
+    return { from: `${calYear}-${mm}-01`, to: `${calYear}-${mm}-${String(calDays).padStart(2, '0')}` };
+  }, [calendarViewMode, weekDays, calYear, calMonth, calDays]);
+
+  const rentalPaymentDays = useMemo(() => buildRentalPaymentDays({
+    rentals, customers, products, payments, documents,
+    from: calRange.from, to: calRange.to,
+  }), [rentals, customers, products, payments, documents, calRange]);
+
+  const rentalDaysByDate = useMemo(() => {
+    const byDate = new Map<string, RentalPaymentDay[]>();
+    for (const d of rentalPaymentDays) {
+      const list = byDate.get(d.date);
+      if (list) list.push(d);
+      else byDate.set(d.date, [d]);
+    }
+    return byDate;
+  }, [rentalPaymentDays]);
+
+  // Los "🚲 Pago Alquiler" guardados quedaron obsoletos: ese mismo cobro
+  // ahora se deriva del ciclo real, con su estado de verdad. Se ocultan
+  // en lugar de borrarlos: son datos del usuario y la limpieza es una
+  // decision suya, no un efecto colateral de este cambio.
+  const calendarEvents = useMemo(
+    () => events.filter(e => !e.title.startsWith('🚲 Pago Alquiler')),
+    [events],
+  );
+
+  const openDayEvents = useCallback((date: string) => {
+    setSelectedDayEventsDate(date);
+    setModalType('dayEventsList');
+  }, []);
+
+  // Texto largo del cobro: es el tooltip en la grilla y la linea de
+  // detalle en el modal y en la tabla.
+  const rentDetail = useCallback((d: RentalPaymentDay): string => {
+    const es = language === 'es';
+    const partes = [d.bike, `€${fmt2(d.amount)}`].filter(Boolean);
+    if (d.status === 'paid') {
+      partes.push(d.paid_on
+        ? (es ? `pagado el ${fmtDMY(d.paid_on)}` : `paid on ${fmtDMY(d.paid_on)}`)
+        : (es ? 'pagado' : 'paid'));
+    } else if (d.status === 'overdue') {
+      partes.push(es ? 'IMPAGO' : 'UNPAID');
+    } else {
+      partes.push(es ? 'a cobrar' : 'to collect');
+    }
+    if (d.invoice_number) partes.push(d.invoice_number);
+    return partes.join(' · ');
+  }, [language]);
+
+  const rentStatusLabel = useCallback((s: RentalPaymentStatus): string => {
+    const es = language === 'es';
+    if (s === 'paid') return es ? 'Pagado' : 'Paid';
+    if (s === 'overdue') return es ? 'Impago' : 'Unpaid';
+    return es ? 'A cobrar' : 'To collect';
+  }, [language]);
+
+  // Etiquetas de un dia de la grilla. Los cobros van primero: son de hoy
+  // y son plata, asi que si el dia recorta lo que muestra, que recorte
+  // por el otro lado.
+  const dayTags = useCallback((date: string) => {
+    const rents = rentalDaysByDate.get(date) ?? [];
+    const evs = calendarEvents.filter(e => e.event_date === date);
+    return [
+      ...rents.map(d => ({
+        key: d.id,
+        tone: RENT_TONE[d.status],
+        label: `${RENT_ICON[d.status]} ${d.rider || (language === 'es' ? 'Alquiler' : 'Rental')}`,
+        title: `${language === 'es' ? 'Cobro de alquiler' : 'Rent collection'} · ${d.rider} · ${rentDetail(d)}`,
+        onClick: () => openDayEvents(date),
+      })),
+      ...evs.map(e => {
+        const dyn = getDynamicEventStatus(e);
+        return {
+          key: e.id,
+          tone: (dyn === 'Pendiente' ? 'alert' : 'ok') as CalTone,
+          label: e.title,
+          title: e.title,
+          onClick: () => { if (isManagedElsewhere(e)) openDayEvents(date); else openEventModal(e); },
+        };
+      }),
+    ];
+  }, [rentalDaysByDate, calendarEvents, language, rentDetail, openDayEvents, getDynamicEventStatus, openEventModal]);
   const weekStartStr = useMemo(() => `${String(weekDays[0].getDate()).padStart(2, '0')}/${String(weekDays[0].getMonth() + 1).padStart(2, '0')}`, [weekDays]);
   const weekEndStr = useMemo(() => `${String(weekDays[6].getDate()).padStart(2, '0')}/${String(weekDays[6].getMonth() + 1).padStart(2, '0')}`, [weekDays]);
   const weekYear = useMemo(() => weekDays[0].getFullYear(), [weekDays]);
@@ -7883,6 +8364,7 @@ USING (true);`;
           {[
             { key: 'analytics',     icon: '📊', label: t.dashboard },
             { key: 'balance',       icon: '💰', label: t.balance },
+            { key: 'profitability', icon: '📈', label: language === 'es' ? 'Rentabilidad' : 'Profitability' },
             { key: 'invoicing',     icon: '🧾', label: language === 'es' ? 'Facturación' : 'Invoicing' },
             { key: 'expenses',      icon: '🛒', label: language === 'es' ? 'Compras y Gastos' : 'Purchases' },
             { key: 'stock',         icon: '📦', label: t.stock },
@@ -7897,6 +8379,7 @@ USING (true);`;
             { key: 'quick_replies', icon: '💬', label: t.quick_replies },
             { key: 'emails',        icon: '📧', label: language === 'es' ? 'Plantillas de Emails' : 'Email Templates' },
             { key: 'tasks',         icon: '📋', label: t.tasks },
+            { key: 'response_times', icon: '⏱️', label: language === 'es' ? 'Calculador de Respuestas' : 'Response Calculator' },
           ].filter(({ key }) => !(key === 'balance' && isManager)).map(({ key, icon, label }) => (
             <a key={key} className={`menu-item ${currentTab === key ? 'active' : ''}`}
               onClick={() => {
@@ -7949,6 +8432,9 @@ USING (true);`;
           <h1 className="topbar-title">{
             currentTab === 'invoicing' ? (language === 'es' ? 'Facturación' : 'Invoicing')
             : currentTab === 'expenses' ? (language === 'es' ? 'Compras y Gastos' : 'Purchases & Expenses')
+            : currentTab === 'profitability' ? (language === 'es' ? 'Rentabilidad' : 'Profitability')
+            : currentTab === 'response_times' ? (language === 'es' ? 'Calculador de Respuestas' : 'Response Calculator')
+            : currentTab === 'notifications' ? (language === 'es' ? 'Notificaciones' : 'Notifications')
             : (t[currentTab as keyof typeof t] || currentTab)
           }</h1>
           <div className="topbar-actions">
@@ -8077,32 +8563,66 @@ USING (true);`;
 
             <div style={{ position: 'relative' }}>
 
-              <button className="bell-btn" onClick={() => setShowNotifications(!showNotifications)}>
+              <button className="bell-btn" onClick={openNotifications}>
                 🔔
-                {activeAlerts.length > 0 && <span className="bell-badge">{activeAlerts.length}</span>}
+                {/* El numero cuenta solo lo NO visto: al abrir se apaga. */}
+                {unreadNotifications > 0 && <span className="bell-badge">{unreadNotifications}</span>}
               </button>
               {showNotifications && (
                 <div className="notification-menu">
                   <div className="notification-header">
-                    <h4>{language === 'es' ? 'Alertas de Operaciones' : 'Operations Alerts'}</h4>
+                    <h4>
+                      {language === 'es' ? 'Notificaciones' : 'Notifications'}
+                      {notifications.length > 0 && (
+                        <span style={{ fontSize: '11px', color: 'var(--text-muted)', fontWeight: 400, marginLeft: '6px' }}>
+                          ({notifications.length})
+                        </span>
+                      )}
+                    </h4>
                     <button className="btn-secondary btn-xs" onClick={() => setShowNotifications(false)}>✕</button>
                   </div>
                   <div className="notification-list">
-                    {activeAlerts.length === 0
-                      ? <div style={{ padding: '16px', fontSize: '12px', color: 'var(--text-muted)' }}>{language === 'es' ? 'Sin alertas pendientes' : 'No alerts pending'}</div>
-                      : activeAlerts.map(a => (
-                        <div key={a.id} className={`notification-item ${a.priority}`}>
-                          <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-bright)' }}>
-                            {a.type === 'event' ? '📅' : '⚙️'} {a.message}
-                          </span>
-                          {a.date && (
-                            <span style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '2px', display: 'block' }}>
-                              📆 {fmtAlertDate(a.date)}
+                    {notifications.length === 0 ? (
+                      <div style={{ padding: '20px 16px', fontSize: '12px', color: 'var(--text-muted)', textAlign: 'center' }}>
+                        ✅ {language === 'es' ? 'Nada pendiente. Todo al día.' : 'Nothing pending. All clear.'}
+                      </div>
+                    ) : (
+                      notifications.slice(0, 10).map(n => {
+                        const isNew = !seenSnapshot.has(n.id);
+                        return (
+                          <div
+                            key={n.id}
+                            className={`notification-item ${n.priority}`}
+                            onClick={() => { setCurrentTab(n.target); setShowNotifications(false); }}
+                            style={{ cursor: 'pointer', background: isNew ? 'rgba(96,165,250,0.07)' : undefined }}
+                            title={language === 'es' ? 'Ir a la vista' : 'Open view'}
+                          >
+                            <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-bright)', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <span>{n.icon}</span>
+                              <span style={{ flex: 1 }}>{n.title}</span>
+                              {isNew && (
+                                <span style={{ fontSize: '9px', fontWeight: 700, color: '#60a5fa', background: 'rgba(96,165,250,0.15)', padding: '1px 5px', borderRadius: '3px', letterSpacing: '.04em' }}>
+                                  {language === 'es' ? 'NUEVA' : 'NEW'}
+                                </span>
+                              )}
                             </span>
-                          )}
-                        </div>
-                      ))
-                    }
+                            {n.detail && (
+                              <span style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '2px', display: 'block' }}>
+                                {n.detail}
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                  <div
+                    style={{ padding: '10px 14px', borderTop: '1px solid rgba(255,255,255,0.08)', textAlign: 'center', cursor: 'pointer', fontSize: '12px', fontWeight: 600, color: '#60a5fa' }}
+                    onClick={() => { setCurrentTab('notifications'); setShowNotifications(false); }}
+                  >
+                    {notifications.length > 10
+                      ? (language === 'es' ? `Ver más notificaciones (${notifications.length - 10} más)` : `See more notifications (${notifications.length - 10} more)`)
+                      : (language === 'es' ? 'Ver historial de notificaciones' : 'See notification history')}
                   </div>
                 </div>
               )}
@@ -8289,6 +8809,50 @@ USING (true);`;
 
               </div>
             </>
+          )}
+
+          {/* ================================================
+              TAB: RENTABILIDAD (analisis de negocio)
+              ================================================ */}
+          {currentTab === 'profitability' && (
+            <ProfitabilityView
+              language={language}
+              products={products}
+              bikeCategoryId={catBikeId}
+              rentals={rentals}
+              rentalItems={rentalItems}
+              payments={payments}
+              expenses={expenses}
+              records={records}
+              assignments={bikeAssignments}
+              sales={sales}
+              financingPayments={financingPaymentsData}
+              documents={documents}
+              appAccounts={appAccounts}
+              accountEarnings={accountEarnings}
+              platforms={platforms}
+            />
+          )}
+
+          {/* ================================================
+              TAB: CALCULADOR DE RESPUESTAS
+              ================================================ */}
+          {currentTab === 'response_times' && (
+            <ResponseTimesView language={language} showToast={showToast} />
+          )}
+
+          {/* ================================================
+              TAB: HISTORIAL DE NOTIFICACIONES
+              Se llega desde la campanita, no desde el menu.
+              ================================================ */}
+          {currentTab === 'notifications' && (
+            <NotificationsView
+              language={language}
+              notifications={notifications}
+              seen={seenSnapshot}
+              onNavigate={(tab: TargetTab) => setCurrentTab(tab)}
+              onMarkAllRead={markNotificationsSeen}
+            />
           )}
 
           {/* ================================================
@@ -8508,6 +9072,7 @@ USING (true);`;
                         <th>Categoría</th>
                         <th>Descripción</th>
                         <th>{language === 'es' ? 'Método de Pago' : 'Payment Method'}</th>
+                        <th>{language === 'es' ? 'Factura' : 'Invoice'}</th>
                         <th style={{ textAlign: 'right' }}>Monto</th>
                       </tr>
                     </thead>
@@ -8518,10 +9083,43 @@ USING (true);`;
                           ? balanceData.txs.filter(tx => (tx.description || '').toLowerCase().includes(term) || (tx.category || '').toLowerCase().includes(term))
                           : balanceData.txs;
                         return filteredTxs.length === 0 ? (
-                        <tr><td colSpan={5} style={{ textAlign: 'center', padding: '20px', color: 'var(--text-muted)' }}>{balanceSearch.trim() ? (language === 'es' ? 'No hay transacciones que coincidan.' : 'No matching transactions.') : 'No hay transacciones registradas.'}</td></tr>
+                        <tr><td colSpan={6} style={{ textAlign: 'center', padding: '20px', color: 'var(--text-muted)' }}>{balanceSearch.trim() ? (language === 'es' ? 'No hay transacciones que coincidan.' : 'No matching transactions.') : 'No hay transacciones registradas.'}</td></tr>
                       ) : (
                         filteredTxs.map((tx) => {
                           const isCustomExpense = tx.id.startsWith('other-');
+                          // Documento fiscal asociado a la transaccion, si lo
+                          // tiene. Segun el tipo de movimiento:
+                          //  - cobro de alquiler (pay-): su factura (INV), por pago.
+                          //  - venta contado / entrada financiada (sale-*): el INV de la venta.
+                          //  - deposito recibido (dep-in-): su recibo de deposito (DEP).
+                          //  - cuota financiada (fin-pay-): su recibo (RCP), por venta + n de cuota.
+                          // El resto (compras, reembolsos, gastos, cobros de app,
+                          // ventas legacy) no genera documento y queda sin enlace.
+                          let invDoc: FiscalDocument | null = null;
+                          const rid = tx.id;
+                          if (rid.startsWith('pay-')) {
+                            invDoc = invoiceByPaymentId.get(rid.replace('pay-', '')) ?? null;
+                          } else if (rid.startsWith('sale-new-') || rid.startsWith('sale-down-')) {
+                            const saleId = rid
+                              .replace('sale-new-', '')
+                              .replace('sale-down-', '')
+                              .replace(/-cash$/, '')
+                              .replace(/-transfer$/, '');
+                            invDoc = documents.find(d => d.sale_id === saleId && d.doc_type === 'INV') ?? null;
+                          } else if (rid.startsWith('dep-in-')) {
+                            const rentalId = rid.replace('dep-in-', '');
+                            invDoc = documents.find(d => d.rental_id === rentalId && d.doc_type === 'DEP') ?? null;
+                          } else if (rid.startsWith('fin-pay-')) {
+                            const fp = financingPaymentsData.find(x => x.id === rid.replace('fin-pay-', ''));
+                            const plan = fp ? financingPlans.find(pl => pl.id === fp.financing_plan_id) : null;
+                            if (fp && plan) {
+                              invDoc = documents.find(d =>
+                                d.doc_type === 'RCP' &&
+                                d.sale_id === plan.sale_id &&
+                                d.financing_snapshot?.installment_number === fp.installment_number,
+                              ) ?? null;
+                            }
+                          }
                           let customColor = undefined;
                           if (isCustomExpense) {
                             const expId = tx.id.replace('other-', '');
@@ -8574,6 +9172,17 @@ USING (true);`;
                                   <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>—</span>
                                 )}
                               </td>
+                              <td>
+                                {invDoc ? (
+                                  <button
+                                    onClick={() => openDocumentPdf(invDoc!)}
+                                    style={{ background: 'none', border: 'none', color: '#60a5fa', cursor: 'pointer', textDecoration: 'underline', padding: 0, fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                                    title={language === 'es' ? 'Ver factura' : 'View invoice'}
+                                  >
+                                    🧾 {invDoc.number}
+                                  </button>
+                                ) : null}
+                              </td>
                               <td style={{ textAlign: 'right', fontWeight: 'bold', color: tx.type === 'income' ? '#10b981' : '#ef4444' }}>
                                 {tx.type === 'income' ? '+' : '-'}€{fmt2(tx.amount)}
                                 <button
@@ -8612,13 +9221,10 @@ USING (true);`;
                                           // Delete financing plan, payments and linked calendar events
                                           const plan = financingPlans.find(fp => fp.sale_id === saleId);
                                           if (plan) {
-                                            const sale = sales.find(s => s.id === saleId);
-                                            const cust = sale ? customers.find(c => c.id === sale.customer_id) : null;
-                                            const custName = cust ? `${cust.first_name} ${cust.last_name}` : null;
-                                            const linkedEvents = events.filter(e =>
-                                              e.title.includes('💳 Cuota') &&
-                                              (custName ? e.title.includes(custName) : false)
-                                            );
+                                            // Por plan, no por nombre de cliente: si el cliente tiene
+                                            // dos financiamientos, borrar uno se llevaba las cuotas
+                                            // del otro.
+                                            const linkedEvents = events.filter(e => eventRef(e.description, 'Plan ID') === plan.id);
                                             for (const ev of linkedEvents) {
                                               await deleteEvent(ev.id);
                                             }
@@ -8776,7 +9382,7 @@ USING (true);`;
                       </thead>
                       <tbody>
                         {products
-                          .filter(p => p.category_id === catBattId && p.status === 'Disponible')
+                          .filter(p => p.category_id === catBattId && p.status === 'Disponible' && (p.custom_field_values as any)?.battery_available !== false)
                           .map(bat => {
                             const isSelected = wizBatteryIds.includes(bat.id);
                             return (
@@ -8805,7 +9411,7 @@ USING (true);`;
                               </tr>
                             );
                           })}
-                        {products.filter(p => p.category_id === catBattId && p.status === 'Disponible').length === 0 && (
+                        {products.filter(p => p.category_id === catBattId && p.status === 'Disponible' && (p.custom_field_values as any)?.battery_available !== false).length === 0 && (
                           <tr>
                             <td colSpan={4} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '24px' }}>
                               {language === 'es' ? 'No hay baterías disponibles.' : 'No available batteries.'}
@@ -9514,6 +10120,20 @@ USING (true);`;
                     <input type="checkbox" checked={wizHasInsurance} onChange={e => setWizHasInsurance(e.target.checked)} />
                     {language === 'es' ? '¿Tiene Seguro Adicional?' : 'Has Additional Insurance?'}
                   </label>
+                  {wizRateType === 'semanal' && (
+                    <label className="form-checkbox" style={{ marginBottom: '16px' }}>
+                      <input type="checkbox" checked={wizAutoInvoice} onChange={e => setWizAutoInvoice(e.target.checked)} />
+                      🧾 {language === 'es'
+                        ? 'Facturación automática semanal (emite y envía la factura cada semana)'
+                        : 'Automatic weekly invoicing (issues and emails the invoice every week)'}
+                    </label>
+                  )}
+                  <label className="form-checkbox" style={{ marginBottom: '16px' }}>
+                    <input type="checkbox" checked={wizSendEmails} onChange={e => setWizSendEmails(e.target.checked)} />
+                    ✉️ {language === 'es'
+                      ? 'Enviar correos al cliente (confirmación del alquiler y facturas)'
+                      : 'Send emails to the customer (rental confirmation and invoices)'}
+                  </label>
                   <div style={{ display: 'flex', gap: '12px', marginTop: '20px' }}>
                     <button className="btn-secondary" onClick={() => setWizardStep(5)}>← Atrás</button>
                     <button className="btn-primary" onClick={() => setWizardStep(7)}>Siguiente →</button>
@@ -9861,8 +10481,8 @@ USING (true);`;
             <DocumentsView
               language={language}
               showToast={showToast}
-              rentalCodeById={rentalCodeById}
-              customers={customers.map(c => ({ id: c.id, name: `${c.first_name} ${c.last_name}`.trim() }))}
+              rentals={invoicingRentals}
+              customers={customers.map(c => ({ id: c.id, name: `${c.first_name} ${c.last_name}`.trim(), email: c.email ?? '' }))}
             />
           )}
 
@@ -9874,6 +10494,25 @@ USING (true);`;
               categories={expenseCategories}
               onAddExpense={async (data) => {
                 try {
+                  // El comprobante se sube ANTES de crear el gasto: si la
+                  // subida falla, no queda un gasto que dice tener adjunto
+                  // y apunta a un archivo que no existe.
+                  let receiptPath: string | null = null;
+                  if (data.receiptFile) {
+                    try {
+                      receiptPath = await uploadExpenseReceipt(data.receiptFile);
+                    } catch (upErr) {
+                      console.error('[FastSheep] no se pudo subir el comprobante:', upErr);
+                      showToast(
+                        language === 'es'
+                          ? 'No se pudo subir el comprobante. El gasto no se guardó.'
+                          : 'Could not upload the receipt. The expense was not saved.',
+                        'error',
+                      );
+                      return;
+                    }
+                  }
+
                   const b = data.hasVat ? addVatHelper(data.amount) : noVat(data.amount);
                   await insertBusinessExpense({
                     expense_date: data.date,
@@ -9882,11 +10521,17 @@ USING (true);`;
                     description: data.description,
                     quantity: 1,
                     amount: b.amount, vat_rate: b.vat_rate, vat_amount: b.vat_amount, net_amount: b.net_amount,
-                    payment_method: '', supplier_invoice_ref: data.invoiceRef || null, invoice_file_url: null,
+                    payment_method: '', supplier_invoice_ref: data.invoiceRef || null,
+                    invoice_file_url: receiptPath,
                     source: 'manual', source_id: null, product_id: null, created_by: null,
                   } as Parameters<typeof insertBusinessExpense>[0]);
                   await reloadBusinessExpenses();
-                  showToast(language === 'es' ? 'Gasto registrado.' : 'Expense saved.', 'success');
+                  showToast(
+                    language === 'es'
+                      ? (receiptPath ? 'Gasto registrado con comprobante.' : 'Gasto registrado.')
+                      : (receiptPath ? 'Expense saved with receipt.' : 'Expense saved.'),
+                    'success',
+                  );
                 } catch {
                   showToast(language === 'es' ? 'No se pudo guardar el gasto.' : 'Could not save the expense.', 'error');
                 }
@@ -10393,7 +11038,7 @@ USING (true);`;
                                             style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
                                             onClick={() => openProductModal(associatedLock)}
                                           >
-                                            🔗 {language === 'es' ? 'Sí' : 'Yes'} ({associatedLock.serial_number})
+                                            🔗 {language === 'es' ? 'Sí' : 'Yes'} ({associatedLock.serial_number}{associatedLock.key_number ? ` · 🔑 ${associatedLock.key_number}` : ''})
                                           </span>
                                         ) : (
                                           <span style={{ color: 'var(--text-muted)' }}>{language === 'es' ? 'No' : 'No'}</span>
@@ -10616,6 +11261,7 @@ USING (true);`;
                                                         setActiveStockMenuId(null);
                                                         setSelectedProductId(prod.id);
                                                         setSelectedCondition(prod.condition || 'bueno');
+                                                        setSelectedBatteryAvailable((prod.custom_field_values as any)?.battery_available !== false);
                                                         setModalType('changeCondition');
                                                       }}
                                                       onMouseEnter={(e) => {
@@ -11280,7 +11926,7 @@ USING (true);`;
                                             style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
                                             onClick={() => openProductModal(associatedLock)}
                                           >
-                                            🔗 {language === 'es' ? 'Sí' : 'Yes'} ({associatedLock.serial_number})
+                                            🔗 {language === 'es' ? 'Sí' : 'Yes'} ({associatedLock.serial_number}{associatedLock.key_number ? ` · 🔑 ${associatedLock.key_number}` : ''})
                                           </span>
                                         ) : (
                                           <span style={{ color: 'var(--text-muted)' }}>{language === 'es' ? 'No' : 'No'}</span>
@@ -11505,6 +12151,7 @@ USING (true);`;
                                                         setActiveStockMenuId(null);
                                                         setSelectedProductId(prod.id);
                                                         setSelectedCondition(prod.condition || 'bueno');
+                                                        setSelectedBatteryAvailable((prod.custom_field_values as any)?.battery_available !== false);
                                                         setModalType('changeCondition');
                                                       }}
                                                       onMouseEnter={(e) => {
@@ -11978,6 +12625,7 @@ USING (true);`;
                                     const paidPayments = payments.filter(p => p.status === 'Pagada').length;
                                     const totalPayments = payments.length;
                                     const buyer = sale ? customers.find(c => c.id === sale.customer_id) : null;
+                                    const saleHasInvoice = sale ? documents.some(d => d.sale_id === sale.id && d.doc_type === 'INV') : true;
 
                                     return (
                                       <tr key={s.id}>
@@ -12055,6 +12703,17 @@ USING (true);`;
                                           >
                                             ✏️ {language === 'es' ? 'Editar' : 'Edit'}
                                           </button>
+                                          {sale && !saleHasInvoice && (
+                                            <button
+                                              className="btn-secondary btn-xs"
+                                              disabled={issuingSaleInvoiceId === sale.id}
+                                              onClick={() => emitInvoiceForExistingSale(sale.id)}
+                                            >
+                                              {issuingSaleInvoiceId === sale.id
+                                                ? (language === 'es' ? '⏳ Emitiendo...' : '⏳ Issuing...')
+                                                : `🧾 ${language === 'es' ? 'Emitir factura' : 'Issue invoice'}`}
+                                            </button>
+                                          )}
                                           {s.category_id === catBikeId && (
                                             <button
                                               className="btn-secondary btn-xs"
@@ -12720,6 +13379,18 @@ USING (true);`;
                                       <button 
                                         className="btn-danger btn-xs" 
                                         onClick={async () => {
+                                          // Borrar el cliente NO borra sus alquileres: el FK los deja
+                                          // sin dueno y desaparecen de todas las pantallas.
+                                          const ligados = await countRentalsForCustomer(cust.id);
+                                          if (ligados > 0) {
+                                            showToast(
+                                              language === 'es'
+                                                ? `No se puede eliminar: tiene ${ligados} alquiler(es) asociados. Eliminá primero esos alquileres.`
+                                                : `Cannot delete: ${ligados} rental(s) are linked. Delete those rentals first.`,
+                                              'error',
+                                            );
+                                            return;
+                                          }
                                           const confirmName = window.prompt(language === 'es' ? `Escribe "${cust.first_name}" para confirmar la eliminación de este usuario:` : `Type "${cust.first_name}" to confirm deleting this user:`);
                                           if (confirmName === cust.first_name) {
                                             try {
@@ -13097,9 +13768,17 @@ USING (true);`;
                                   <button 
                                     className="btn-secondary btn-xs"
                                     style={{ padding: '2px 8px', height: '24px', minHeight: 'unset', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px' }}
-                                    onClick={() => {
-                                      setLightboxUrl(cust.id_document_url);
-                                      setLightboxTitle(language === 'es' ? `Documento ID – ${cust.first_name} ${cust.last_name}` : `ID Document – ${cust.first_name} ${cust.last_name}`);
+                                    onClick={async () => {
+                                      // El bucket es privado: hay que firmar un
+                                      // enlace temporal para poder verlo.
+                                      try {
+                                        const signed = await getRiderDocumentUrl(cust.id_document_url);
+                                        setLightboxUrl(signed);
+                                        setLightboxTitle(language === 'es' ? `Documento ID – ${cust.first_name} ${cust.last_name}` : `ID Document – ${cust.first_name} ${cust.last_name}`);
+                                      } catch (e) {
+                                        console.error('No se pudo abrir el documento de identidad:', e);
+                                        showToast(language === 'es' ? 'No se pudo abrir el documento.' : 'Could not open the document.', 'error');
+                                      }
                                     }}
                                   >
                                     👁️ {language === 'es' ? 'Ver ID' : 'View ID'}
@@ -13991,12 +14670,41 @@ USING (true);`;
                                     setPayFormNotes('');
                                     setPayFormType('rent');
                                     setPayFormReceivedVia('efectivo');
+                                    setPayFormIsRetro(false);
+                                    resetPayFormItems();
                                     // Si el alquiler ya factura solo por el cron semanal, se
                                     // deja el checkbox apagado para no emitir dos facturas del
                                     // mismo cobro. Si no, encendido.
                                     setPayFormEmitInvoice(!(r.auto_invoice && r.rate_type === 'semanal'));
+                                    setPayFormSendEmail(r.auto_email !== false);
                                     setModalType('rentalPayment');
                                   }}>💶 {t.logPayment}</button>
+
+                                  {/* Pago retroactivo: para cargar las semanas ya pasadas de un
+                                      alquiler dado de alta tarde. Propone la siguiente semana sin
+                                      cobrar, contando desde el inicio, para poder encadenarlas. */}
+                                  <button className="btn-secondary btn-xs" onClick={() => {
+                                    const yaCobradas = payments.filter(p => p.rental_id === r.id).length;
+                                    const paso = r.rate_type === 'mensual' ? 30 : r.rate_type === 'diario' ? 1 : 7;
+                                    const [sy, sm, sd] = r.start_date.split('-').map(Number);
+                                    const d = new Date(sy, sm - 1, sd + yaCobradas * paso);
+                                    const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+                                    // Nunca proponer una fecha futura.
+                                    const propuesta = d > hoy ? hoy : d;
+                                    setPayFormRentalId(r.id);
+                                    setPayFormAmount(r.rental_rate);
+                                    setPayFormDate(`${propuesta.getFullYear()}-${String(propuesta.getMonth() + 1).padStart(2, '0')}-${String(propuesta.getDate()).padStart(2, '0')}`);
+                                    setPayFormNotes('');
+                                    setPayFormType('rent');
+                                    setPayFormReceivedVia('efectivo');
+                                    setPayFormIsRetro(true);
+                                    resetPayFormItems();
+                                    // En un pago viejo no se factura ni se avisa por defecto:
+                                    // se esta reconstruyendo historial, no cobrando hoy.
+                                    setPayFormEmitInvoice(false);
+                                    setPayFormSendEmail(false);
+                                    setModalType('rentalPayment');
+                                  }}>📅 {language === 'es' ? 'Pago retroactivo' : 'Back-dated payment'}</button>
 
                                   <button className="btn-secondary btn-xs" onClick={() => {
                                     setMaintExpenseFormCost('');
@@ -14093,6 +14801,84 @@ USING (true);`;
                                     🔄 {t.returnBike}
                                   </button>
                                 </div>
+                              )}
+
+                              {/* Facturacion automatica semanal. El estado se
+                                  deriva: durante el aviso de devolucion el cron
+                                  no factura (solo mira 'Activo'), asi que el
+                                  checkbox se muestra apagado y bloqueado. Al
+                                  cancelar el aviso vuelve al valor guardado en
+                                  auto_invoice, que el aviso nunca toca. */}
+                              {r.rate_type === 'semanal' && r.status !== 'Inactivo' && (
+                                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '10px', cursor: r.status === 'Devolución en Proceso' ? 'not-allowed' : 'pointer', fontSize: '13px', opacity: r.status === 'Devolución en Proceso' ? 0.6 : 1 }}>
+                                  <input
+                                    type="checkbox"
+                                    checked={!!r.auto_invoice && r.status !== 'Devolución en Proceso'}
+                                    disabled={r.status === 'Devolución en Proceso'}
+                                    onChange={async e => {
+                                      const on = e.target.checked;
+                                      try {
+                                        // Al reactivar, la fecha de cobro se
+                                        // adelanta al proximo vencimiento futuro
+                                        // para que el cron no facture de golpe las
+                                        // semanas que estuvo apagada.
+                                        let nextDate = r.next_invoice_date ?? null;
+                                        if (on) {
+                                          const [sy, sm, sd] = r.start_date.split('-').map(Number);
+                                          const d = new Date(sy, sm - 1, sd);
+                                          const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+                                          while (d < hoy) d.setDate(d.getDate() + 7);
+                                          nextDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+                                        }
+                                        await upsertRental({ ...r, auto_invoice: on, next_invoice_date: nextDate });
+                                        triggerReload();
+                                        showToast(
+                                          language === 'es'
+                                            ? (on ? 'Facturación automática activada.' : 'Facturación automática desactivada.')
+                                            : (on ? 'Automatic invoicing enabled.' : 'Automatic invoicing disabled.'),
+                                          'success',
+                                        );
+                                      } catch {
+                                        showToast(language === 'es' ? 'No se pudo actualizar la facturación automática.' : 'Could not update automatic invoicing.', 'error');
+                                      }
+                                    }}
+                                  />
+                                  🧾 {language === 'es' ? 'Facturación automática semanal' : 'Automatic weekly invoicing'}
+                                  {r.status === 'Devolución en Proceso' && (
+                                    <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>
+                                      {language === 'es' ? '(pausada por aviso de devolución)' : '(paused by return notice)'}
+                                    </span>
+                                  )}
+                                </label>
+                              )}
+
+                              {/* Envio de correos al cliente. Al reactivar, los
+                                  correos salen de ese momento en adelante: no se
+                                  reenvia nada de fechas pasadas (el cron solo
+                                  envia la factura que emite en cada corrida). */}
+                              {r.status !== 'Inactivo' && (
+                                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '10px', cursor: 'pointer', fontSize: '13px' }}>
+                                  <input
+                                    type="checkbox"
+                                    checked={r.auto_email !== false}
+                                    onChange={async e => {
+                                      const on = e.target.checked;
+                                      try {
+                                        await upsertRental({ ...r, auto_email: on });
+                                        triggerReload();
+                                        showToast(
+                                          language === 'es'
+                                            ? (on ? 'Envío de correos activado.' : 'Envío de correos desactivado.')
+                                            : (on ? 'Email sending enabled.' : 'Email sending disabled.'),
+                                          'success',
+                                        );
+                                      } catch {
+                                        showToast(language === 'es' ? 'No se pudo actualizar el envío de correos.' : 'Could not update email sending.', 'error');
+                                      }
+                                    }}
+                                  />
+                                  ✉️ {language === 'es' ? 'Enviar correos al cliente' : 'Send emails to the customer'}
+                                </label>
                               )}
 
                               {/* Documentos de este alquiler (punto 3): factura,
@@ -14971,89 +15757,34 @@ USING (true);`;
                       {Array.from({ length: calDays }).map((_, i) => {
                         const dayNum = i + 1;
                         const dayString = `${calYear}-${String(calMonth + 1).padStart(2, '0')}-${String(dayNum).padStart(2, '0')}`;
-                        const dayEvents = events.filter(e => e.event_date === dayString);
+                        const tags = dayTags(dayString);
                         const isToday = dayString === new Date().toISOString().split('T')[0];
+                        const limit = 2;
+                        const showMore = tags.length > limit;
+                        const visible = showMore ? tags.slice(0, limit - 1) : tags;
                         return (
                           <div key={dayNum} className={`calendar-day ${isToday ? 'today' : ''}`}
                             style={{ justifyContent: 'flex-start', gap: '4px' }}
                             onClick={() => {
-                              if (dayEvents.length > 0) {
-                                setSelectedDayEventsDate(dayString);
-                                setModalType('dayEventsList');
-                              } else {
-                                openEventModal(dayString);
-                              }
+                              if (tags.length > 0) openDayEvents(dayString);
+                              else openEventModal(dayString);
                             }}>
                             <span className="day-number">{dayNum}</span>
                             <div className="day-events" style={{ display: 'flex', flexDirection: 'column', gap: '4px', width: '100%', marginTop: '4px' }}>
-                              {(() => {
-                                const limit = 2;
-                                const showMore = dayEvents.length > limit;
-                                const visibleEvents = showMore ? dayEvents.slice(0, limit - 1) : dayEvents;
-                                return (
-                                  <>
-                                    {visibleEvents.map(e => {
-                                      const dynStatus = getDynamicEventStatus(e);
-                                      const isPending = dynStatus === 'Pendiente';
-                                      return (
-                                        <div key={e.id} className={`event-tag ${isPending ? 'pending' : 'done'}`}
-                                          title={e.title}
-                                          onClick={ev => { 
-                                            ev.stopPropagation(); 
-                                            if (e.title.includes('Cuota') || e.title.toLowerCase().includes('cuota')) {
-                                              showToast(language === 'es' ? 'Las cuotas se gestionan desde financiamiento.' : 'Installments are managed from financing.', 'success');
-                                              return;
-                                            }
-                                            if (e.title.startsWith('[Service]')) {
-                                              showToast(language === 'es' ? 'Los servicios se gestionan desde el taller.' : 'Services are managed from the workshop.', 'success');
-                                              return;
-                                            }
-                                            openEventModal(e); 
-                                          }}
-                                          style={{
-                                            display: 'flex',
-                                            alignItems: 'center',
-                                            gap: '6px',
-                                            padding: '2px 6px',
-                                            borderRadius: '4px',
-                                            fontSize: '10px',
-                                            fontWeight: 500,
-                                            background: isPending ? 'rgba(239, 68, 68, 0.15)' : 'rgba(16, 185, 129, 0.15)',
-                                            border: isPending ? '1px solid rgba(239, 68, 68, 0.3)' : '1px solid rgba(16, 185, 129, 0.3)',
-                                            color: isPending ? '#f87171' : '#34d399',
-                                            whiteSpace: 'nowrap',
-                                            overflow: 'hidden',
-                                            textOverflow: 'ellipsis',
-                                            width: '100%',
-                                            boxSizing: 'border-box'
-                                          }}>
-                                          <span style={{
-                                            width: '6px',
-                                            height: '6px',
-                                            borderRadius: '50%',
-                                            backgroundColor: isPending ? '#ef4444' : '#10b981',
-                                            flexShrink: 0
-                                          }} />
-                                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                            {e.title}
-                                          </span>
-                                        </div>
-                                      );
-                                    })}
-                                    {showMore && (
-                                      <div style={{
-                                        fontSize: '10px',
-                                        fontWeight: 600,
-                                        color: 'var(--text-muted)',
-                                        paddingLeft: '4px',
-                                        marginTop: '2px'
-                                      }}>
-                                        + {dayEvents.length - (limit - 1)} {language === 'es' ? 'más...' : 'more...'}
-                                      </div>
-                                    )}
-                                  </>
-                                );
-                              })()}
+                              {visible.map(t => (
+                                <CalendarTag key={t.key} label={t.label} tone={t.tone} title={t.title} onClick={t.onClick} />
+                              ))}
+                              {showMore && (
+                                <div style={{
+                                  fontSize: '10px',
+                                  fontWeight: 600,
+                                  color: 'var(--text-muted)',
+                                  paddingLeft: '4px',
+                                  marginTop: '2px'
+                                }}>
+                                  + {tags.length - (limit - 1)} {language === 'es' ? 'más...' : 'more...'}
+                                </div>
+                              )}
                             </div>
                           </div>
                         );
@@ -15064,18 +15795,14 @@ USING (true);`;
                       {weekDays.map((dayDate, idx) => {
                         const dayNum = dayDate.getDate();
                         const dayString = `${dayDate.getFullYear()}-${String(dayDate.getMonth() + 1).padStart(2, '0')}-${String(dayDate.getDate()).padStart(2, '0')}`;
-                        const dayEvents = events.filter(e => e.event_date === dayString);
+                        const tags = dayTags(dayString);
                         const isToday = dayString === new Date().toISOString().split('T')[0];
                         return (
                           <div key={`wk-${idx}`} className={`calendar-day ${isToday ? 'today' : ''}`}
                             style={{ aspectRatio: 'unset', height: '180px', justifyContent: 'flex-start', gap: '8px' }}
                             onClick={() => {
-                              if (dayEvents.length > 0) {
-                                setSelectedDayEventsDate(dayString);
-                                setModalType('dayEventsList');
-                              } else {
-                                openEventModal(dayString);
-                              }
+                              if (tags.length > 0) openDayEvents(dayString);
+                              else openEventModal(dayString);
                             }}>
                             <span className="day-number" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
                               <span>{dayNum}</span>
@@ -15086,58 +15813,13 @@ USING (true);`;
                             <div className="day-events" style={{ display: 'flex', flexDirection: 'column', gap: '4px', width: '100%', marginTop: '4px' }}>
                               {(() => {
                                 const limit = 3;
-                                const showMore = dayEvents.length > limit;
-                                const visibleEvents = showMore ? dayEvents.slice(0, limit - 1) : dayEvents;
+                                const showMore = tags.length > limit;
+                                const visible = showMore ? tags.slice(0, limit - 1) : tags;
                                 return (
                                   <>
-                                    {visibleEvents.map(e => {
-                                      const dynStatus = getDynamicEventStatus(e);
-                                      const isPending = dynStatus === 'Pendiente';
-                                      return (
-                                        <div key={e.id} className={`event-tag ${isPending ? 'pending' : 'done'}`}
-                                          title={e.title}
-                                          onClick={ev => { 
-                                            ev.stopPropagation(); 
-                                            if (e.title.includes('Cuota') || e.title.toLowerCase().includes('cuota')) {
-                                              showToast(language === 'es' ? 'Las cuotas se gestionan desde financiamiento.' : 'Installments are managed from financing.', 'success');
-                                              return;
-                                            }
-                                            if (e.title.startsWith('[Service]')) {
-                                              showToast(language === 'es' ? 'Los servicios se gestionan desde el taller.' : 'Services are managed from the workshop.', 'success');
-                                              return;
-                                            }
-                                            openEventModal(e); 
-                                          }}
-                                          style={{
-                                            display: 'flex',
-                                            alignItems: 'center',
-                                            gap: '6px',
-                                            padding: '2px 6px',
-                                            borderRadius: '4px',
-                                            fontSize: '10px',
-                                            fontWeight: 500,
-                                            background: isPending ? 'rgba(239, 68, 68, 0.15)' : 'rgba(16, 185, 129, 0.15)',
-                                            border: isPending ? '1px solid rgba(239, 68, 68, 0.3)' : '1px solid rgba(16, 185, 129, 0.3)',
-                                            color: isPending ? '#f87171' : '#34d399',
-                                            whiteSpace: 'nowrap',
-                                            overflow: 'hidden',
-                                            textOverflow: 'ellipsis',
-                                            width: '100%',
-                                            boxSizing: 'border-box'
-                                          }}>
-                                          <span style={{
-                                            width: '6px',
-                                            height: '6px',
-                                            borderRadius: '50%',
-                                            backgroundColor: isPending ? '#ef4444' : '#10b981',
-                                            flexShrink: 0
-                                          }} />
-                                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                            {e.title}
-                                          </span>
-                                        </div>
-                                      );
-                                    })}
+                                    {visible.map(t => (
+                                      <CalendarTag key={t.key} label={t.label} tone={t.tone} title={t.title} onClick={t.onClick} />
+                                    ))}
                                     {showMore && (
                                       <div style={{
                                         fontSize: '10px',
@@ -15146,7 +15828,7 @@ USING (true);`;
                                         paddingLeft: '4px',
                                         marginTop: '2px'
                                       }}>
-                                        + {dayEvents.length - (limit - 1)} {language === 'es' ? 'más...' : 'more...'}
+                                        + {tags.length - (limit - 1)} {language === 'es' ? 'más...' : 'more...'}
                                       </div>
                                     )}
                                   </>
@@ -15159,6 +15841,21 @@ USING (true);`;
                     </>
                   )}
                   </div>
+                </div>
+
+                {/* Referencia de colores. Sin esto, verde/rojo/ambar son
+                    tres colores; con esto son tres estados. */}
+                <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap', marginTop: '12px', fontSize: '11px', color: 'var(--text-muted)' }}>
+                  {([
+                    ['ok', language === 'es' ? 'Pagado / realizado' : 'Paid / done'],
+                    ['alert', language === 'es' ? 'Impago o pendiente' : 'Unpaid or pending'],
+                    ['soon', language === 'es' ? 'Cobro por venir' : 'Upcoming collection'],
+                  ] as [CalTone, string][]).map(([tone, label]) => (
+                    <span key={tone} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: CAL_TONES[tone].dot }} />
+                      {label}
+                    </span>
+                  ))}
                 </div>
 
               {/* Events list */}
@@ -15174,14 +15871,14 @@ USING (true);`;
                     </thead>
                     <tbody>
                       {(() => {
-                        const filteredEvents = events.filter(ev => {
+                        const filteredEvents = calendarEvents.filter(ev => {
                           if (calendarViewMode === 'week') {
                             const evDate = new Date(ev.event_date);
                             const start = new Date(weekDays[0]);
                             start.setHours(0,0,0,0);
                             const end = new Date(weekDays[6]);
                             end.setHours(23,59,59,999);
-                            
+
                             const t = evDate.getTime();
                             return t >= start.getTime() && t <= end.getTime();
                           } else {
@@ -15189,8 +15886,41 @@ USING (true);`;
                             return ey === calYear && em === (calMonth + 1);
                           }
                         });
-                        
-                        if (filteredEvents.length === 0) {
+
+                        // Los cobros de alquiler ya vienen acotados al rango
+                        // visible desde buildRentalPaymentDays.
+                        const rentRows = rentalPaymentDays.map(d => ({ date: d.date, node: (
+                          <tr key={d.id}>
+                            <td>
+                              <strong>💶 {language === 'es' ? 'Cobro de alquiler' : 'Rent collection'} — {d.rider}</strong>
+                              <br />
+                              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{rentDetail(d)}</span>
+                            </td>
+                            <td>{fmtDMY(d.date)}</td>
+                            <td>
+                              <span
+                                className="badge"
+                                style={{
+                                  background: CAL_TONES[RENT_TONE[d.status]].bg,
+                                  border: `1px solid ${CAL_TONES[RENT_TONE[d.status]].border}`,
+                                  color: CAL_TONES[RENT_TONE[d.status]].fg,
+                                }}
+                              >
+                                {rentStatusLabel(d.status)}
+                              </span>
+                            </td>
+                            <td>
+                              <button
+                                className="btn-secondary btn-xs"
+                                onClick={() => { setActiveCustomerId(null); setCurrentTab('rental_wizard'); }}
+                              >
+                                {language === 'es' ? '→ Ver alquiler' : '→ Open rental'}
+                              </button>
+                            </td>
+                          </tr>
+                        ) }));
+
+                        if (filteredEvents.length === 0 && rentRows.length === 0) {
                           return (
                             <tr>
                               <td colSpan={4} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '24px' }}>
@@ -15202,8 +15932,10 @@ USING (true);`;
                             </tr>
                           );
                         }
-                        
-                        return filteredEvents.map(ev => {
+
+                        // Cobros y eventos van intercalados por fecha: leer
+                        // el mes en orden importa mas que separarlos por tipo.
+                        const eventRows = filteredEvents.map(ev => {
                           const isService = ev.title.startsWith('[Service]');
                           let bikeInfo = '';
                           if (isService) {
@@ -15213,7 +15945,7 @@ USING (true);`;
                               bikeInfo = ` - ${bike.brand} ${bike.model}`;
                             }
                           }
-                          return (
+                          return { date: ev.event_date, node: (
                             <tr key={ev.id}>
                               <td><strong>{ev.title}{bikeInfo}</strong><br /><span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{ev.description}</span></td>
                               <td>{fmtDMY(ev.event_date)}</td>
@@ -15334,7 +16066,11 @@ USING (true);`;
                               </div>
                             </td>
                           </tr>
-                        ); });
+                        ) }; });
+
+                        return [...rentRows, ...eventRows]
+                          .sort((a, b) => a.date.localeCompare(b.date))
+                          .map(r => r.node);
                       })()}
                     </tbody>
                   </table>
@@ -16774,6 +17510,18 @@ USING (true);`;
                                         className="btn-secondary btn-xs"
                                         style={{ color: '#f87171', borderColor: 'rgba(248,113,113,0.3)' }}
                                         onClick={async () => {
+                                          // Ver la nota del otro punto de borrado: el FK deja
+                                          // huerfanos los alquileres en vez de impedir el borrado.
+                                          const ligados = await countRentalsForCustomer(cust.id);
+                                          if (ligados > 0) {
+                                            showToast(
+                                              language === 'es'
+                                                ? `No se puede eliminar: tiene ${ligados} alquiler(es) asociados. Eliminá primero esos alquileres.`
+                                                : `Cannot delete: ${ligados} rental(s) are linked. Delete those rentals first.`,
+                                              'error',
+                                            );
+                                            return;
+                                          }
                                           if (!await asyncConfirm(language === 'es' ? `¿Eliminar a ${cust.first_name} ${cust.last_name}?` : `Delete ${cust.first_name} ${cust.last_name}?`)) return;
                                           try {
                                             await deleteCustomer(cust.id);
@@ -18710,6 +19458,16 @@ USING (true);`;
                   </div>
                 </div>
 
+                {/* 3. ENVIO DE EMAIL */}
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', margin: '0 0 12px', cursor: 'pointer', fontSize: '13px' }}>
+                  <input
+                    type="checkbox"
+                    checked={soldSendEmail}
+                    onChange={e => setSoldSendEmail(e.target.checked)}
+                  />
+                  ✉️ {language === 'es' ? 'Enviar correo de confirmación al cliente' : 'Send confirmation email to the customer'}
+                </label>
+
                 {/* 3. IDIOMA EMAIL */}
                 <div className="form-group">
                   <label className="form-label">🌐 {language === 'es' ? 'Idioma del Correo' : 'Email Language'}</label>
@@ -18991,9 +19749,18 @@ USING (true);`;
                   )}
                 </div>
 
-                <button 
-                  className="btn-primary" 
-                  disabled={soldSubmitting || soldProducts.length === 0} 
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', margin: '4px 0 16px', cursor: 'pointer', fontSize: '13px' }}>
+                  <input
+                    type="checkbox"
+                    checked={soldEmitInvoice}
+                    onChange={e => setSoldEmitInvoice(e.target.checked)}
+                  />
+                  🧾 {language === 'es' ? 'Emitir factura de esta venta' : 'Issue an invoice for this sale'}
+                </label>
+
+                <button
+                  className="btn-primary"
+                  disabled={soldSubmitting || soldProducts.length === 0}
                   onClick={async () => {
                     if (soldPaymentType === 'financiado') {
                       if (!soldCustomerFirstName.trim() || !soldCustomerPhone.trim() || !soldCustomerEmail.trim()) {
@@ -19057,206 +19824,40 @@ USING (true);`;
                       await insertSale(saleObj);
 
                       // 3. Create Sale Items & Update Product status
-                      const saleItemsToInsert = [];
-                      // Working copy kept in sync with every DB mutation below, so that selling several
-                      // units of the same consolidated/generic serial in a single sale always reads the
-                      // up-to-date distribution (prevents stale-snapshot double counting).
-                      let currentProducts = products.map(pp => ({ ...pp, custom_field_values: { ...pp.custom_field_values } }));
-                      const applyUpsert = async (row: Product) => {
-                        await upsertProduct(row);
-                        const syncedRow = { ...row, custom_field_values: { ...row.custom_field_values } };
-                        const idx = currentProducts.findIndex(cp => cp.id === row.id);
-                        if (idx >= 0) currentProducts[idx] = syncedRow; else currentProducts.push(syncedRow);
-                      };
-                      const applyDelete = async (id: string) => {
-                        await deleteProduct(id);
-                        currentProducts = currentProducts.filter(cp => cp.id !== id);
-                      };
-                      for (const item of soldProducts) {
-                        const p = item.product;
-                        const tempId = item.tempId;
-                        const actualUnitPrice = soldProductPrices[tempId] ?? (p.price_sold ?? 0);
-                        const statusToSet = soldPaymentType === 'financiado' ? 'Financiada' : 'Vendida';
-                        const isGeneric = isProductGeneric(p);
-                        const selectedLoc = soldProductLocations[tempId] || 'Almacén Central';
-                        const dist = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
-                        const totalQty = dist ? Object.values(dist).reduce((a, b) => a + b, 0) : 0;
-
-                        if (isGeneric) {
-                          const pGroup = currentProducts.filter(item => item.serial_number === p.serial_number && item.status === 'Disponible');
-
-                          // Find the product in the group that has the selected location in its distribution (or as its single location)
-                          const targetProduct = pGroup.find(mp => {
-                            const distMap = (mp.custom_field_values?.location_distribution as Record<string, number>) || {};
-                            if (distMap[selectedLoc] > 0) return true;
-                            if (Object.keys(distMap).length === 0 && mp.custom_field_values?.location === selectedLoc) return true;
-                            return false;
-                          }) || pGroup[0] || p;
-
-                          const tDist = (targetProduct.custom_field_values?.location_distribution as Record<string, number>) || {};
-                          const tTotalQty = Object.values(tDist).reduce((a, b) => a + b, 0);
-
-                          if (Object.keys(tDist).length > 0 && tTotalQty > 1) {
-                            const splitId = crypto.randomUUID();
-                            
-                            // Insert the split-off sold unit
-                            await applyUpsert({
-                              ...targetProduct,
-                              id: splitId,
-                              status: statusToSet,
-                              price_sold: actualUnitPrice,
-                              sold_date: soldFormDate,
-                              custom_field_values: { 
-                                ...targetProduct.custom_field_values, 
-                                location: selectedLoc, 
-                                location_distribution: undefined 
-                              },
-                            });
-
-                            saleItemsToInsert.push({
-                              sale_id: newSaleId,
-                              product_id: splitId,
-                              unit_price: actualUnitPrice
-                            });
-
-                            // Decrement quantity from targetProduct
-                            const updatedDist = { ...tDist };
-                            updatedDist[selectedLoc] = (updatedDist[selectedLoc] || 1) - 1;
-                            Object.keys(updatedDist).forEach(k => { if (updatedDist[k] <= 0) delete updatedDist[k]; });
-                            const newTotal = Object.values(updatedDist).reduce((a, b) => a + b, 0);
-
-                            if (newTotal <= 0) {
-                              const totalRowsInGroup = currentProducts.filter(item => item.serial_number === p.serial_number).length;
-                              if (totalRowsInGroup <= 1) {
-                                await applyUpsert({
-                                  ...targetProduct,
-                                  custom_field_values: {
-                                    ...targetProduct.custom_field_values,
-                                    location: null,
-                                    location_distribution: {}
-                                  }
-                                });
-                              } else {
-                                await applyDelete(targetProduct.id);
-                              }
-                            } else {
-                              let mainLocation = '';
-                              let maxQ = -1;
-                              Object.entries(updatedDist).forEach(([l, v]) => {
-                                  if (v > maxQ) {
-                                    maxQ = v;
-                                    mainLocation = l;
-                                  }
-                              });
-                              await applyUpsert({
-                                ...targetProduct,
-                                custom_field_values: { 
-                                  ...targetProduct.custom_field_values, 
-                                  location: mainLocation || 'Almacén Central',
-                                  location_distribution: updatedDist 
-                                }
-                              });
-                            }
-                          } else {
-                            // Standard or last unit of generic item
-                            const totalRowsInGroup = currentProducts.filter(item => item.serial_number === p.serial_number).length;
-                            if (totalRowsInGroup <= 1) {
-                              await applyUpsert({
-                                ...targetProduct,
-                                status: statusToSet,
-                                price_sold: actualUnitPrice,
-                                sold_date: soldFormDate,
-                                custom_field_values: { 
-                                  ...targetProduct.custom_field_values, 
-                                  location: selectedLoc, 
-                                  location_distribution: undefined 
-                                }
-                              });
-                              saleItemsToInsert.push({
-                                sale_id: newSaleId,
-                                product_id: targetProduct.id,
-                                unit_price: actualUnitPrice
-                              });
-                            } else {
-                              const splitId = crypto.randomUUID();
-                              await applyUpsert({
-                                ...targetProduct,
-                                id: splitId,
-                                status: statusToSet,
-                                price_sold: actualUnitPrice,
-                                sold_date: soldFormDate,
-                                custom_field_values: { 
-                                  ...targetProduct.custom_field_values, 
-                                  location: selectedLoc, 
-                                  location_distribution: undefined 
-                                }
-                              });
-                              saleItemsToInsert.push({
-                                sale_id: newSaleId,
-                                product_id: splitId,
-                                unit_price: actualUnitPrice
-                              });
-                              await applyDelete(targetProduct.id);
-                            }
-                          }
-                        } else {
-                          // Standard non-generic (unique item)
-                          if (dist && totalQty > 1) {
-                            const splitId = crypto.randomUUID();
-                            const mainLoc = Object.entries(dist).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Almacén Central';
-                            
-                            await applyUpsert({
-                              ...p,
-                              id: splitId,
-                              status: statusToSet,
-                              price_sold: actualUnitPrice,
-                              sold_date: soldFormDate,
-                              custom_field_values: { ...p.custom_field_values, location: mainLoc, location_distribution: undefined },
-                            });
-
-                            saleItemsToInsert.push({
-                              sale_id: newSaleId,
-                              product_id: splitId,
-                              unit_price: actualUnitPrice
-                            });
-
-                            const updatedDist = { ...dist };
-                            const locToDecrement = Object.keys(updatedDist).find(k => updatedDist[k] > 0) || mainLoc;
-                            updatedDist[locToDecrement] = (updatedDist[locToDecrement] || 1) - 1;
-                            Object.keys(updatedDist).forEach(k => { if (updatedDist[k] <= 0) delete updatedDist[k]; });
-                            const newTotal = Object.values(updatedDist).reduce((a, b) => a + b, 0);
-
-                            if (newTotal <= 0) {
-                              await applyUpsert({
-                                ...p,
-                                status: statusToSet,
-                                price_sold: actualUnitPrice,
-                                sold_date: soldFormDate,
-                                custom_field_values: { ...p.custom_field_values, location_distribution: undefined }
-                              });
-                            } else {
-                              await applyUpsert({
-                                ...p,
-                                custom_field_values: { ...p.custom_field_values, location_distribution: updatedDist }
-                              });
-                            }
-                          } else {
-                            await applyUpsert({
-                              ...p,
-                              status: statusToSet,
-                              price_sold: actualUnitPrice,
-                              sold_date: soldFormDate
-                            });
-
-                            saleItemsToInsert.push({
-                              sale_id: newSaleId,
-                              product_id: p.id,
-                              unit_price: actualUnitPrice
-                            });
-                          }
-                        }
-                      }
+                      const saleItemsToInsert = await sellProductUnits({
+                        products, soldProducts, soldProductPrices, soldProductLocations,
+                        soldPaymentType, soldFormDate, newSaleId, isProductGeneric,
+                      });
                       await insertSaleItems(saleItemsToInsert);
+
+                      // 3.5 Emitir la factura fiscal de la venta automaticamente,
+                      // salvo que se haya desmarcado "Emitir factura" en el modal.
+                      // El VAT de una venta de bienes se devenga entero en la
+                      // entrega (tambien si es financiada). Un fallo al facturar
+                      // no debe tumbar la venta, que ya quedo guardada: se avisa
+                      // aparte y la factura puede reemitirse desde Documentos.
+                      if (soldEmitInvoice) try {
+                        const invDesc = saleInvoiceDescription(soldProducts.map(item => item.product));
+                        const saleDoc = await issueSaleInvoice({
+                          saleId: newSaleId,
+                          description: invDesc,
+                          paymentMethod: soldReceivedVia,
+                          // Contado: pagada en la entrega. Financiada: el INV se
+                          // emite por el total y queda pendiente de cobro; las
+                          // cuotas se registran aparte con sus recibos.
+                          paymentDate: soldPaymentType === 'financiado' ? null : soldFormDate,
+                          issueDate: soldFormDate,
+                        });
+                        await generateDocumentPdf(saleDoc.id, false);
+                      } catch (invErr) {
+                        console.error('[FastSheep] no se pudo emitir la factura de la venta:', invErr);
+                        showToast(
+                          language === 'es'
+                            ? 'Venta guardada, pero la factura no se pudo emitir. Puedes emitirla desde Documentos.'
+                            : 'Sale saved, but the invoice could not be issued. You can issue it from Documents.',
+                          'error',
+                        );
+                      }
 
                       // 4. Create Financing Plan if Financed
                       if (soldPaymentType === 'financiado' && finalCustId) {
@@ -19305,7 +19906,7 @@ USING (true);`;
                           const reminderEvent = {
                             id: crypto.randomUUID(),
                             title: `💳 Cuota 1/${soldInstallments}: ${soldCustomerFirstName} ${soldCustomerLastName}`,
-                            description: `Vencimiento de la primera cuota del financiamiento por la compra de: ${bikeSerials}. Monto: €${fmt2(installmentAmount)}.`,
+                            description: `Vencimiento de la primera cuota del financiamiento por la compra de: ${bikeSerials}. Monto: €${fmt2(installmentAmount)}.\nPlan ID: ${newPlanId}`,
                             event_date: firstInstallmentDate,
                             remind_one_week: true,
                             remind_one_day: true,
@@ -19315,12 +19916,12 @@ USING (true);`;
                         }
 
                         // 6. Trigger Financing email structure
-                        if (customerObj) {
+                        if (customerObj && soldSendEmail) {
                           sendFinancingPlanEmail(saleObj, { ...financingPlanObj, created_at: new Date().toISOString() }, paymentsList, soldProducts.map(item => item.product), customerObj, soldEmailLang, emailTemplates);
                         }
                       } else {
                         // Send cash sale confirmation email
-                        if (customerObj) {
+                        if (customerObj && soldSendEmail) {
                           sendSaleConfirmationEmail(saleObj, soldProducts.map(item => item.product), customerObj, soldEmailLang, emailTemplates);
                         } else {
                           // No customer registered, just print details
@@ -19862,15 +20463,135 @@ USING (true);`;
         // significa literalmente no emitir nada.
         const isAutoInvoiced = !!rental.auto_invoice && rental.rate_type === 'semanal';
 
+        // Cobro combinado: el rider paga la semana y ademas se lleva algo de
+        // la tienda. Al banco entra un solo importe, asi que sale una sola
+        // factura con el alquiler y los articulos como lineas.
+        const itemPriceOf = (it: { tempId: string; product: Product }) =>
+          round2(payFormItemPrices[it.tempId] ?? (it.product.price_sold ?? 0));
+        const itemQtyOf = (it: { tempId: string; product: Product }) =>
+          Math.max(1, Math.round(payFormItemQty[it.tempId] ?? 1));
+        const itemLineOf = (it: { tempId: string; product: Product }) =>
+          round2(itemQtyOf(it) * itemPriceOf(it));
+        const itemsTotal = round2(payFormItems.reduce((s, it) => s + itemLineOf(it), 0));
+        const chargeTotal = round2(payFormAmount + itemsTotal);
+        const hasItems = payFormItems.length > 0;
+
+        // Unidades de cada producto ya comprometidas, contando cantidades:
+        // no se puede ofrecer mas de lo que queda en el estante.
+        const pickedCounts: Record<string, number> = {};
+        payFormItems.forEach(it => {
+          pickedCounts[it.product.id] = (pickedCounts[it.product.id] || 0) + itemQtyOf(it);
+        });
+        const itemQuery = payFormItemSearch.trim().toLowerCase();
+        const availableItems = products.filter(p => {
+          if (p.status !== 'Disponible') return false;
+          // Mismo criterio que el modal de venta: una unidad unica se puede
+          // poner una sola vez; de un generico, tantas como tenga en su fila.
+          const yaPuestos = pickedCounts[p.id] || 0;
+          if (yaPuestos > 0) {
+            if (!isProductGeneric(p)) return false;
+            const dist = p.custom_field_values?.location_distribution as Record<string, number> | undefined;
+            const enLaFila = dist ? Object.values(dist).reduce((a, b) => a + b, 0) : 1;
+            if (yaPuestos >= enLaFila) return false;
+          }
+          if (!itemQuery) return true;
+          return `${p.name ?? ''} ${p.serial_number ?? ''}`.toLowerCase().includes(itemQuery);
+        }).slice(0, 8);
+
+        // Stock disponible por ubicacion, sumando TODAS las filas que
+        // comparten el codigo: un generico puede estar partido en varias
+        // filas y mirar solo una da una cantidad que no existe.
+        //
+        // Es el mismo recuento que hace el modal de venta. Si aqui contara
+        // distinto, dos pantallas dirian cosas diferentes del mismo estante.
+        const stockPorUbicacion = (p: Product): Record<string, number> => {
+          const mapa: Record<string, number> = {};
+          products
+            .filter(g => g.serial_number === p.serial_number && g.status === 'Disponible')
+            .forEach(mp => {
+              const dist = (mp.custom_field_values?.location_distribution as Record<string, number>) || {};
+              Object.entries(dist).forEach(([loc, qty]) => {
+                if (qty > 0) mapa[loc] = (mapa[loc] || 0) + qty;
+              });
+              // Sin distribucion, la fila es una unidad en su ubicacion.
+              if (mp.custom_field_values?.location_distribution == null && mp.custom_field_values?.location) {
+                const loc = mp.custom_field_values.location as string;
+                mapa[loc] = (mapa[loc] || 0) + 1;
+              }
+            });
+          return mapa;
+        };
+
+        const stockTotal = (p: Product): number => {
+          if (!isProductGeneric(p)) return 1;
+          const n = Object.values(stockPorUbicacion(p)).reduce((a, b) => a + b, 0);
+          return n || 1;
+        };
+
+        const addPayFormItem = (p: Product) => {
+          const tempId = crypto.randomUUID();
+          // Al agregar el PRIMER articulo se propone emitir factura, aunque
+          // el alquiler venga con la casilla apagada por facturar solo por
+          // el cron: si no, la semanal pendiente se marcaria pagada por 70
+          // y el casco quedaria sin papel, que es justo el descuadre con el
+          // banco que esto vino a arreglar. Solo se propone: se puede
+          // desmarcar, y a los riders a los que no se les factura nunca se
+          // les sigue sin facturar.
+          if (payFormItems.length === 0) setPayFormEmitInvoice(true);
+          setPayFormItems(prev => [...prev, { tempId, product: p }]);
+          setPayFormItemPrices(prev => ({ ...prev, [tempId]: p.price_sold ?? 0 }));
+          setPayFormItemQty(prev => ({ ...prev, [tempId]: 1 }));
+          // Se propone la ubicacion con mas unidades: es de la que se
+          // descuenta si el operador no toca nada.
+          const ubic = stockPorUbicacion(p);
+          const conMas = Object.entries(ubic).sort((a, b) => b[1] - a[1])[0]?.[0]
+            ?? (p.custom_field_values?.location as string | undefined)
+            ?? 'Almacén Central';
+          setPayFormItemLocations(prev => ({ ...prev, [tempId]: conMas }));
+          setPayFormItemSearch('');
+        };
+
+        const removePayFormItem = (tempId: string) => {
+          setPayFormItems(prev => prev.filter(it => it.tempId !== tempId));
+        };
+
         return (
           <div className="modal-overlay">
-            <div className="modal-content" style={{ maxWidth: '400px' }}>
+            {/* Algo mas ancho que el resto de modales chicos: con articulos
+                cargados hay que ver ubicacion, cantidad y precio en la misma
+                linea sin que se pisen. */}
+            <div className="modal-content" style={{ maxWidth: '470px' }}>
               <div className="modal-header">
-                <h3>💵 {language === 'es' ? 'Registrar Pago' : 'Register Payment'}</h3>
-                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setPayFormRentalId(null); }}>✕</button>
+                <h3>
+                  {payFormIsRetro
+                    ? `📅 ${language === 'es' ? 'Pago Retroactivo' : 'Back-dated Payment'}`
+                    : `💵 ${language === 'es' ? 'Registrar Pago' : 'Register Payment'}`}
+                </h3>
+                <button className="btn-secondary btn-xs" onClick={() => { setModalType(null); setPayFormRentalId(null); resetPayFormItems(); }}>✕</button>
               </div>
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                
+
+                {payFormIsRetro && (
+                  <p style={{ fontSize: '12px', color: 'var(--text-muted)', margin: 0, padding: '10px 12px', background: 'rgba(96,165,250,0.08)', border: '1px solid rgba(96,165,250,0.2)', borderRadius: '8px' }}>
+                    {language === 'es'
+                      ? 'Cargando una semana ya pasada. La fecha propuesta es la siguiente sin cobrar; al confirmar podés volver a abrirlo para la semana siguiente.'
+                      : 'Recording a past week. The suggested date is the next uncollected one; after confirming you can reopen it for the following week.'}
+                  </p>
+                )}
+
+                {/* Fecha del cobro. Sin esto no se pueden cargar semanas
+                    viejas de un alquiler dado de alta tarde. */}
+                <div className="form-group">
+                  <label className="form-label">📆 {language === 'es' ? 'Fecha del pago' : 'Payment date'}</label>
+                  <input
+                    type="date"
+                    className="form-control"
+                    value={payFormDate}
+                    max={new Date().toISOString().split('T')[0]}
+                    onChange={e => setPayFormDate(e.target.value)}
+                  />
+                </div>
+
                 {/* Radio Buttons */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', padding: '12px', background: 'rgba(255,255,255,0.02)', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
                   <label className="form-checkbox" style={{ margin: 0, fontWeight: payFormType === 'rent' ? 'bold' : 'normal', display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
@@ -19949,17 +20670,169 @@ USING (true);`;
                   </div>
                 </div>
 
+                {/* Articulos de tienda cobrados en el mismo movimiento.
+                    Plegado por defecto: casi todos los cobros son solo el
+                    alquiler y el modal tiene que seguir siendo de dos clics. */}
+                <div style={{ padding: '12px', background: 'rgba(255,255,255,0.02)', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: hasItems || payFormItemSearch ? '10px' : 0 }}>
+                    <span style={{ fontSize: '13px', fontWeight: 600 }}>
+                      🛒 {language === 'es' ? 'Artículos de la tienda' : 'Shop items'}
+                    </span>
+                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                      {language === 'es' ? 'opcional' : 'optional'}
+                    </span>
+                  </div>
+
+                  {payFormItems.map(it => {
+                    // El selector se muestra para todo producto que tenga
+                    // ubicaciones con stock, aunque sea una sola: saber de
+                    // que estante sale es la mitad de la informacion.
+                    const ubic = stockPorUbicacion(it.product);
+                    const locs = Object.keys(ubic);
+                    const locElegida = payFormItemLocations[it.tempId] ?? locs[0];
+                    // Tope de unidades: lo que hay en la ubicacion elegida, o
+                    // el total si el producto no lleva ubicaciones.
+                    const maxUnidades = Math.max(1, ubic[locElegida] ?? stockTotal(it.product));
+                    const qty = itemQtyOf(it);
+                    return (
+                      <div key={it.tempId} style={{
+                        marginBottom: '8px', padding: '8px 10px', borderRadius: '8px',
+                        background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.06)',
+                      }}>
+                        {/* Fila 1: que es, y el boton de quitarlo */}
+                        <div style={{ display: 'flex', alignItems: 'baseline', gap: '6px' }}>
+                          <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            <span style={{ fontSize: '13px', fontWeight: 600 }}>{it.product.name || it.product.serial_number}</span>
+                            <span style={{ color: 'var(--text-muted)', marginLeft: '6px', fontSize: '11px' }}>
+                              {it.product.serial_number}
+                            </span>
+                          </div>
+                          <button className="btn-secondary btn-xs" style={{ padding: '2px 7px' }}
+                            onClick={() => removePayFormItem(it.tempId)}>✕</button>
+                        </div>
+
+                        {/* Fila 2: de que estante sale */}
+                        {locs.length > 0 && (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '5px', marginTop: '6px' }}>
+                            <span style={{ fontSize: '11px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>📍</span>
+                            <select
+                              className="form-control"
+                              style={{ height: '26px', fontSize: '11.5px', padding: '0 4px', margin: 0, flex: 1, minWidth: 0 }}
+                              value={locElegida}
+                              onChange={e => {
+                                const nueva = e.target.value;
+                                setPayFormItemLocations(prev => ({ ...prev, [it.tempId]: nueva }));
+                                // Al cambiar de estante la cantidad puede pasarse
+                                // de lo que hay alli: se recorta en el momento.
+                                const tope = Math.max(1, ubic[nueva] ?? 1);
+                                setPayFormItemQty(prev => ({ ...prev, [it.tempId]: Math.min(qty, tope) }));
+                              }}
+                            >
+                              {locs.map(l => (
+                                <option key={l} value={l}>
+                                  {l} ({language === 'es' ? 'Disp:' : 'Avail:'} {ubic[l]})
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+
+                        {/* Fila 3: cantidad x precio unitario = total de linea */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '6px' }}>
+                          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                            {language === 'es' ? 'Cant.' : 'Qty'}
+                          </span>
+                          <input
+                            type="number" min={1} max={maxUnidades} step={1}
+                            className="form-control"
+                            style={{ width: '56px', height: '28px', fontSize: '13px', margin: 0, padding: '0 6px' }}
+                            value={qty}
+                            onChange={e => {
+                              const n = Math.round(Number(e.target.value) || 1);
+                              setPayFormItemQty(prev => ({ ...prev, [it.tempId]: Math.min(Math.max(1, n), maxUnidades) }));
+                            }}
+                          />
+                          <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>×</span>
+                          {/* El simbolo va pegado al campo: sin el, un "40" se
+                              lee igual de bien como precio que como cantidad. */}
+                          <span style={{ fontSize: '13px', color: 'var(--text-muted)' }}>€</span>
+                          <NumberField
+                            className="form-control"
+                            style={{ width: '78px', height: '28px', fontSize: '13px', margin: 0 }}
+                            value={payFormItemPrices[it.tempId] ?? 0}
+                            onValueChange={v => setPayFormItemPrices(prev => ({ ...prev, [it.tempId]: v ?? 0 }))}
+                          />
+                          <span style={{ marginLeft: 'auto', fontSize: '13px', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                            €{fmt2(itemLineOf(it))}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                  <input
+                    className="form-control"
+                    style={{ height: '30px', fontSize: '12.5px', marginTop: hasItems ? '8px' : '10px' }}
+                    placeholder={language === 'es' ? '🔎 Buscar producto en stock…' : '🔎 Search product in stock…'}
+                    value={payFormItemSearch}
+                    onChange={e => setPayFormItemSearch(e.target.value)}
+                  />
+                  {payFormItemSearch.trim() && (
+                    <div style={{ marginTop: '6px', maxHeight: '150px', overflowY: 'auto' }}>
+                      {availableItems.length === 0 ? (
+                        <p style={{ fontSize: '11.5px', color: 'var(--text-muted)', margin: '6px 0' }}>
+                          {language === 'es' ? 'Sin resultados disponibles.' : 'No available matches.'}
+                        </p>
+                      ) : availableItems.map(p => (
+                        <button
+                          key={p.id}
+                          className="btn-secondary btn-xs"
+                          style={{ display: 'block', width: '100%', textAlign: 'left', marginBottom: '4px' }}
+                          onClick={() => addPayFormItem(p)}
+                        >
+                          {p.name || p.serial_number}
+                          <span style={{ color: 'var(--text-muted)', marginLeft: '6px' }}>
+                            {p.serial_number} · €{fmt2(p.price_sold ?? 0)} · {stockTotal(p)} {language === 'es' ? 'en stock' : 'in stock'}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* El importe que tiene que coincidir con el movimiento del
+                    banco. Solo aparece cuando hay algo que sumar. */}
+                {hasItems && (
+                  <div style={{
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'baseline',
+                    padding: '10px 12px', borderRadius: '8px',
+                    background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.25)',
+                  }}>
+                    <span style={{ fontSize: '12.5px', fontWeight: 600 }}>
+                      {language === 'es' ? 'TOTAL A COBRAR' : 'TOTAL TO CHARGE'}
+                    </span>
+                    <span style={{ fontSize: '18px', fontWeight: 700, color: '#10b981' }}>€{fmt2(chargeTotal)}</span>
+                  </div>
+                )}
+
                 {/* Emitir factura de este cobro (apartado 5). */}
-                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: !payFormEmitInvoice && payFormType === 'rent' && isAutoInvoiced ? '4px' : '16px', cursor: 'pointer', fontSize: '13px' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: !payFormEmitInvoice && payFormType === 'rent' && isAutoInvoiced ? '4px' : '16px', cursor: 'pointer', fontSize: '13px', opacity: hasItems ? 0.7 : 1 }}>
                   <input
                     type="checkbox"
                     checked={payFormEmitInvoice}
                     onChange={e => setPayFormEmitInvoice(e.target.checked)}
                     style={{ width: '16px', height: '16px' }}
                   />
-                  🧾 {language === 'es' ? 'Emitir factura y enviarla al cliente' : 'Issue invoice and send it to the customer'}
+                  {language === 'es' ? 'Emitir factura' : 'Issue invoice'}
                 </label>
-                {!payFormEmitInvoice && payFormType === 'rent' && isAutoInvoiced && (
+                {hasItems && !payFormEmitInvoice && (
+                  <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '-8px', marginBottom: '16px' }}>
+                    {language === 'es'
+                      ? 'Los artículos se venden y salen del stock igual; simplemente no queda ningún documento de este cobro.'
+                      : 'The items are still sold and leave stock; there is simply no document for this charge.'}
+                  </p>
+                )}
+                {!hasItems && !payFormEmitInvoice && payFormType === 'rent' && isAutoInvoiced && !payFormIsRetro && (
                   <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '-8px', marginBottom: '16px' }}>
                     {language === 'es'
                       ? 'La factura de esta semana ya fue emitida automáticamente; al confirmar se marcará como pagada y se reenviará por email.'
@@ -19967,14 +20840,65 @@ USING (true);`;
                   </p>
                 )}
 
+                {/* Envio del correo, independiente de la factura. Arranca segun
+                    el auto_email del alquiler y apagado si es retroactivo. */}
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', cursor: 'pointer', fontSize: '13px' }}>
+                  <input
+                    type="checkbox"
+                    checked={payFormSendEmail}
+                    onChange={e => setPayFormSendEmail(e.target.checked)}
+                    style={{ width: '16px', height: '16px' }}
+                  />
+                  {language === 'es' ? 'Enviar correo al cliente' : 'Send email to the customer'}
+                </label>
+                {rental.auto_email === false && (
+                  <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '-4px', marginBottom: '12px' }}>
+                    {language === 'es'
+                      ? 'Este alquiler tiene los correos desactivados en su expediente.'
+                      : 'This rental has emails disabled in its file.'}
+                  </p>
+                )}
+
+                {/* Las dos casillas se combinan de cuatro formas y no es
+                    obvio de memoria cual hace que: se dice en claro. */}
+                <div style={{
+                  fontSize: '11.5px', lineHeight: 1.5, padding: '10px 12px', borderRadius: '8px', marginBottom: '4px',
+                  background: 'rgba(96,165,250,0.07)', border: '1px solid rgba(96,165,250,0.18)', color: 'var(--text-muted)',
+                }}>
+                  {hasItems && payFormEmitInvoice
+                    ? (language === 'es'
+                        ? `➜ Sale UNA factura de €${fmt2(chargeTotal)} con el alquiler y los artículos, ya pagada${isAutoInvoiced ? ', que reemplaza a la semanal pendiente y hereda su número' : ''}. Las unidades salen del stock como vendidas.`
+                        : `➜ ONE invoice of €${fmt2(chargeTotal)} is issued with the rental and the items, already paid${isAutoInvoiced ? ', replacing the pending weekly one and inheriting its number' : ''}. The units leave stock as sold.`)
+                    : hasItems && !payFormEmitInvoice
+                    ? (language === 'es'
+                        ? `➜ Sin factura. Se registran el cobro de €${fmt2(chargeTotal)} y la venta de los artículos, que salen del stock como vendidos${isAutoInvoiced ? ', y la factura semanal pendiente se marca como pagada' : ''}. Suma igual al balance.`
+                        : `➜ No invoice. The €${fmt2(chargeTotal)} charge and the sale of the items are recorded, and the units leave stock as sold${isAutoInvoiced ? ', and the pending weekly invoice is marked as paid' : ''}. It still counts in the balance.`)
+                    : payFormEmitInvoice && payFormSendEmail
+                    ? (language === 'es'
+                        ? '➜ Se emite la factura y el cliente recibe el detalle del pago con la factura adjunta. Copia a administración.'
+                        : '➜ The invoice is issued and the customer gets the payment details with the invoice attached. Copy to accounting.')
+                    : payFormEmitInvoice && !payFormSendEmail
+                      ? (language === 'es'
+                          ? '➜ Se emite la factura pero el cliente NO recibe ningún correo. Igual se envía a administración para el control interno.'
+                          : '➜ The invoice is issued but the customer gets NO email. It is still sent to accounting for internal control.')
+                      : !payFormEmitInvoice && payFormSendEmail
+                        ? (language === 'es'
+                            ? '➜ No se emite factura. El cliente recibe solo el detalle del pago por email.'
+                            : '➜ No invoice is issued. The customer only gets the payment details by email.')
+                        : (language === 'es'
+                            ? '➜ Solo se registra el pago: sin factura y sin correos. Suma igual al balance y a las estadísticas.'
+                            : '➜ Only the payment is recorded: no invoice, no emails. It still counts in the balance and statistics.')}
+                </div>
+
                 <button className="btn-primary" onClick={async () => {
                   try {
                     const finalNotes = payFormType === 'other'
                       ? ('Otro: ' + (payFormNotes.trim() || (language === 'es' ? 'Pago extra' : 'Extra payment')))
                       : 'Renta';
 
+                    const paymentId = crypto.randomUUID();
                     await insertPayment({
-                      id: crypto.randomUUID(),
+                      id: paymentId,
                       rental_id: payFormRentalId,
                       amount: payFormAmount,
                       payment_date: payFormDate,
@@ -19982,52 +20906,165 @@ USING (true);`;
                       received_via: payFormReceivedVia,
                     });
 
-                    // Emitir/actualizar la factura del cobro y (si tiene email)
-                    // enviarla. El fallo al facturar no debe tumbar el registro
-                    // del pago, que ya quedo guardado: se avisa aparte.
-                    let invoiceEmailSent = false;
-                    if (payFormEmitInvoice && payFormRentalId && payFormAmount > 0) {
+                    // Las dos casillas son independientes y se combinan asi:
+                    //
+                    //   emitir + enviar : factura al cliente (lleva el detalle
+                    //                     del pago) con copia a administracion.
+                    //   emitir sin enviar: la factura se emite y va SOLO a
+                    //                     administracion. Toda factura tiene que
+                    //                     llegar ahi por control interno.
+                    //   enviar sin emitir: solo el aviso de pago recibido.
+                    //   ninguna          : el pago se registra y nada mas.
+                    //
+                    // Un fallo al facturar no tumba el registro del pago, que
+                    // ya quedo guardado: se avisa aparte.
+                    // LA VENTA VA PRIMERO Y VA SIEMPRE. El stock y el balance
+                    // no dependen del papel: si el operador decide no emitir
+                    // factura, los articulos igual se vendieron y salieron
+                    // del deposito. Hay riders a los que no se les factura
+                    // nunca, y llevarse un casco no cambia eso.
+                    let saleId: string | null = null;
+                    if (hasItems) {
                       try {
-                        const desc = payFormType === 'other'
-                          ? (payFormNotes.trim() || (language === 'es' ? 'Cobro adicional' : 'Additional charge'))
-                          : (language === 'es' ? 'Alquiler de e-bike' : 'E-bike rental');
+                        const nuevaVenta = crypto.randomUUID();
+                        await insertSale({
+                          id: nuevaVenta,
+                          customer_id: rental.customer_id,
+                          sale_date: payFormDate,
+                          payment_type: 'contado',
+                          total_amount: itemsTotal,
+                          down_payment: itemsTotal,
+                          email_language: language === 'es' ? 'es' : 'en',
+                          notes: `Venta en el cobro del alquiler ${rental.rental_code ?? ''}`.trim(),
+                          status: 'Completada',
+                          received_via: payFormReceivedVia,
+                        });
+                        // sellProductUnits descuenta de a UNA unidad, asi que
+                        // una linea de "3 cascos" se despliega en tres
+                        // entradas con el mismo precio y la misma ubicacion.
+                        const unidades: { tempId: string; product: Product }[] = [];
+                        const preciosUnidad: Record<string, number> = {};
+                        const ubicacionUnidad: Record<string, string> = {};
+                        payFormItems.forEach(it => {
+                          for (let u = 0; u < itemQtyOf(it); u++) {
+                            const uid = `${it.tempId}-${u}`;
+                            unidades.push({ tempId: uid, product: it.product });
+                            preciosUnidad[uid] = itemPriceOf(it);
+                            ubicacionUnidad[uid] = payFormItemLocations[it.tempId] ?? '';
+                          }
+                        });
+                        await insertSaleItems(await sellProductUnits({
+                          products,
+                          soldProducts: unidades,
+                          soldProductPrices: preciosUnidad,
+                          soldProductLocations: ubicacionUnidad,
+                          soldPaymentType: 'contado',
+                          soldFormDate: payFormDate,
+                          newSaleId: nuevaVenta,
+                          isProductGeneric,
+                        }));
+                        saleId = nuevaVenta;
+                      } catch (ventaErr) {
+                        console.error('[FastSheep] no se pudo registrar la venta del cobro:', ventaErr);
+                        showToast(
+                          language === 'es'
+                            ? 'Pago guardado, pero los artículos no se pudieron vender. Revisá el stock.'
+                            : 'Payment saved, but the items could not be sold. Check the stock.',
+                          'error',
+                        );
+                      }
+                    }
+
+                    let invoiceEmailSent = false;
+                    if (hasItems && saleId && payFormEmitInvoice && payFormRentalId) {
+                      // COBRO COMBINADO. El rider paga la semana y ademas se
+                      // lleva algo: al banco entra un solo importe, asi que
+                      // sale un solo papel.
+                      //
+                      // Si el cron ya habia dejado la semanal en pendiente, la
+                      // combinada la reemplaza y hereda su numero.
+                      try {
+                        const doc = await issueRentalInvoiceWithItems({
+                          rentalId: payFormRentalId,
+                          rentAmount: payFormAmount,
+                          // Un cobro "otro" lleva la nota que escribio el
+                          // operador; la renta normal, el concepto estandar.
+                          rentDescription: payFormType === 'other'
+                            ? (payFormNotes.trim() || LINE_TEXT.extraCharge)
+                            : undefined,
+                          items: payFormItems.map(it => ({
+                            description: it.product.name || it.product.serial_number,
+                            quantity: itemQtyOf(it),
+                            unitPrice: itemPriceOf(it),
+                          })),
+                          saleId,
+                          paymentMethod: payFormReceivedVia,
+                          paymentDate: payFormDate,
+                        });
+                        await linkPaymentToDocument(paymentId, doc.id);
+                        const res = await generateDocumentPdf(doc.id, true, !payFormSendEmail);
+                        invoiceEmailSent = payFormSendEmail && res.emailed;
+                      } catch (comboErr) {
+                        console.error('[FastSheep] no se pudo emitir la factura combinada:', comboErr);
+                        showToast(
+                          language === 'es'
+                            ? 'Pago guardado, pero la factura combinada no se pudo emitir. Revisá los documentos del alquiler.'
+                            : 'Payment saved, but the combined invoice could not be issued. Check the rental documents.',
+                          'error',
+                        );
+                      }
+                    } else if (payFormEmitInvoice && payFormRentalId && payFormAmount > 0) {
+                      try {
                         const doc = await issueRentalInvoice({
                           rentalId: payFormRentalId,
                           amount: payFormAmount,
                           paymentMethod: payFormReceivedVia,
                           paymentDate: payFormDate,
-                          description: desc,
+                          // Solo el cobro "otro" trae concepto propio, el que
+                          // escribio el operador. La renta usa el estandar.
+                          description: payFormType === 'other'
+                            ? (payFormNotes.trim() || LINE_TEXT.extraCharge)
+                            : undefined,
                         });
-                        const res = await generateDocumentPdf(doc.id, true);
-                        invoiceEmailSent = res.emailed;
+                        await linkPaymentToDocument(paymentId, doc.id);
+                        // Siempre se envia; lo que cambia es a quien. Sin correo
+                        // al cliente, va en modo "solo administracion".
+                        const res = await generateDocumentPdf(doc.id, true, !payFormSendEmail);
+                        invoiceEmailSent = payFormSendEmail && res.emailed;
                       } catch (invErr) {
                         console.error('[FastSheep] no se pudo emitir la factura del pago:', invErr);
                         showToast(language === 'es' ? 'Pago guardado, pero la factura no se pudo emitir.' : 'Payment saved, but the invoice could not be issued.', 'error');
                       }
-                    } else if (!payFormEmitInvoice && payFormType === 'rent' && isAutoInvoiced && payFormRentalId && payFormAmount > 0) {
-                      // Alquiler semanal auto-facturado: la factura de esta semana
-                      // ya la emitio el cron en 'pending'. Solo hay que marcarla
-                      // pagada y reenviarla actualizada por email (apartado 8).
+                    } else if (
+                      !payFormEmitInvoice && !payFormIsRetro && payFormType === 'rent' &&
+                      isAutoInvoiced && payFormRentalId && payFormAmount > 0
+                    ) {
+                      // Alquiler semanal auto-facturado: la factura de esta
+                      // semana ya la emitio el cron en 'pending'. No se emite
+                      // nada nuevo, solo se marca pagada la que ya existe.
+                      //
+                      // No aplica a un pago retroactivo: ahi se reconstruye
+                      // historial y no hay que tocar facturas del cron.
                       try {
                         const doc = await markOldestPendingRentalInvoicePaid({
                           rentalId: payFormRentalId,
                           paymentMethod: payFormReceivedVia,
                           paymentDate: payFormDate,
                           fallbackAmount: payFormAmount,
-                          fallbackDescription: language === 'es' ? 'Alquiler de e-bike' : 'E-bike rental',
                         });
-                        const res = await generateDocumentPdf(doc.id, true);
-                        invoiceEmailSent = res.emailed;
+                        await linkPaymentToDocument(paymentId, doc.id);
+                        const res = await generateDocumentPdf(doc.id, true, !payFormSendEmail);
+                        invoiceEmailSent = payFormSendEmail && res.emailed;
                       } catch (invErr) {
                         console.error('[FastSheep] no se pudo actualizar la factura del pago:', invErr);
                         showToast(language === 'es' ? 'Pago guardado, pero no se pudo actualizar la factura.' : 'Payment saved, but the invoice could not be updated.', 'error');
                       }
                     }
 
-                    // Aviso generico de pago recibido: solo si no se acaba de
-                    // mandar ya una factura/actualizacion por este mismo cobro,
-                    // para no duplicar el correo al cliente.
-                    if (payFormRentalId && !invoiceEmailSent) {
+                    // Aviso de pago recibido. Solo si se pidio escribirle al
+                    // cliente y no se le acaba de mandar ya la factura, que
+                    // lleva el mismo detalle: si no, recibiria dos correos.
+                    if (payFormRentalId && !invoiceEmailSent && payFormSendEmail) {
                       const rentObj = rentals.find(r => r.id === payFormRentalId);
                       const rider = rentObj ? customers.find(c => c.id === rentObj.customer_id) : null;
                       if (rider) {
@@ -20036,8 +21073,40 @@ USING (true);`;
                       }
                     }
 
-                    triggerReload(); setModalType(null); setPayFormRentalId(null);
-                    showToast(language === 'es' ? 'Pago registrado exitosamente.' : 'Payment registered successfully.', 'success');
+                    triggerReload();
+                    // Los articulos ya se vendieron: si sobrevivieran al
+                    // cierre (o al salto de periodo del pago retroactivo) se
+                    // volverian a vender en el cobro siguiente.
+                    resetPayFormItems();
+
+                    if (payFormIsRetro) {
+                      // Reconstruir historial son muchos cobros seguidos: el
+                      // modal queda abierto y salta al periodo siguiente, para
+                      // no tener que reabrirlo semana por semana.
+                      const paso = rental.rate_type === 'mensual' ? 30 : rental.rate_type === 'diario' ? 1 : 7;
+                      const [py, pm, pd] = payFormDate.split('-').map(Number);
+                      const sig = new Date(py, pm - 1, pd + paso);
+                      const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+                      if (sig > hoy) {
+                        setModalType(null); setPayFormRentalId(null); setPayFormIsRetro(false);
+                        showToast(language === 'es' ? 'Pago registrado. Ya llegaste a la fecha de hoy.' : 'Payment registered. You have reached today.', 'success');
+                      } else {
+                        setPayFormDate(`${sig.getFullYear()}-${String(sig.getMonth() + 1).padStart(2, '0')}-${String(sig.getDate()).padStart(2, '0')}`);
+                        showToast(language === 'es' ? 'Pago registrado. Siguiente periodo cargado.' : 'Payment registered. Next period loaded.', 'success');
+                      }
+                    } else {
+                      setModalType(null); setPayFormRentalId(null);
+                      showToast(
+                        hasItems
+                          // El total cobrado es lo que hay que comparar con el
+                          // movimiento del banco, asi que se repite al confirmar.
+                          ? (language === 'es'
+                              ? `Cobro registrado: €${fmt2(chargeTotal)} en una sola factura.`
+                              : `Charge registered: €${fmt2(chargeTotal)} on a single invoice.`)
+                          : (language === 'es' ? 'Pago registrado exitosamente.' : 'Payment registered successfully.'),
+                        'success',
+                      );
+                    }
                   } catch {
                     showToast(language === 'es' ? 'Error al registrar pago.' : 'Error logging payment.', 'error');
                   }
@@ -20352,7 +21421,7 @@ USING (true);`;
           .find(p => p && p.category_id === catLockId) || null;
         const availableLocks = products.filter(p => p.category_id === catLockId && p.status === 'Disponible');
         const assignedBatteries = swapBatteryIds.map(id => products.find(p => p.id === id)).filter(Boolean) as Product[];
-        const freeBatteries = products.filter(p => p.category_id === catBattId && p.status === 'Disponible' && !swapBatteryIds.includes(p.id));
+        const freeBatteries = products.filter(p => p.category_id === catBattId && p.status === 'Disponible' && !swapBatteryIds.includes(p.id) && (p.custom_field_values as any)?.battery_available !== false);
         const newBike = products.find(p => p.id === swapNewBikeId);
 
         return (
@@ -20521,7 +21590,7 @@ USING (true);`;
                 <label className="form-label" style={{ fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px' }}>🔋 {language === 'es' ? 'Baterías Asignadas' : 'Assigned Batteries'}</label>
                 {(() => {
                   const assignedBatteries = editRentalBatteryIds.map(id => products.find(p => p.id === id)).filter(Boolean) as Product[];
-                  const availableBatteries = products.filter(p => p.category_id === catBattId && p.status === 'Disponible' && !editRentalBatteryIds.includes(p.id));
+                  const availableBatteries = products.filter(p => p.category_id === catBattId && p.status === 'Disponible' && !editRentalBatteryIds.includes(p.id) && (p.custom_field_values as any)?.battery_available !== false);
                   return (
                     <>
                       {assignedBatteries.length === 0 ? (
@@ -21952,6 +23021,7 @@ USING (true);`;
               custom_field_values: {
                 ...prod.custom_field_values,
                 manual_condition_odometer: prod.odometer || 0,
+                ...(prod.category_id === catBattId ? { battery_available: selectedBatteryAvailable } : {}),
               },
             });
             triggerReload();
@@ -22037,6 +23107,54 @@ USING (true);`;
                     );
                   })}
                 </div>
+
+                {prod.category_id === catBattId && (
+                  <div style={{ borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '16px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                    <p style={{ margin: 0, fontSize: '13px', color: 'var(--text-muted)' }}>
+                      {language === 'es'
+                        ? 'Disponibilidad para alquiler:'
+                        : 'Availability for rental:'}
+                    </p>
+                    <div style={{ display: 'flex', gap: '10px' }}>
+                      {[
+                        { val: true,  labelEs: 'Disponible',    labelEn: 'Available',     icon: '✅', color: '#10b981', bg: 'rgba(16, 185, 129, 0.08)' },
+                        { val: false, labelEs: 'No Disponible', labelEn: 'Not Available', icon: '🚫', color: '#ef4444', bg: 'rgba(239, 68, 68, 0.08)' },
+                      ].map((opt) => {
+                        const isSelected = selectedBatteryAvailable === opt.val;
+                        return (
+                          <div
+                            key={String(opt.val)}
+                            onClick={() => setSelectedBatteryAvailable(opt.val)}
+                            style={{
+                              flex: 1,
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              gap: '8px',
+                              padding: '12px 16px',
+                              borderRadius: '10px',
+                              cursor: 'pointer',
+                              background: isSelected ? opt.bg : 'rgba(255,255,255,0.02)',
+                              border: isSelected ? `2px solid ${opt.color}` : '2px solid rgba(255,255,255,0.06)',
+                              transition: 'all 0.2s ease',
+                              fontWeight: 'bold',
+                              fontSize: '14px',
+                              color: isSelected ? opt.color : 'var(--text-bright)',
+                            }}
+                          >
+                            <span style={{ fontSize: '18px' }}>{opt.icon}</span>
+                            {language === 'es' ? opt.labelEs : opt.labelEn}
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <p style={{ margin: 0, fontSize: '11px', color: 'var(--text-muted)' }}>
+                      {language === 'es'
+                        ? 'Las baterías marcadas como "No Disponible" no aparecerán al crear un nuevo alquiler.'
+                        : 'Batteries marked as "Not Available" will not appear when creating a new rental.'}
+                    </p>
+                  </div>
+                )}
               </div>
 
               <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px', borderTop: '1px solid rgba(255, 255, 255, 0.08)', paddingTop: '12px' }}>
@@ -22599,7 +23717,8 @@ USING (true);`;
 
       {/* MODAL: Day Events List */}
       {modalType === 'dayEventsList' && selectedDayEventsDate && (() => {
-        const dayEvents = events.filter(e => e.event_date === selectedDayEventsDate);
+        const dayEvents = calendarEvents.filter(e => e.event_date === selectedDayEventsDate);
+        const dayRents = rentalDaysByDate.get(selectedDayEventsDate) ?? [];
         const formattedDate = selectedDayEventsDate.split('-').reverse().join('/');
         return (
           <div className="modal-overlay">
@@ -22610,17 +23729,63 @@ USING (true);`;
               </div>
               <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', maxHeight: '300px', overflowY: 'auto' }}>
+                  {dayRents.map(d => {
+                    const tone = CAL_TONES[RENT_TONE[d.status]];
+                    return (
+                      <div
+                        key={d.id}
+                        className="glass-card"
+                        onClick={() => {
+                          setModalType(null);
+                          setSelectedDayEventsDate(null);
+                          setActiveCustomerId(null);
+                          setCurrentTab('rental_wizard');
+                        }}
+                        style={{
+                          padding: '12px 16px', cursor: 'pointer',
+                          border: `1px solid ${tone.border}`, borderRadius: '12px',
+                          display: 'flex', flexDirection: 'column', gap: '6px',
+                          background: tone.bg,
+                        }}
+                      >
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' }}>
+                          <span style={{ fontWeight: 700, color: 'var(--text-bright)', fontSize: '14px' }}>
+                            💶 {d.rider || (language === 'es' ? 'Alquiler' : 'Rental')}
+                          </span>
+                          <span style={{
+                            fontSize: '10px', fontWeight: 600, padding: '2px 8px', borderRadius: '20px',
+                            background: tone.bg, color: tone.fg, border: `1px solid ${tone.border}`,
+                          }}>
+                            {rentStatusLabel(d.status)}
+                          </span>
+                        </div>
+                        <p style={{ margin: 0, fontSize: '12px', color: 'var(--text-muted)', lineHeight: '1.4' }}>
+                          {rentDetail(d)}
+                        </p>
+                      </div>
+                    );
+                  })}
                   {dayEvents.map(e => (
                     <div 
                       key={e.id} 
                       className="glass-card" 
                       onClick={() => {
-                        if (e.title.includes('Cuota') || e.title.toLowerCase().includes('cuota')) {
-                          showToast(language === 'es' ? 'Las cuotas se gestionan desde financiamiento.' : 'Installments are managed from financing.', 'success');
-                          return;
-                        }
-                        if (e.title.startsWith('[Service]')) {
-                          showToast(language === 'es' ? 'Los servicios se gestionan desde el taller.' : 'Services are managed from the workshop.', 'success');
+                        // El detalle ya esta a la vista en esta tarjeta. El click
+                        // lleva a la pantalla donde el evento se gestiona de
+                        // verdad, en vez de avisar que no se puede hacer nada.
+                        const goTo = (tab: string) => {
+                          setModalType(null);
+                          setSelectedDayEventsDate(null);
+                          setCurrentTab(tab);
+                        };
+                        if (e.title.startsWith('[Service]')) { goTo('maintenance'); return; }
+                        if (e.title.toLowerCase().includes('cuota')) {
+                          // El financiamiento vive en Balance, que un manager no ve.
+                          if (isManager) {
+                            showToast(language === 'es' ? 'Las cuotas se gestionan desde financiamiento.' : 'Installments are managed from financing.', 'success');
+                            return;
+                          }
+                          goTo('balance');
                           return;
                         }
                         openEventModal(e);
@@ -22899,7 +24064,7 @@ USING (true);`;
                       const reminderEvent: CompanyEvent = {
                         id: leadId, // deterministic ID matching the lead ID
                         title: `Seguimiento: ${leadFormName}`,
-                        description: `Acción: ${leadFormReminderAction || 'Seguimiento Lead'}`,
+                        description: `Acción: ${leadFormReminderAction || 'Seguimiento Lead'}\n[LeadID: ${leadId}]`,
                         event_date: leadFormReminderDate,
                         remind_one_week: false,
                         remind_one_day: true,
@@ -22913,8 +24078,19 @@ USING (true);`;
                         // ignore if event did not exist
                       }
                     }
+                  } else if (existingLead && existingLead.name !== leadFormName) {
+                    // El nombre del lead va dentro del titulo del evento: si no
+                    // se renombran, los recordatorios quedan con el nombre viejo
+                    // y dejan de encontrarse al buscarlos por el lead.
+                    const linked = events.filter(ev =>
+                      ev.title.startsWith('Seguimiento:') &&
+                      (ev.id === leadId || eventRef(ev.description, 'LeadID') === leadId)
+                    );
+                    for (const ev of linked) {
+                      await upsertEvent({ ...ev, title: `Seguimiento: ${leadFormName}` });
+                    }
                   }
-                  
+
                   triggerReload(); 
                   setModalType(null); 
                   showToast(
@@ -23544,11 +24720,15 @@ USING (true);`;
 
                       try {
                         const updates: Promise<void>[] = [];
+                        // Fecha del reporte: sin ella no se puede medir cada
+                        // cuanto se pierde una bici en el panel de Rentabilidad.
+                        const lostOn = new Date().toISOString().split('T')[0];
 
                         // 1. Update the bike itself
                         updates.push(upsertProduct({
                           ...targetBike,
-                          status: reportTheftType
+                          status: reportTheftType,
+                          lost_date: lostOn
                         }));
 
                         // 2. Process associated items
@@ -23562,7 +24742,8 @@ USING (true);`;
                               const isLostOrStolen = reportTheftItems[prod.id] === true;
                               updates.push(upsertProduct({
                                 ...prod,
-                                status: isLostOrStolen ? reportTheftType : 'Disponible'
+                                status: isLostOrStolen ? reportTheftType : 'Disponible',
+                                lost_date: isLostOrStolen ? lostOn : null
                               }));
                             }
                           });
@@ -23783,6 +24964,10 @@ USING (true);`;
                 </div>
                 <button className="btn-primary" onClick={async () => {
                   try {
+                    // Los cobros de cuentas de reparto NO emiten factura a
+                    // proposito: son ingreso interno de la casa, no una venta
+                    // a un cliente. Solo se contabilizan en el Balance y en
+                    // Rentabilidad. No anadir aqui issueDocument ni PDFs.
                     await insertAccountEarning({ id: crypto.randomUUID(), account_id: acc.id, amount: earnFormAmount, date: earnFormDate, notes: earnFormNotes });
                     triggerReload(); setModalType(null); 
                     showToast(language === 'es' ? 'Pago registrado.' : 'Payment logged.', 'success');
@@ -27084,6 +28269,7 @@ USING (true);`;
                         setActiveStockMenuId(null);
                         setSelectedProductId(prod.id);
                         setSelectedCondition(prod.condition || 'bueno');
+                        setSelectedBatteryAvailable((prod.custom_field_values as any)?.battery_available !== false);
                         setModalType('changeCondition');
                       }}
                       onMouseEnter={(e) => {
@@ -27231,6 +28417,21 @@ USING (true);`;
                 }}
                 onClick={async () => {
                   setActiveStockMenuId(null);
+
+                  // Borrar un producto NO borra sus alquileres: el FK les pone
+                  // bike_id en null y quedan huerfanos, sin bici y fuera de
+                  // toda pantalla. Se comprueba antes de tocar nada.
+                  const ligados = await countRentalsForProduct(prod.id);
+                  if (ligados > 0) {
+                    showToast(
+                      language === 'es'
+                        ? `No se puede eliminar ${prod.serial_number}: tiene ${ligados} alquiler(es) asociados. Eliminá primero esos alquileres.`
+                        : `Cannot delete ${prod.serial_number}: ${ligados} rental(s) are linked. Delete those rentals first.`,
+                      'error',
+                    );
+                    return;
+                  }
+
                   const inactiveStatuses = ['Vendida', 'Financiada', 'Robada', 'Perdida', 'Perdida/Garda'];
 
                   // If the menu was opened on a single sold/lost/stolen unit (e.g. from the Sold tab),
@@ -27248,10 +28449,7 @@ USING (true);`;
                           // This product was the sale's only item → remove the whole sale (+ financing).
                           const plan = financingPlans.find(fp => fp.sale_id === si.sale_id);
                           if (plan) {
-                            const sale = sales.find(s => s.id === si.sale_id);
-                            const cust = sale ? customers.find(c => c.id === sale.customer_id) : null;
-                            const custName = cust ? `${cust.first_name} ${cust.last_name}` : null;
-                            const linkedEvents = events.filter(e => e.title.includes('💳 Cuota') && (custName ? e.title.includes(custName) : false));
+                            const linkedEvents = events.filter(e => eventRef(e.description, 'Plan ID') === plan.id);
                             for (const ev of linkedEvents) await deleteEvent(ev.id);
                             await deleteFinancingPayments(plan.id);
                             await deleteFinancingPlan(plan.id);
@@ -27602,6 +28800,7 @@ USING (true);`;
           {[
             { key: 'analytics',     icon: '📊', label: t.dashboard },
             { key: 'balance',       icon: '💰', label: t.balance },
+            { key: 'profitability', icon: '📈', label: language === 'es' ? 'Rentabilidad' : 'Profitability' },
             { key: 'invoicing',     icon: '🧾', label: language === 'es' ? 'Facturación' : 'Invoicing' },
             { key: 'expenses',      icon: '🛒', label: language === 'es' ? 'Compras y Gastos' : 'Purchases' },
             { key: 'stock',         icon: '📦', label: t.stock },
@@ -27615,6 +28814,7 @@ USING (true);`;
             { key: 'quick_replies', icon: '💬', label: t.quick_replies },
             { key: 'emails',        icon: '📧', label: language === 'es' ? 'Plantillas' : 'Templates' },
             { key: 'tasks',         icon: '📋', label: t.tasks },
+            { key: 'response_times', icon: '⏱️', label: language === 'es' ? 'Calculador de Respuestas' : 'Response Calculator' },
           ].filter(({ key }) => !(key === 'balance' && isManager)).map(({ key, icon, label }) => (
             <li key={key}>
               <a className={`menu-item ${currentTab === key ? 'active' : ''}`}

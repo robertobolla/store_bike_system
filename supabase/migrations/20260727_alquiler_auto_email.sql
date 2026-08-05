@@ -1,0 +1,12 @@
+-- ================================================================
+-- Envio de emails automaticos por alquiler.
+--
+-- Interruptor independiente de la facturacion (auto_invoice): permite
+-- alquilar sin mandarle correos al cliente, o cortar/reanudar los
+-- correos desde el expediente. Por defecto activado, como hasta ahora.
+--
+-- Regla temporal: los correos salen del momento en que se activa en
+-- adelante. Nunca se reenvian correos de fechas pasadas; el cron solo
+-- envia el correo de la factura que emite en esa misma corrida.
+-- ================================================================
+alter table rentals add column if not exists auto_email boolean not null default true;

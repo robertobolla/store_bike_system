@@ -9,6 +9,7 @@
 import { useMemo, useState } from 'react';
 import { addVat, formatMoney, noVat, round2 } from './money';
 import { formatDate as fmtDate } from '../utils/date';
+import { getExpenseReceiptUrl } from './api';
 import type { UnifiedExpenseRow } from './types';
 
 const ORIGIN_LABELS: Record<string, { es: string; en: string; color: string }> = {
@@ -42,6 +43,8 @@ export interface NewManualExpense {
   amount: number;
   hasVat: boolean;
   invoiceRef: string;
+  /** Comprobante a adjuntar. La subida la resuelve quien recibe el alta. */
+  receiptFile?: File | null;
 }
 
 interface Props {
@@ -68,6 +71,8 @@ export function ExpensesView({ language, showToast, expenses, categories, onAddE
   const [fAmount, setFAmount] = useState('');
   const [fHasVat, setFHasVat] = useState(false);
   const [fInvoiceRef, setFInvoiceRef] = useState('');
+  const [fReceipt, setFReceipt] = useState<File | null>(null);
+  const [openingReceipt, setOpeningReceipt] = useState<string | null>(null);
 
   const visible = useMemo(() => {
     const bounds = rangeBounds(timeRange, customFrom, customTo);
@@ -109,8 +114,9 @@ export function ExpensesView({ language, showToast, expenses, categories, onAddE
         amount: n,
         hasVat: fHasVat,
         invoiceRef: fInvoiceRef,
+        receiptFile: fReceipt,
       });
-      setFDesc(''); setFAmount(''); setFInvoiceRef(''); setFHasVat(false);
+      setFDesc(''); setFAmount(''); setFInvoiceRef(''); setFHasVat(false); setFReceipt(null);
       setShowForm(false);
     } finally {
       setSaving(false);
@@ -194,6 +200,22 @@ export function ExpensesView({ language, showToast, expenses, categories, onAddE
             <input className="form-control" value={fDesc} onChange={e => setFDesc(e.target.value)}
               placeholder={es ? 'Ej: alquiler local julio' : 'E.g. July shop rent'} />
           </div>
+          {/* Comprobante de la compra: el ticket o la factura del proveedor. */}
+          <div className="form-group" style={{ marginTop: '12px' }}>
+            <label className="form-label">📎 {es ? 'Comprobante (opcional)' : 'Receipt (optional)'}</label>
+            <input
+              type="file"
+              className="form-control"
+              accept="application/pdf,image/jpeg,image/png,image/webp,image/heic"
+              onChange={e => setFReceipt(e.target.files?.[0] ?? null)}
+            />
+            <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '6px 0 0' }}>
+              {fReceipt
+                ? `${fReceipt.name} · ${(fReceipt.size / 1024 / 1024).toFixed(2)} MB`
+                : (es ? 'Foto del ticket o PDF de la factura. Máximo 10 MB.' : 'Photo of the receipt or invoice PDF. Max 10 MB.')}
+            </p>
+          </div>
+
           <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '12px', cursor: 'pointer', fontSize: '13px' }}>
             <input type="checkbox" checked={fHasVat} onChange={e => setFHasVat(e.target.checked)}
               style={{ width: '16px', height: '16px' }} />
@@ -223,13 +245,14 @@ export function ExpensesView({ language, showToast, expenses, categories, onAddE
                 <th>{es ? 'Descripción' : 'Description'}</th>
                 <th>{es ? 'Categoría' : 'Category'}</th>
                 <th>{es ? 'Origen' : 'Source'}</th>
+                <th>{es ? 'Comprobante' : 'Receipt'}</th>
                 <th style={{ textAlign: 'right' }}>{es ? 'Total' : 'Total'}</th>
                 <th></th>
               </tr>
             </thead>
             <tbody>
               {visible.length === 0 ? (
-                <tr><td colSpan={6} style={{ textAlign: 'center', padding: '32px', color: 'var(--text-muted)' }}>
+                <tr><td colSpan={7} style={{ textAlign: 'center', padding: '32px', color: 'var(--text-muted)' }}>
                   {es ? 'No hay gastos.' : 'No expenses.'}
                 </td></tr>
               ) : visible.map(exp => {
@@ -243,6 +266,31 @@ export function ExpensesView({ language, showToast, expenses, categories, onAddE
                       <span className="badge" style={{ background: `${o.color}22`, color: o.color, fontSize: '11px' }}>
                         {es ? o.es : o.en}
                       </span>
+                    </td>
+                    <td>
+                      {exp.receiptPath ? (
+                        <button
+                          className="btn-secondary btn-xs"
+                          disabled={openingReceipt === exp.id}
+                          onClick={async () => {
+                            try {
+                              setOpeningReceipt(exp.id);
+                              // El bucket es privado: la URL se firma al abrir,
+                              // no se guarda una publica.
+                              window.open(await getExpenseReceiptUrl(exp.receiptPath as string), '_blank');
+                            } catch (err) {
+                              console.error(err);
+                              showToast(es ? 'No se pudo abrir el comprobante.' : 'Could not open the receipt.', 'error');
+                            } finally {
+                              setOpeningReceipt(null);
+                            }
+                          }}
+                        >
+                          {openingReceipt === exp.id ? '⏳' : `📎 ${es ? 'Ver' : 'View'}`}
+                        </button>
+                      ) : (
+                        <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>—</span>
+                      )}
                     </td>
                     <td style={{ textAlign: 'right', fontWeight: 600 }}>{formatMoney(exp.amount)}</td>
                     <td>

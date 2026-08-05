@@ -826,6 +826,13 @@ h1, h2, h3, h4, h5, h6 {
   border-left: 3px solid var(--color-primary);
 }
 
+/* Baja: riesgos que importan pero no son de hoy (contratos sin firmar,
+   alquileres sin deposito). Se distinguen en gris para que no compitan
+   con lo urgente. */
+.notification-item.low {
+  border-left: 3px solid #94a3b8;
+}
+
 /* Modals */
 .modal-overlay {
   position: fixed;
